@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 
 from worker.jobstore import JobState, JobStore
@@ -27,12 +28,16 @@ class FakeLauncher:
         session_id="abcdef12",
         log_frames=None,
         status="running",
+        launch_started=None,
+        release_launch=None,
     ):
         self.launch_delay = launch_delay
         self.launch_error = launch_error
         self.session_id = session_id
         self.log_frames = list(log_frames or [[]])
         self.status_value = status
+        self.launch_started = launch_started
+        self.release_launch = release_launch
         self.launch_calls = []
         self.log_calls = []
         self.status_calls = []
@@ -40,6 +45,11 @@ class FakeLauncher:
 
     def launch(self, **kwargs):
         self.launch_calls.append(kwargs)
+        if self.launch_started is not None:
+            self.launch_started.set()
+        if self.release_launch is not None:
+            if not self.release_launch.wait(timeout=2.0):
+                raise TimeoutError("launch was not released")
         if self.launch_delay:
             time.sleep(self.launch_delay)
         if self.launch_error is not None:
@@ -252,7 +262,7 @@ def test_failed_session_records_session_failed(tmp_path):
     assert terminal.error == "session_failed"
 
 
-def test_cancel_calls_launcher_and_records_cancelled(tmp_path):
+def test_cancel_on_running_calls_launcher_and_records_cancelled(tmp_path):
     store = make_store()
     job = make_running_job(store, session_id="fedcba98")
     launcher = FakeLauncher()
@@ -262,6 +272,100 @@ def test_cancel_calls_launcher_and_records_cancelled(tmp_path):
 
     assert launcher.cancel_calls == ["fedcba98"]
     assert terminal.state is JobState.CANCELLED
+
+
+def test_cancel_while_launching_never_becomes_running_and_cancels_session(tmp_path):
+    store = make_store()
+    launch_started = threading.Event()
+    release_launch = threading.Event()
+    launcher = FakeLauncher(
+        launch_started=launch_started,
+        release_launch=release_launch,
+        session_id="fedcba98",
+    )
+    manager = WorkManager(store, launcher, tmp_path)
+
+    job = manager.launch("Task", "brief")
+
+    assert launch_started.wait(timeout=1.0)
+    wait_for_state(store, job.job_id, JobState.LAUNCHING)
+    cancelled = manager.cancel(job.job_id)
+    release_launch.set()
+
+    deadline = time.monotonic() + 1.0
+    while not launcher.cancel_calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    states = [
+        event.text
+        for event in store.events(job.job_id)
+        if event.kind == "state"
+    ]
+    assert cancelled.state is JobState.CANCELLED
+    assert store.get(job.job_id).state is JobState.CANCELLED
+    assert states == ["queued", "launching", "cancelled"]
+    assert launcher.cancel_calls == ["fedcba98"]
+
+
+def test_cancel_on_succeeded_is_a_no_op_without_callback(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    succeeded = store.transition(job.job_id, JobState.SUCCEEDED, summary="done")
+    manager = WorkManager(store, FakeLauncher(), tmp_path)
+    notifications = []
+    manager.on_terminal(notifications.append)
+
+    returned = manager.cancel(job.job_id)
+
+    assert returned == succeeded
+    assert store.get(job.job_id) == succeeded
+    assert notifications == []
+
+
+def test_cancel_on_failed_is_a_no_op_without_callback(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    failed = store.transition(job.job_id, JobState.FAILED, error="failed")
+    manager = WorkManager(store, FakeLauncher(), tmp_path)
+    notifications = []
+    manager.on_terminal(notifications.append)
+
+    returned = manager.cancel(job.job_id)
+
+    assert returned == failed
+    assert store.get(job.job_id) == failed
+    assert notifications == []
+
+
+def test_cancel_on_cancelled_is_a_no_op_without_callback(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    cancelled = store.transition(job.job_id, JobState.CANCELLED)
+    manager = WorkManager(store, FakeLauncher(), tmp_path)
+    notifications = []
+    manager.on_terminal(notifications.append)
+
+    returned = manager.cancel(job.job_id)
+
+    assert returned == cancelled
+    assert store.get(job.job_id) == cancelled
+    assert notifications == []
+
+
+def test_terminal_callback_fires_once_across_cancel_and_poll(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    launcher = FakeLauncher(status="done")
+    manager = WorkManager(store, launcher, tmp_path)
+    launcher.log_frames = [[result_frame(manager, job.job_id)]]
+    notifications = []
+    manager.on_terminal(notifications.append)
+
+    manager.cancel(job.job_id)
+    manager._poll(job)
+
+    assert store.get(job.job_id).state is JobState.CANCELLED
+    assert [item.job_id for item in notifications] == [job.job_id]
 
 
 def test_on_terminal_fires_exactly_once_for_each_job(tmp_path):
