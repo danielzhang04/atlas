@@ -167,8 +167,7 @@ class McpServers:
 
 
 def _bounded_text(value: str) -> str:
-    clean = "".join(char for char in value if char in "
-	" or unicodedata.category(char) != "Cc")
+    clean = "".join(char for char in value if char in "\n\t" or unicodedata.category(char) != "Cc")
     if len(clean) <= _MAX_CONTENT:
         return clean
     return clean[:_MAX_CONTENT - len(_TRUNCATED)] + _TRUNCATED
