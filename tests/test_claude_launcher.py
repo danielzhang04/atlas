@@ -187,7 +187,7 @@ def test_session_operations_use_explicit_working_directory(tmp_path):
     assert "--cwd" not in runner.calls[1][0]
 
 
-def test_parse_result_accepts_succeeded_status():
+def test_parse_result_accepts_new_minimal_frame():
     job_id = str(uuid4())
     frame = result_frame(job_id, "nonce", "succeeded", "completed")
 
@@ -197,20 +197,15 @@ def test_parse_result_accepts_succeeded_status():
     )
 
 
-def test_parse_result_accepts_realistic_two_line_wrapped_frame():
-    job_id = str(uuid4())
-    summary = (
-        "Wrote a 3-line haiku about maps to haiku.txt in the working folder "
-        "and verified its contents."
-    )
+def test_parse_result_accepts_live_two_line_frame_with_raw_backslash_path():
+    job_id = "52dbb226-…"
+    summary = "Wrote a 3-line haiku …"
     first = (
-        f"  ATLAS_RESULT_V1:nonce:{{\"job_id\":\"{job_id}\","
-        "\"status\":\"succeeded\",\"summary\":\"Wrote a 3-line haiku about maps "
-        "to haiku.txt in the working folder  "
+        f'ATLAS_RESULT_V1:nonce:{{"job_id":"{job_id}",'
+        '"status":"succeeded","summary":"Wrote a 3-line haiku …",'
     )
     second = (
-        "  and verified its contents.\",\"error_code\":null,"
-        "\"artifacts\":[\"C:\\\\Users\\\\danie\\\\haiku.txt\"]}"
+        r'"error_code":null,"artifacts":["C:\Users\danie\AppData\Local\Atlas\jobs\52dbb226-…\haiku.txt"]}'
     )
 
     assert parse_result([first, second], nonce="nonce", job_id=job_id) == (
@@ -273,9 +268,7 @@ def test_parse_result_rejects_template_echo():
     payload = {
         "job_id": job_id,
         "status": "succeeded|failed|cancelled",
-        "summary": "bounded factual summary",
-        "error_code": None,
-        "artifacts": [],
+        "summary": "one factual sentence",
     }
     frame = f"ATLAS_RESULT_V1:nonce:{json.dumps(payload)}"
 
@@ -286,11 +279,11 @@ def test_parse_result_ignores_wrapped_prompt_template_and_accepts_real_frame():
     job_id = str(uuid4())
     logs = [
         f'ATLAS_RESULT_V1:nonce:{{"job_id":"{job_id}",',
-        '  "status":"succeeded|failed|cancelled","summary":"bounded factual',
-        '                                      summary","error_code":null,"artifacts":[]}',
+        '  "status":"succeeded|failed|cancelled","summary":"one factual',
+        '                                      sentence"}',
         "ordinary terminal output",
         f'ATLAS_RESULT_V1:nonce:{{"job_id":"{job_id}","status":"succeeded",',
-        '  "summary":"finished cleanly","error_code":null,"artifacts":[]}',
+        '  "summary":"finished cleanly"}',
     ]
 
     assert parse_result(logs, nonce="nonce", job_id=job_id) == (
@@ -299,14 +292,15 @@ def test_parse_result_ignores_wrapped_prompt_template_and_accepts_real_frame():
     )
 
 
-def test_worker_prompt_template_has_one_closing_object_brace():
+def test_worker_prompt_uses_minimal_result_frame_contract():
     job_id = str(uuid4())
 
     prompt = worker_prompt(job_id, "nonce", "Do it")
     template = prompt.split("\n\n", 1)[0]
 
-    assert template.endswith('"artifacts":[]}')
-    assert not template.endswith('"artifacts":[]}}')
+    assert template.endswith('"summary":"one factual sentence"}')
+    assert "artifacts" not in prompt
+    assert "}}" not in prompt
 
 
 def test_parse_result_rejects_two_conflicting_frames():
