@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from hashlib import sha256
+import logging
 from pathlib import Path
 import threading
 from typing import Callable
@@ -10,6 +11,9 @@ from uuid import uuid4
 
 from .claude_launcher import ClaudeLauncher, parse_result, worker_prompt
 from .jobstore import Job, JobState, JobStore
+
+
+logger = logging.getLogger("atlas.work")
 
 
 class WorkManager:
@@ -80,7 +84,7 @@ class WorkManager:
             with self._job_lock(job_id):
                 job = self.store.get(job_id)
                 if job.state is not JobState.LAUNCHING:
-                    self.launcher.cancel(launched_session_id)
+                    self.launcher.cancel(launched_session_id, cwd=job_dir)
                     return
                 self.store.transition(
                     job_id,
@@ -118,7 +122,10 @@ class WorkManager:
                 return job
             if job.state is JobState.RUNNING and job.session_id:
                 try:
-                    self.launcher.cancel(job.session_id)
+                    self.launcher.cancel(
+                        job.session_id,
+                        cwd=self.workspace_root / job.job_id,
+                    )
                 except Exception:
                     pass
             terminal = self.store.transition(job_id, JobState.CANCELLED)
@@ -150,6 +157,10 @@ class WorkManager:
         for line in lines:
             if line in seen:
                 continue
+            if not line.strip():
+                continue
+            if not any(character.isalnum() for character in line):
+                continue
             self.store.append_output(job_id, line)
             seen.add(line)
 
@@ -164,9 +175,10 @@ class WorkManager:
                 self._terminal(terminal)
             return
 
-        lines = self.launcher.logs(job.session_id)
+        job_dir = self.workspace_root / job.job_id
+        lines = self.launcher.logs(job.session_id, cwd=job_dir)
         self._append_new_lines(job.job_id, lines)
-        session_status = self.launcher.status(job.session_id)
+        session_status = self.launcher.status(job.session_id, cwd=job_dir)
         if session_status in {"running", "unknown"}:
             return
         if session_status == "needs_input":
@@ -276,7 +288,12 @@ class WorkManager:
                     continue
                 try:
                     self._poll(job)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "poll failed for job %s: %s",
+                        job.job_id,
+                        type(exc).__name__,
+                    )
                     continue
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
