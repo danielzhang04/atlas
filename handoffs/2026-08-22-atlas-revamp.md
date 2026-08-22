@@ -15,8 +15,15 @@ Claude call with a tool registry, sentence-chunked straight into TTS) → `tools
 (`open`, `focus`, `confirm`, `cancel_pending`, `launch_work`, `work_status`, `cancel_work`) plus every
 tool of Daniel's own MCP servers mirrored by `mcp_client.py` (`config/mcp.yaml`, env from
 `~/.claude.json`) → `work.py` (background `claude --bg` session launched on a thread, output streamed
-into the job store, spoken completion). `worker/` went from 11,915 to ~3,600 lines; tests from 406 to
-186+ (all account-free).
+into the job store, spoken completion). `worker/` went from 11,915 to 4,233 lines; tests from 406 to
+203 (all account-free). 22 commits on the branch.
+
+## Housekeeping
+
+- Task worktrees `t1`–`t4` are pruned from git; the `Atlas-worktrees\t3` and `t4` directories remain only
+  because the Codex sandbox left locked `.pytest-tmp`/`.pytest_cache` residue — safe to delete.
+- Smoke jobs (`haiku.txt` under `%LOCALAPPDATA%\Atlas\jobs\<id>`) and their History rows are test residue.
+- Keep-awake stayed armed throughout (`kb\scripts\keep_awake.ps1 -Status`).
 
 ## Live measurements on this machine (`python -m worker.chat`, real API/MCP/CLI)
 
@@ -26,7 +33,7 @@ into the job store, spoken completion). `worker/` went from 11,915 to ~3,600 lin
 | "pull up gmail" | `open` fired (Gmail opened in the default browser), "Done." | 1.58 s |
 | "what's on my calendar today" | `google__get_events` through the real google-workspace MCP server, spoken summary | ~2 s after MCP connect |
 | "research … write me a summary" | "Launching that now. It'll show up in Workers." spoken **before** `launch_work` ran | 0.97 s |
-| `launch_work` haiku job | QUEUED → LAUNCHING → RUNNING with a real `claude --bg` session in 7 s; Claude finished in 14 s; output lines streamed into `/jobs/{id}/events`; terminal state detected by a *fresh* process (restart path) at +35 s | — |
+| `launch_work` haiku job | QUEUED → LAUNCHING → RUNNING with a real `claude --bg` session in 7 s; Claude finished in ~15 s; output lines streamed into `/jobs/{id}/events`; **SUCCEEDED with the spoken summary** detected by a *fresh* process (restart path) at +36 s | — |
 
 `worker.chat` wall-clock includes a cold MCP connect (uvx spawn, up to ~25 s on a cold cache); the voice
 worker connects MCP once at startup in the background, so voice turns do not pay that.
@@ -37,8 +44,10 @@ worker connects MCP once at startup in the background, so voice turns do not pay
   system block follows the cached rules block.
 - MCP connect timed out at 20 s on a cold `uvx` cache → 60 s; MCP child stderr no longer floods the log.
 - `ClaudeLauncher` looked sessions up by `Path.cwd()` after a restart → explicit job cwd everywhere.
-- `claude logs` wraps the result frame at terminal width and echoes the prompt's template frame →
-  wrapped-frame decoding, template excluded by status value, `}}` typo in the prompt fixed.
+- `claude logs` wraps the result frame at terminal width, echoes the prompt's template frame, and Claude
+  prints Windows paths with raw backslashes inside the JSON → wrapped-frame decoding, template excluded by
+  status value, frame contract shrunk to `job_id/status/summary` (no paths), backslash-tolerant decoding,
+  `}}` typo in the prompt fixed. Verified live: job `1796a614…` → SUCCEEDED with summary.
 - `WorkManager.cancel` could resurrect a cancelled job or re-fire callbacks → atomic with launch/poll.
 - Poll failures were silently swallowed → logged by exception class; terminal chrome filtered from output.
 - Stale pre-revamp `worker.ui_server --port 4361` mirror (started 2026-08-21, not under PM2) held the old
