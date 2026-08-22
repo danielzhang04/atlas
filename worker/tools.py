@@ -236,7 +236,7 @@ def builtin(
         return registry.cancel_pending()
 
     async def launch_work(arguments: dict) -> dict:
-        title = _text_argument(arguments, "title", maximum=300)
+        title = _text_argument(arguments, "title", maximum=200)
         brief = _text_argument(arguments, "brief", maximum=4096)
         job = work.launch(title, brief)
         return {"job_id": job.job_id, "status": "launching", "title": job.title}
