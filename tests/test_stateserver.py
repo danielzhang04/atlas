@@ -92,11 +92,12 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
                 await _request(server, path="/mcp"),
                 await _request(server, path="/health"),
                 await _request(server, path=f"/jobs/{job_id}/events?after=bad"),
+                await _request(server, path=f"/jobs/{job_id}/events?after={'9' * 21}"),
             )
         finally:
             await server.stop()
 
-    job_response, event_response, mcp_response, health_response, invalid = asyncio.run(scenario())
+    job_response, event_response, mcp_response, health_response, invalid, oversized = asyncio.run(scenario())
     expected = {key: value for key, value in jobs[0].items() if key != "secret"}
     assert json.loads(job_response[2]) == {"jobs": [expected]}
     assert json.loads(event_response[2]) == {"events": [{
@@ -112,6 +113,7 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
         "mcp": [{"name": "google", "connected": True, "tools": 11, "error": None}],
     }
     assert invalid[0] == 400
+    assert oversized[0] == 400
 
 
 def test_pairing_protects_private_results_and_job_cancellation():
@@ -134,6 +136,10 @@ def test_pairing_protects_private_results_and_job_cancellation():
         json_headers = {"content-type": "application/json", "origin": origin}
         try:
             denied = await _request(server, path=f"/jobs/{job_id}/result")
+            bad_pair = await _request(
+                server, "POST", "/pair", body=json.dumps({"token": "\u2603"}),
+                headers=json_headers,
+            )
             paired = await _request(
                 server, "POST", "/pair", body=json.dumps({"token": "pair-token"}),
                 headers=json_headers,
@@ -146,12 +152,12 @@ def test_pairing_protects_private_results_and_job_cancellation():
             cancel = await _request(
                 server, "POST", f"/jobs/{job_id}/cancel", body="{}", headers=authorized,
             )
-            return denied, paired, result, cancel
+            return denied, bad_pair, paired, result, cancel
         finally:
             await server.stop()
 
-    denied, paired, result, cancel = asyncio.run(scenario())
-    assert denied[0] == 401 and paired[0] == 200
+    denied, bad_pair, paired, result, cancel = asyncio.run(scenario())
+    assert denied[0] == 401 and bad_pair[0] == 401 and paired[0] == 200
     assert json.loads(result[2]) == {"job_id": job_id, "result": "Private result"}
     assert json.loads(cancel[2])["job"]["status"] == "cancelled"
     assert cancelled == [job_id]
@@ -179,4 +185,3 @@ def test_stop_is_idempotent():
         await server.stop()
 
     asyncio.run(scenario())
-

@@ -77,4 +77,3 @@ def build(
         turn_timeout_s=float(timeout_s),
     )
     return Runtime(registry, mcp, work, brain, store)
-

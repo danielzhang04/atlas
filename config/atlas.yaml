@@ -1,81 +1,20 @@
 fast_model: claude-haiku-4-5
-interpreter_timeout_s: 10.0
-interpreter_max_tokens: 256
+google_account: daniel.zhang.t1@gmail.com
+turn_timeout_s: 12.0
+max_tokens: 400
+
 job_store_path: "%LOCALAPPDATA%/Atlas/jobs.sqlite3"
-subscription_health_path: "%LOCALAPPDATA%/Atlas/subscription-health.json"
+work_workspace_path: "%LOCALAPPDATA%/Atlas/jobs"
+state_port: 4360
 stt_keyterms: [Atlas]
-local_file_roots: {}        # selected only after end review; mutations remain unavailable
-desktop_target_aliases: {}  # optional host actions; normal voice work uses connected Claude Code
-browser_bridge_url: null    # e.g. http://127.0.0.1:4370 after a trusted bridge is installed
-browser_allowed_origins: [] # exact http/https origins the paired bridge may interact with
-google_broker_endpoint: null  # external local credential broker; unconfigured until end review
-receipt_journal_path: "%LOCALAPPDATA%/Atlas/receipts.jsonl"  # fixed-schema, redacted local history
-agentic_workspace_path: "%LOCALAPPDATA%/Atlas/agent-jobs"  # fresh MCP-only job workspaces
-connected_workspace_path: "%LOCALAPPDATA%/Atlas/connected-jobs"  # user Claude integrations; isolated task dirs
-state_port: 4360            # local read-only /state surface, 127.0.0.1 only (design §3; daemon owns 4317)
-# dismiss phrases MIGRATED to config/intents.yaml (design §7 reflex lane, Task 10): the reflex
-# lane's `dismiss` intent is now the single source of dismiss matching data — no key here anymore.
-# --- Voice toggle (Daniel 2026-07-20): named voices, switch by pointing active_voice at one
-# and restarting the console. V1 adds a spoken switch command. Matilda = round-2 winner (F);
-# male slot filled by round-3 audition.
+
 active_voice: mars
 voices:
-  matilda: {vendor: elevenlabs, voice_id: XrExE9yKIg1WjnnlVkGX, model: eleven_turbo_v2_5}  # F — premium (paid-sub quota)
-  mars:    {vendor: deepgram,   model: aura-2-mars-en}                                      # M — $0 workhorse (Daniel's pick, rides credit)
+  matilda: {vendor: elevenlabs, voice_id: XrExE9yKIg1WjnnlVkGX, model: eleven_turbo_v2_5}
+  mars: {vendor: deepgram, model: aura-2-mars-en}
 
-wake_model: hey_atlas   # custom-trained model at config/hey_atlas.onnx; set to hey_jarvis (pretrained fallback) if it misbehaves
-wake_input_device: Intel   # mic-name substring pin; Windows default drifts to AirPods HFP (unusable audio)
+wake_model: hey_atlas
+wake_input_device: Intel
 wake_threshold: 0.5
-# Ghost-wake fix (2026-08-12): a wake fires only after this many CONSECUTIVE 80ms frames score
-# above wake_threshold. Single-frame spikes (mic buffer glitches under CPU load, ambient-audio
-# transients) woke Atlas every few minutes with nobody speaking; a real "hey atlas" holds the
-# score high for many frames. Suppressed spikes are logged ("wake spike suppressed") — if false
-# wakes persist, raise this to 4-5 or bump wake_threshold to 0.6 using the logged peak scores.
 wake_patience: 3
-
-# TTS OUTPUT device pin (Bug 2, 2026-07-21): speaker-name substring, the output analogue of
-# wake_input_device. livekit console TTS otherwise rides the drifting Windows DEFAULT output and
-# opens it ONCE at startup, so audio lands on an inaudible AirPods HFP sink and Daniel hears nothing
-# on the main speaker. Substring-matched against output devices; unset/no-match -> system default
-# (a loud warning is logged, never a silent wrong-device swap). Run `python -m worker.app console
-# --list-devices` to see the exact name and adjust if "Speakers" is not your main output.
-# 2026-07-21 verify step 0: on this machine bare "Speakers" first-matches the real Realtek main
-# speaker (id 5) but also substring-matches virtual sinks (Nahimic mirror, SteelSeries Sonar,
-# "Speakers ()"); pinned tighter so a device-order shift can't silently reroute TTS.
-# 2026-07-21 (late): `follow` = output-follow mode (docs/specs/2026-07-21-atlas-output-follow-design.md):
-# TTS hot-follows the Windows default output (headphones connect -> TTS moves there, disconnect ->
-# back to speakers) with no worker restart. Any other string = static substring pin as before
-# (e.g. `Speakers (Realtek`). The wake INPUT stays pinned regardless — BT hands-free mics are unusable.
 tts_output_device: follow
-
-# --- Task 8 persona bake-off (2-way: Deepgram Aura-2 vs ElevenLabs stock; Cartesia scratched) ---
-# The 3 fixed lines below are synthesized per voice into .superpowers/sdd/t8-staging/persona-samples/
-# by worker.persona_samples; Daniel picks by ear at the V0 checkpoint. Registers span the three the
-# spec §10 calls for: butler / chief-of-staff / casual. Aura-2 encodes the voice in the model string
-# (aura-2-<voice>-en, no separate voice= param); ElevenLabs picks are stock/premade voice_ids.
-persona_candidates:
-  deepgram:
-    - {voice: draco,     register: butler,         model: aura-2-draco-en}       # British, warm, trustworthy baritone
-    - {voice: asteria,   register: chief-of-staff, model: aura-2-asteria-en}     # clear, confident, knowledgeable
-    - {voice: andromeda, register: casual,         model: aura-2-andromeda-en}   # casual/expressive — current worker default
-  elevenlabs:
-    - {voice: George,    register: butler,         voice_id: JBFqnCBsd6RMkjVDRZzb}   # British, warm, captivating
-    - {voice: Sarah,     register: chief-of-staff, voice_id: EXAVITQu4vr4xnSDxMaL}   # mature, reassuring, confident
-    - {voice: Roger,     register: casual,         voice_id: CwhRBWXzGAHq8TQ4Fs17}   # laid-back, casual, resonant
-  elevenlabs_model: eleven_turbo_v2_5   # production low-latency model (matches the voice-worker latency profile)
-
-# Authored in-register (spec §10 names the 3 sample TYPES — status report / completion callback /
-# approval readback — but gives no exact text; these follow the "lead with the point, one breath" rule).
-persona_lines:
-  - id: 1-status-report
-    text: >-
-      Three cards are in flight — two building, one in review — and today's spend is
-      eleven cents against the twenty-dollar cap.
-  - id: 2-completion-callback
-    text: >-
-      The render you asked for just finished — six hundred twenty-eight seconds, verified
-      clean. It's on your monitor.
-  - id: 3-approval-readback
-    text: >-
-      You're approving the merge of the atlas branch into main: thirty-one files, all tests
-      green. Say the word and I'll ship it.

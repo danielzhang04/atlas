@@ -171,6 +171,66 @@ def test_tool_use_continues_with_result_and_invokes_callback():
     }]}
 
 
+def test_confirmation_status_and_id_survive_for_the_later_confirm_turn():
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "mutate {\"message\": \"hello\"}", "confirm-123"),
+        ToolResult("ok", "sent"),
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Should I send it?"], content=[text_block("Should I send it?")]),
+        FakeStream(
+            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Sent."], content=[text_block("Sent.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        first = await collect(brain, "Send the message")
+        second = await collect(brain, "Yes")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == ["Should I send it?"]
+    assert second == ["Sent."]
+    tool_result = client.messages.calls[1]["messages"][-1]["content"][0]
+    assert tool_result["content"] == (
+        'needs_confirmation (confirm_id: confirm-123): mutate {"message": "hello"}'
+    )
+    assert "Host pending confirmation id: confirm-123." in client.messages.calls[2]["system"][0]["text"]
+    assert brain._pending_confirm_id is None
+
+
+def test_confirmation_cannot_execute_in_the_turn_that_created_it():
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "mutate {}", "confirm-123"),
+    )
+    events = []
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(
+            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Please confirm first."], content=[text_block("Please confirm first.")]),
+    )
+    brain = Brain(
+        client,
+        registry,
+        model="fast",
+        persona="",
+        on_tool=lambda name, result: events.append((name, result.status)),
+    )
+
+    assert asyncio.run(collect(brain, "Send it")) == ["Please confirm first."]
+    assert registry.calls == [("mutate", {})]
+    assert events == [("mutate", "needs_confirmation"), ("confirm", "error")]
+    assert brain._pending_confirm_id == "confirm-123"
+
+
 def test_streamed_text_is_yielded_before_tool_runs():
     seen: list[str] = []
     registry = FakeRegistry(ToolResult("ok", "result"))

@@ -48,4 +48,3 @@ def test_settings_show_config_paths_mcp_and_voice_status_without_removed_doctrin
 def test_browser_launch_failure_is_best_effort(monkeypatch):
     monkeypatch.setattr(ui_server.webbrowser, "open", lambda *_args, **_kwargs: False)
     assert ui_server._open_pairing_window("http://127.0.0.1:4360/#pair=redacted") is False
-

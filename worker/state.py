@@ -121,4 +121,3 @@ class StatePublisher:
                 fn(event)
             except Exception:
                 logger.exception("atlas state subscriber raised; skipping")
-

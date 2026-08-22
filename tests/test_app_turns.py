@@ -135,4 +135,3 @@ def test_cancelled_completion_is_bounded():
         state=JobState.SUCCEEDED, summary="x" * 500,
     ))
     assert len(line) == 320
-

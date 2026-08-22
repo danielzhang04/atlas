@@ -333,6 +333,20 @@ async def entrypoint(ctx: JobContext) -> None:
     publisher.set_output_device(_output_device_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
+    loop = asyncio.get_running_loop()
+    session_box: dict[str, Any] = {}
+    pending_terminal = []
+
+    def _deliver_terminal(job) -> None:
+        current_session = session_box.get("session")
+        if current_session is None:
+            pending_terminal.append(job)
+            return
+        _announce_terminal(job, publisher, current_session, engagement)
+
+    services.work.on_terminal(
+        lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
+    )
     stop_work = asyncio.Event()
     mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
     work_task = asyncio.create_task(services.work.run(stop_work))
@@ -357,12 +371,10 @@ async def entrypoint(ctx: JobContext) -> None:
         tools=[],
     )
     await session.start(agent=agent, room=ctx.room)
-    loop = asyncio.get_running_loop()
-    services.work.on_terminal(
-        lambda job: loop.call_soon_threadsafe(
-            _announce_terminal, job, publisher, session, engagement,
-        )
-    )
+    session_box["session"] = session
+    for terminal_job in pending_terminal:
+        _announce_terminal(terminal_job, publisher, session, engagement)
+    pending_terminal.clear()
 
     async def _submit(text: str) -> None:
         await _submit_voice_turn(
@@ -497,4 +509,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -81,7 +81,7 @@ class PairingAuthorizer:
         if (
             self._pairing_token is None
             or not isinstance(token, str)
-            or not hmac.compare_digest(token, self._pairing_token)
+            or not hmac.compare_digest(self._digest(token), self._digest(self._pairing_token))
         ):
             self._failures += 1
             raise PermissionError("invalid pairing token")
@@ -292,7 +292,7 @@ class StateServer:
         if JOB_ID.fullmatch(job_id) is None or self._job_event_provider is None:
             raise web.HTTPNotFound()
         raw_after = request.query.get("after", "0")
-        if not raw_after.isdigit():
+        if not raw_after.isdigit() or len(raw_after) > 20:
             raise web.HTTPBadRequest(text="after must be a non-negative integer")
         after = int(raw_after)
         try:
@@ -474,4 +474,3 @@ async def start(
         health_provider=health_provider,
     )
     return await server.start(port)
-

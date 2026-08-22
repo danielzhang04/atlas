@@ -1,13 +1,12 @@
 anthropic>=0.40
 pytest>=8
 pyyaml>=6
-aiohttp>=3.14   # local /state surface (Task 5); already transitively installed via livekit-agents (3.14.1)
-mcp==1.29.0     # strict stdio bridge for authenticated Atlas broker reads
-# voice deps (Task 6)
+aiohttp>=3.14
+mcp==1.29.0
 livekit-agents==1.6.6
 livekit-plugins-deepgram
 livekit-plugins-elevenlabs
 livekit-plugins-silero
 openwakeword==0.6.0
-comtypes>=1.4      # COM plumbing for pycaw (output-follow watcher, 2026-07-21 design)
-pycaw>=20240210    # Windows Core Audio default-endpoint probe (devicewatch.current_default_output)
+comtypes>=1.4
+pycaw>=20240210
