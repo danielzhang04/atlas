@@ -29,6 +29,16 @@ class WorkManager:
         self._callbacks: list[Callable[[Job], None]] = []
         self._notified: set[str] = set()
         self._terminal_lock = threading.Lock()
+        self._job_locks: dict[str, threading.Lock] = {}
+        self._job_locks_lock = threading.Lock()
+
+    def _job_lock(self, job_id: str) -> threading.Lock:
+        with self._job_locks_lock:
+            lock = self._job_locks.get(job_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._job_locks[job_id] = lock
+            return lock
 
     @staticmethod
     def _nonce(job_id: str) -> str:
@@ -50,7 +60,11 @@ class WorkManager:
         try:
             job_dir = self.workspace_root / job_id
             job_dir.mkdir(parents=True, exist_ok=True)
-            self.store.transition(job_id, JobState.LAUNCHING)
+            with self._job_lock(job_id):
+                job = self.store.get(job_id)
+                if job.state is not JobState.QUEUED:
+                    return
+                self.store.transition(job_id, JobState.LAUNCHING)
             requested_session_id = str(uuid4())
             prompt = worker_prompt(
                 job_id,
@@ -63,22 +77,28 @@ class WorkManager:
                 prompt=prompt,
                 cwd=job_dir,
             )
-            if self.store.get(job_id).state is JobState.CANCELLED:
-                self.launcher.cancel(launched_session_id)
-                return
-            self.store.transition(
-                job_id,
-                JobState.RUNNING,
-                session_id=launched_session_id,
-            )
+            with self._job_lock(job_id):
+                job = self.store.get(job_id)
+                if job.state is not JobState.LAUNCHING:
+                    self.launcher.cancel(launched_session_id)
+                    return
+                self.store.transition(
+                    job_id,
+                    JobState.RUNNING,
+                    session_id=launched_session_id,
+                )
         except Exception:
-            if self.store.get(job_id).state is JobState.CANCELLED:
-                return
-            terminal = self.store.transition(
-                job_id,
-                JobState.FAILED,
-                error="launch_failed",
-            )
+            with self._job_lock(job_id):
+                job = self.store.get(job_id)
+                if job.state is JobState.CANCELLED:
+                    return
+                if job.state not in {JobState.QUEUED, JobState.LAUNCHING}:
+                    return
+                terminal = self.store.transition(
+                    job_id,
+                    JobState.FAILED,
+                    error="launch_failed",
+                )
             self._terminal(terminal)
 
     def active(self) -> list[Job]:
@@ -88,13 +108,20 @@ class WorkManager:
         return list(self.store.recent(n))
 
     def cancel(self, job_id: str) -> Job:
-        job = self.store.get(job_id)
-        if job.session_id:
-            try:
-                self.launcher.cancel(job.session_id)
-            except Exception:
-                pass
-        terminal = self.store.transition(job_id, JobState.CANCELLED)
+        with self._job_lock(job_id):
+            job = self.store.get(job_id)
+            if job.state in {
+                JobState.SUCCEEDED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+            }:
+                return job
+            if job.state is JobState.RUNNING and job.session_id:
+                try:
+                    self.launcher.cancel(job.session_id)
+                except Exception:
+                    pass
+            terminal = self.store.transition(job_id, JobState.CANCELLED)
         self._terminal(terminal)
         return terminal
 
@@ -127,13 +154,14 @@ class WorkManager:
             seen.add(line)
 
     def _poll(self, job: Job) -> None:
+        with self._job_lock(job.job_id):
+            job = self.store.get(job.job_id)
+            if job.state is not JobState.RUNNING:
+                return
         if not job.session_id:
-            terminal = self.store.transition(
-                job.job_id,
-                JobState.FAILED,
-                error="orphaned",
-            )
-            self._terminal(terminal)
+            terminal = self._finish_running(job.job_id, JobState.FAILED, error="orphaned")
+            if terminal is not None:
+                self._terminal(terminal)
             return
 
         lines = self.launcher.logs(job.session_id)
@@ -142,20 +170,22 @@ class WorkManager:
         if session_status in {"running", "unknown"}:
             return
         if session_status == "needs_input":
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.FAILED,
                 error="needs_input",
             )
-            self._terminal(terminal)
+            if terminal is not None:
+                self._terminal(terminal)
             return
         if session_status == "failed":
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.FAILED,
                 error="session_failed",
             )
-            self._terminal(terminal)
+            if terminal is not None:
+                self._terminal(terminal)
             return
 
         result = parse_result(
@@ -164,36 +194,60 @@ class WorkManager:
             job_id=job.job_id,
         )
         if result is None:
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.FAILED,
                 error="result_missing",
             )
-            self._terminal(terminal)
+            if terminal is not None:
+                self._terminal(terminal)
             return
 
         result_status, summary = result
         if result_status == "succeeded":
-            self.store.set_result(job.job_id, summary)
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.SUCCEEDED,
                 summary=summary,
+                result=summary,
             )
         elif result_status == "failed":
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.FAILED,
                 summary=summary,
                 error="task_failed",
             )
         else:
-            terminal = self.store.transition(
+            terminal = self._finish_running(
                 job.job_id,
                 JobState.CANCELLED,
                 summary=summary,
             )
-        self._terminal(terminal)
+        if terminal is not None:
+            self._terminal(terminal)
+
+    def _finish_running(
+        self,
+        job_id: str,
+        state: JobState,
+        *,
+        summary: str | None = None,
+        error: str | None = None,
+        result: str | None = None,
+    ) -> Job | None:
+        with self._job_lock(job_id):
+            job = self.store.get(job_id)
+            if job.state is not JobState.RUNNING:
+                return None
+            if result is not None:
+                self.store.set_result(job_id, result)
+            return self.store.transition(
+                job_id,
+                state,
+                summary=summary,
+                error=error,
+            )
 
     def _reattach(self) -> None:
         for job in self.store.active():
