@@ -117,27 +117,37 @@ def test_launch_resolves_session_id_from_agents_fallback(tmp_path):
     )
 
 
-def test_status_maps_running_literal():
-    assert launcher_for_state("working").status("abcdef12") == "running"
+def test_status_maps_running_literal(tmp_path):
+    launcher = launcher_for_state("working")
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "running"
 
 
-def test_status_maps_done_literal():
-    assert launcher_for_state("ready-for-review").status("abcdef12") == "done"
+def test_status_maps_done_literal(tmp_path):
+    launcher = launcher_for_state("ready-for-review")
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "done"
 
 
-def test_status_maps_failed_literal():
-    assert launcher_for_state("error").status("abcdef12") == "failed"
+def test_status_maps_failed_literal(tmp_path):
+    launcher = launcher_for_state("error")
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "failed"
 
 
-def test_status_maps_needs_input_literal():
-    assert launcher_for_state("waiting").status("abcdef12") == "needs_input"
+def test_status_maps_needs_input_literal(tmp_path):
+    launcher = launcher_for_state("waiting")
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "needs_input"
 
 
-def test_status_maps_unknown_literal():
-    assert launcher_for_state("mystery").status("abcdef12") == "unknown"
+def test_status_maps_unknown_literal(tmp_path):
+    launcher = launcher_for_state("mystery")
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "unknown"
 
 
-def test_logs_strip_ansi_and_collapse_only_consecutive_identical_lines():
+def test_logs_strip_ansi_and_collapse_only_consecutive_identical_lines(tmp_path):
     stdout = (
         "\x1b[31mA\x1b[0m\n"
         "\x1b[31mA\x1b[0m\n"
@@ -149,7 +159,31 @@ def test_logs_strip_ansi_and_collapse_only_consecutive_identical_lines():
     runner = RecordingRunner([command_result(stdout)])
     launcher = ClaudeLauncher("claude", runner=runner)
 
-    assert launcher.logs("abcdef12") == ["A", "B", "A", "A"]
+    assert launcher.logs("abcdef12", cwd=tmp_path) == ["A", "B", "A", "A"]
+
+
+def test_session_operations_use_explicit_working_directory(tmp_path):
+    rows = json.dumps([{"id": "abcdef12", "state": "working"}])
+    runner = RecordingRunner(
+        [
+            command_result(rows),
+            command_result("output"),
+            command_result(),
+        ]
+    )
+    launcher = ClaudeLauncher("claude", runner=runner)
+
+    assert launcher.status("abcdef12", cwd=tmp_path) == "running"
+    assert launcher.logs("abcdef12", cwd=tmp_path) == ["output"]
+    launcher.cancel("abcdef12", cwd=tmp_path)
+
+    assert [call[1]["cwd"] for call in runner.calls] == [
+        tmp_path,
+        tmp_path,
+        tmp_path,
+    ]
+    assert runner.calls[0][0][-1] == str(tmp_path)
+    assert "--cwd" not in runner.calls[1][0]
 
 
 def test_parse_result_accepts_succeeded_status():
@@ -159,6 +193,43 @@ def test_parse_result_accepts_succeeded_status():
     assert parse_result([frame], nonce="nonce", job_id=job_id) == (
         "succeeded",
         "completed",
+    )
+
+
+def test_parse_result_accepts_realistic_two_line_wrapped_frame():
+    job_id = str(uuid4())
+    summary = (
+        "Wrote a 3-line haiku about maps to haiku.txt in the working folder "
+        "and verified its contents."
+    )
+    first = (
+        f"  ATLAS_RESULT_V1:nonce:{{\"job_id\":\"{job_id}\","
+        "\"status\":\"succeeded\",\"summary\":\"Wrote a 3-line haiku about maps "
+        "to haiku.txt in the working folder  "
+    )
+    second = (
+        "  and verified its contents.\",\"error_code\":null,"
+        "\"artifacts\":[\"C:\\\\Users\\\\danie\\\\haiku.txt\"]}"
+    )
+
+    assert parse_result([first, second], nonce="nonce", job_id=job_id) == (
+        "succeeded",
+        summary,
+    )
+
+
+def test_parse_result_accepts_three_line_wrapped_frame_with_terminal_noise():
+    job_id = str(uuid4())
+    logs = [
+        f"ATLAS_RESULT_V1:nonce:{{\"job_id\":\"{job_id}\",",
+        '    "status":"succeeded","summary":"three',
+        '    lines","error_code":null,"artifacts":[]} trailing chrome',
+        "✻ Baked for 14s",
+    ]
+
+    assert parse_result(logs, nonce="nonce", job_id=job_id) == (
+        "succeeded",
+        "three lines",
     )
 
 

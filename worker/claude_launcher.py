@@ -109,25 +109,36 @@ def parse_result(
     job_id: str,
 ) -> tuple[ResultStatus, str] | None:
     prefix = f"ATLAS_RESULT_V1:{nonce}:"
+    clean_lines = [_ANSI_ESCAPE.sub("", line) for line in logs]
+    decoder = json.JSONDecoder()
     frames = []
-    for line in logs:
-        clean = _ANSI_ESCAPE.sub("", line).lstrip()
-        if clean.startswith(prefix):
-            frames.append(clean[len(prefix):].strip())
+    for index, line in enumerate(clean_lines):
+        prefix_index = line.find(prefix)
+        if prefix_index < 0:
+            continue
+        first = line[prefix_index + len(prefix):].rstrip()
+        candidate = " ".join(
+            [first, *(item.strip() for item in clean_lines[index + 1:])]
+        )
+        object_index = candidate.find("{")
+        if object_index < 0:
+            continue
+        try:
+            frame, _ = decoder.raw_decode(candidate[object_index:])
+        except json.JSONDecodeError:
+            continue
+        if frame not in frames:
+            frames.append(frame)
 
-    unique_frames = list(dict.fromkeys(frames))
     result_frames = [
         frame
-        for frame in unique_frames
-        if not _is_worker_result_template(frame, job_id=job_id)
+        for frame in frames
+        if not _is_worker_result_template(json.dumps(frame), job_id=job_id)
     ]
     if len(result_frames) != 1:
         return None
 
-    try:
-        raw = json.loads(result_frames[0])
-    except json.JSONDecodeError:
-        return None
+    raw = result_frames[0]
     if not isinstance(raw, dict):
         return None
     if raw.get("job_id") != job_id:
@@ -154,7 +165,6 @@ class ClaudeLauncher:
         self.runner = runner
         self.model = model
         self.environment = scrubbed_environment(environment)
-        self._cwd: dict[str, Path] = {}
 
     @property
     def available(self) -> bool:
@@ -224,7 +234,6 @@ class ClaudeLauncher:
         background_id = _parse_background_session_id(result.stdout)
         if background_id is None:
             background_id = self._resolve_background_session(name, cwd)
-        self._cwd[background_id] = cwd
         return background_id
 
     def _background_sessions(self, cwd: Path) -> tuple[tuple[str, str, str], ...]:
@@ -294,8 +303,7 @@ class ClaudeLauncher:
             if name in names and state not in terminal
         )
 
-    def status(self, session_id: str) -> SessionStatus:
-        cwd = self._cwd.get(session_id, Path.cwd())
+    def status(self, session_id: str, *, cwd: Path) -> SessionStatus:
         try:
             rows = self._background_sessions(cwd)
         except LauncherError:
@@ -313,8 +321,7 @@ class ClaudeLauncher:
                 return "failed"
         return "unknown"
 
-    def logs(self, session_id: str) -> list[str]:
-        cwd = self._cwd.get(session_id, Path.cwd())
+    def logs(self, session_id: str, *, cwd: Path) -> list[str]:
         argv = (self.executable or "claude", "logs", session_id)
         result = self._run(argv, cwd)
         if result.returncode != 0:
@@ -329,8 +336,7 @@ class ClaudeLauncher:
             collapsed.append(clean)
         return collapsed
 
-    def cancel(self, session_id: str) -> None:
-        cwd = self._cwd.get(session_id, Path.cwd())
+    def cancel(self, session_id: str, *, cwd: Path) -> None:
         argv = (self.executable or "claude", "stop", session_id)
         result = self._run(argv, cwd)
         if result.returncode != 0:

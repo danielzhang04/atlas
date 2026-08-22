@@ -56,17 +56,17 @@ class FakeLauncher:
             raise self.launch_error
         return self.session_id
 
-    def logs(self, session_id):
-        self.log_calls.append(session_id)
+    def logs(self, session_id, *, cwd):
+        self.log_calls.append((session_id, cwd))
         index = min(len(self.log_calls) - 1, len(self.log_frames) - 1)
         return list(self.log_frames[index])
 
-    def status(self, session_id):
-        self.status_calls.append(session_id)
+    def status(self, session_id, *, cwd):
+        self.status_calls.append((session_id, cwd))
         return self.status_value
 
-    def cancel(self, session_id):
-        self.cancel_calls.append(session_id)
+    def cancel(self, session_id, *, cwd):
+        self.cancel_calls.append((session_id, cwd))
 
 
 def make_store():
@@ -179,6 +179,30 @@ def test_run_appends_each_new_redrawn_log_line_exactly_once(tmp_path):
     assert output_texts(store, job.job_id) == ["A", "B", "C"]
 
 
+def test_run_drops_empty_and_non_alphanumeric_output_lines(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    lines = [
+        "",
+        "   ",
+        "───…",
+        "❯",
+        "⏵⏵ auto mode on …",
+        "✻ Baked for 14s",
+        "  useful output  ",
+    ]
+    launcher = FakeLauncher(log_frames=[lines], status="running")
+    manager = WorkManager(store, launcher, tmp_path)
+
+    manager._poll(job)
+
+    assert output_texts(store, job.job_id) == [
+        "⏵⏵ auto mode on …",
+        "✻ Baked for 14s",
+        "  useful output  ",
+    ]
+
+
 def test_done_succeeded_frame_stores_summary_and_result(tmp_path):
     store = make_store()
     job = make_running_job(store)
@@ -270,7 +294,7 @@ def test_cancel_on_running_calls_launcher_and_records_cancelled(tmp_path):
 
     terminal = manager.cancel(job.job_id)
 
-    assert launcher.cancel_calls == ["fedcba98"]
+    assert launcher.cancel_calls == [("fedcba98", tmp_path / job.job_id)]
     assert terminal.state is JobState.CANCELLED
 
 
@@ -304,7 +328,7 @@ def test_cancel_while_launching_never_becomes_running_and_cancels_session(tmp_pa
     assert cancelled.state is JobState.CANCELLED
     assert store.get(job.job_id).state is JobState.CANCELLED
     assert states == ["queued", "launching", "cancelled"]
-    assert launcher.cancel_calls == ["fedcba98"]
+    assert launcher.cancel_calls == [("fedcba98", tmp_path / job.job_id)]
 
 
 def test_cancel_on_succeeded_is_a_no_op_without_callback(tmp_path):
@@ -406,9 +430,41 @@ def test_restart_reattaches_and_polls_running_rows(tmp_path):
 
     asyncio.run(scenario())
 
-    assert launcher.log_calls[0] == "fedcba98"
+    assert launcher.log_calls[0] == (
+        "fedcba98",
+        tmp_path / job.job_id,
+    )
+    assert launcher.status_calls[0] == (
+        "fedcba98",
+        tmp_path / job.job_id,
+    )
     assert output_texts(store, job.job_id) == ["already stored", "reattached"]
     assert store.get(job.job_id).state is JobState.RUNNING
+
+
+def test_run_logs_poll_failures_without_exception_message(tmp_path, caplog):
+    store = make_store()
+    job = make_running_job(store)
+    launcher = FakeLauncher()
+    manager = WorkManager(store, launcher, tmp_path)
+    stop = asyncio.Event()
+
+    def fail_poll(polled_job):
+        stop.set()
+        raise RuntimeError("sensitive detail")
+
+    manager._poll = fail_poll
+
+    async def scenario():
+        await manager.run(stop)
+
+    with caplog.at_level("WARNING", logger="atlas.work"):
+        asyncio.run(scenario())
+
+    assert caplog.messages == [
+        f"poll failed for job {job.job_id}: RuntimeError",
+    ]
+    assert "sensitive detail" not in caplog.text
 
 
 def test_restart_fails_sessionless_rows_as_orphaned(tmp_path):
