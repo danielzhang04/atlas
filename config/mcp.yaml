@@ -7,4 +7,4 @@ servers:
 defaults:
   instant_prefixes: [get_, list_, search_, query_, read_, check_]
   call_timeout_s: 8
-  connect_timeout_s: 20
+  connect_timeout_s: 60

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
+from datetime import datetime
 from typing import Any, Protocol
 
 from .tools import ToolRegistry, ToolResult
@@ -117,6 +118,7 @@ class Brain:
         turn_timeout_s: float = 12.0,
         history_exchanges: int = 8,
         on_tool: Callable[[str, ToolResult], None] | None = None,
+        clock: Callable[[], datetime] = datetime.now,
     ) -> None:
         self.client = client
         self.registry: _Registry = registry
@@ -125,6 +127,7 @@ class Brain:
         self.turn_timeout_s = turn_timeout_s
         self.history_exchanges = history_exchanges
         self.on_tool = on_tool
+        self._clock = clock
         self._pending_confirm_id: str | None = None
         rules = BASE_SYSTEM
         if google_account:
@@ -162,6 +165,9 @@ class Brain:
             "type": "text",
             "text": self._turn_system(),
             "cache_control": {"type": "ephemeral"},
+        }, {
+            "type": "text",
+            "text": self._now_system_text(),
         }]
         tools = self._request_tools()
         spoken: list[str] = []
@@ -263,3 +269,7 @@ class Brain:
             + self._pending_confirm_id
             + ". Use it only if Daniel clearly confirms this pending action."
         )
+
+    def _now_system_text(self) -> str:
+        now = self._clock().astimezone()
+        return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import ModuleType
 from typing import Any, Awaitable, Callable, Literal
@@ -13,6 +14,7 @@ from typing import Any, Awaitable, Callable, Literal
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
+import pytest
 
 
 try:
@@ -32,6 +34,7 @@ except ModuleNotFoundError:
     tools_module.Policy = Literal["instant", "confirm"]
     sys.modules["worker.tools"] = tools_module
 
+import worker.mcp_client as mcp_client
 from worker.mcp_client import McpServers, load_mcp_config, policy_for
 
 
@@ -41,6 +44,39 @@ class FakeRegistry:
 
     def register(self, tool) -> None:
         self.tools.append(tool)
+
+
+def test_stdio_session_discards_child_stderr(monkeypatch):
+    class StopSession(Exception):
+        pass
+
+    class FakeStdioClient:
+        async def __aenter__(self):
+            raise StopSession
+
+        async def __aexit__(self, *_args):
+            return False
+
+    seen = {}
+
+    def fake_stdio_client(spec, *, errlog):
+        seen["spec"] = spec
+        seen["errlog"] = errlog
+        return FakeStdioClient()
+
+    monkeypatch.setattr(mcp_client, "stdio_client", fake_stdio_client)
+
+    async def scenario():
+        with pytest.raises(StopSession):
+            async with mcp_client._stdio_session(
+                "google",
+                mcp_client.StdioServerParameters(command="node"),
+            ):
+                pass
+
+    asyncio.run(scenario())
+    assert seen["spec"].command == "node"
+    assert seen["errlog"] is subprocess.DEVNULL
 
 
 def _server() -> FastMCP:

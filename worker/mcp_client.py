@@ -8,6 +8,7 @@ from datetime import timedelta
 import json
 import logging
 from pathlib import Path
+import subprocess
 from typing import Any, AsyncContextManager, TYPE_CHECKING
 import unicodedata
 
@@ -52,7 +53,7 @@ def policy_for(server_cfg: Mapping, defaults: Mapping, tool_name: str) -> Policy
 async def _stdio_session(
     _server_name: str, spec: StdioServerParameters
 ):
-    async with stdio_client(spec) as (read_stream, write_stream):
+    async with stdio_client(spec, errlog=subprocess.DEVNULL) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             yield session

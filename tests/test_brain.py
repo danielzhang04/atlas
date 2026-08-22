@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -117,7 +118,10 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         ["First sentence. Sec", "ond sentence! Tail"],
         content=[text_block("First sentence. Second sentence! Tail")],
     ))
-    brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.")
+    local_timezone = datetime.now().astimezone().tzinfo
+    clock = lambda: datetime(2026, 8, 22, 9, 41, 29, tzinfo=local_timezone)
+    now = clock().astimezone()
+    brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock)
 
     chunks = asyncio.run(collect(brain, "Hello"))
 
@@ -127,11 +131,18 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         {"role": "assistant", "content": "First sentence. Second sentence! Tail"},
     ]
     call = client.messages.calls[0]
-    assert call["system"] == [{
-        "type": "text",
-        "text": BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed.",
-        "cache_control": {"type": "ephemeral"},
-    }]
+    assert call["system"] == [
+        {
+            "type": "text",
+            "text": BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed.",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
+        },
+    ]
+    assert "cache_control" not in call["system"][1]
     assert call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in call["tools"][0]
     assert call["tool_choice"] == {"type": "auto"}
