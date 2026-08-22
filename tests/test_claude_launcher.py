@@ -7,6 +7,7 @@ from worker.claude_launcher import (
     METERED_PROVIDER_ENV,
     parse_result,
     scrubbed_environment,
+    worker_prompt,
 )
 
 
@@ -279,6 +280,33 @@ def test_parse_result_rejects_template_echo():
     frame = f"ATLAS_RESULT_V1:nonce:{json.dumps(payload)}"
 
     assert parse_result([frame], nonce="nonce", job_id=job_id) is None
+
+
+def test_parse_result_ignores_wrapped_prompt_template_and_accepts_real_frame():
+    job_id = str(uuid4())
+    logs = [
+        f'ATLAS_RESULT_V1:nonce:{{"job_id":"{job_id}",',
+        '  "status":"succeeded|failed|cancelled","summary":"bounded factual',
+        '                                      summary","error_code":null,"artifacts":[]}',
+        "ordinary terminal output",
+        f'ATLAS_RESULT_V1:nonce:{{"job_id":"{job_id}","status":"succeeded",',
+        '  "summary":"finished cleanly","error_code":null,"artifacts":[]}',
+    ]
+
+    assert parse_result(logs, nonce="nonce", job_id=job_id) == (
+        "succeeded",
+        "finished cleanly",
+    )
+
+
+def test_worker_prompt_template_has_one_closing_object_brace():
+    job_id = str(uuid4())
+
+    prompt = worker_prompt(job_id, "nonce", "Do it")
+    template = prompt.split("\n\n", 1)[0]
+
+    assert template.endswith('"artifacts":[]}')
+    assert not template.endswith('"artifacts":[]}}')
 
 
 def test_parse_result_rejects_two_conflicting_frames():

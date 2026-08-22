@@ -1,7 +1,5 @@
 import sqlite3
 
-import pytest
-
 from worker.jobstore import JobState, JobStore, SCHEMA_VERSION
 
 
@@ -131,14 +129,42 @@ def test_append_output_truncates_lines_to_2048_characters():
     assert event.text == "x" * 2_048
 
 
-def test_append_output_rejects_more_than_2000_lines():
+def test_append_output_past_2000_line_cap_returns_none_without_persisting():
     store = make_store()
     job = store.create("Task", "brief")
     for index in range(2_000):
         store.append_output(job.job_id, f"line {index}")
 
-    with pytest.raises(ValueError, match="output limit"):
-        store.append_output(job.job_id, "one too many")
+    result = store.append_output(job.job_id, "one too many")
+
+    output = [event for event in store.events(job.job_id) if event.kind == "output"]
+    assert result is None
+    assert len(output) == 2_000
+    assert all(event.text != "one too many" for event in output)
+
+
+def test_append_output_redacts_named_secret_assignments_before_persisting():
+    store = make_store()
+    job = store.create("Task", "brief")
+
+    event = store.append_output(
+        job.job_id,
+        "api_key=alpha access-token:bravo refresh_token=charlie secret:delta "
+        "password=echo Authorization:foxtrot bearer=golf",
+    )
+
+    assert event.text == " ".join(["[redacted]"] * 7)
+    assert store.events(job.job_id)[-1].text == event.text
+
+
+def test_append_output_redacts_anthropic_key_shapes_before_persisting():
+    store = make_store()
+    job = store.create("Task", "brief")
+
+    event = store.append_output(job.job_id, "key sk-ant-AbCdEf0123_more tail")
+
+    assert event.text == "key [redacted] tail"
+    assert store.events(job.job_id)[-1].text == event.text
 
 
 def test_append_output_strips_control_characters():

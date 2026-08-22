@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import os
 from pathlib import Path
-from urllib.parse import quote
 import webbrowser
 
 import yaml
@@ -76,6 +75,9 @@ async def serve(port: int | None = None, *, open_browser: bool = True) -> None:
             mcp_provider=mcp.status,
             health_provider=lambda: {"claude": launcher.available, "mcp": mcp.status()},
         )
+        bootstrap_url = stateserver.pairing_url(authorizer, server.port)
+        if bootstrap_url is None:
+            raise RuntimeError("Atlas UI pairing is unavailable")
     except Exception:
         stop_work.set()
         await asyncio.gather(work_task, return_exceptions=True)
@@ -83,10 +85,6 @@ async def serve(port: int | None = None, *, open_browser: bool = True) -> None:
         await mcp.close()
         store.close()
         raise
-    bootstrap_url = (
-        f"http://{stateserver.HOST}:{server.port}/"
-        f"#pair={quote(authorizer.pairing_token, safe='')}"
-    )
     print(f"Atlas UI: http://{stateserver.HOST}:{server.port}/", flush=True)
     opened = await asyncio.to_thread(_open_pairing_window, bootstrap_url) if open_browser else False
     if open_browser and not opened:

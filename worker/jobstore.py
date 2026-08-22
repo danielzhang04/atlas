@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -25,6 +26,12 @@ _TERMINAL_STATES = (
     "failed",
     "cancelled",
 )
+_SECRET_SHAPED = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|"
+    r"authorization|bearer)\s*[:=]\s*\S+",
+    re.I,
+)
+_ANTHROPIC_KEY = re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}")
 
 
 class JobState(str, Enum):
@@ -272,14 +279,16 @@ class JobStore:
             self._db.commit()
         return self.get(job_id)
 
-    def append_output(self, job_id: str, text: str) -> JobEvent:
+    def append_output(self, job_id: str, text: str) -> JobEvent | None:
         if not isinstance(text, str):
             raise TypeError("output must be text")
         clean = "".join(
             character
             for character in text
             if ord(character) >= 32 and ord(character) != 127
-        )[:2_048]
+        )
+        clean = _SECRET_SHAPED.sub("[redacted]", clean)
+        clean = _ANTHROPIC_KEY.sub("[redacted]", clean)[:2_048]
         now = float(self._clock())
         with self._lock:
             count = self._db.execute(
@@ -287,7 +296,7 @@ class JobStore:
                 (job_id,),
             ).fetchone()[0]
             if count >= 2_000:
-                raise ValueError("output limit reached")
+                return None
             sequence = self._append(job_id, now, "output", clean)
             self._db.commit()
         return JobEvent(sequence, now, "output", clean)

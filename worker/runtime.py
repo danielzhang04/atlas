@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .brain import Brain
 from .claude_launcher import ClaudeLauncher
@@ -44,6 +44,7 @@ def build(
     client: Any = None,
     launcher: ClaudeLauncher | None = None,
     session_factory=None,
+    paired_url: Callable[[], str | None] | None = None,
 ) -> Runtime:
     """Build services without connecting MCP or starting background work."""
     model = _required_text(cfg, "fast_model")
@@ -59,7 +60,12 @@ def build(
     store = JobStore(store_path if store_path == ":memory:" else _path(store_path))
     work = WorkManager(store, launcher or ClaudeLauncher(), _path(workspace_path))
     registry = ToolRegistry()
-    builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work)
+    builtin(
+        registry,
+        load_apps(ATLAS / "config" / "apps.yaml"),
+        work,
+        paired_url=paired_url,
+    )
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}
     mcp = McpServers(load_mcp_config(ATLAS / "config" / "mcp.yaml"), **mcp_kwargs)
     if client is None:

@@ -8,7 +8,7 @@ def test_standalone_ui_uses_the_loopback_server_and_fragment_pairing():
     source = (ui_server.ATLAS / "worker" / "ui_server.py").read_text(encoding="utf-8")
     client = (ui_server.ATLAS / "ui" / "app.js").read_text(encoding="utf-8")
     assert ui_server.stateserver.HOST == "127.0.0.1"
-    assert "#pair=" in source
+    assert "stateserver.pairing_url" in source
     assert "window.location.hash" in client
     assert "history.replaceState" in client
     assert "localStorage" not in client and "sessionStorage" not in client
@@ -26,6 +26,8 @@ def test_workers_poll_incremental_events_and_history_fetches_paired_results():
     client = (ui_server.ATLAS / "ui" / "app.js").read_text(encoding="utf-8")
     assert 'fetch("/jobs", {cache: "no-store"})' in client
     assert "/events?after=${lastSequence}" in client
+    assert "if (!actionToken) return;" in client
+    assert "pair to view output" in client
     assert "setInterval(refreshJobs, 1000)" in client
     assert "/jobs/${encodeURIComponent(jobId)}/result" in client
     assert "stateserver" not in client

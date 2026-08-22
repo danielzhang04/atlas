@@ -38,7 +38,13 @@ class _Registry(Protocol):
     def schemas(self) -> list[dict[str, Any]]:
         ...
 
-    async def call(self, name: str, arguments: Mapping[str, Any]) -> Any:
+    async def call(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        tainted: bool = False,
+    ) -> Any:
         ...
 
 
@@ -173,6 +179,7 @@ class Brain:
         spoken: list[str] = []
         buffer = ""
         tool_rounds = 0
+        tainted = False
         try:
             async with asyncio.timeout(self.turn_timeout_s):
                 while True:
@@ -202,6 +209,7 @@ class Brain:
                     if not tool_blocks:
                         raise ValueError("tool_use response did not contain a tool call")
                     results = []
+                    external_result = False
                     for block in tool_blocks:
                         name = _field(block, "name")
                         call_id = _field(block, "id")
@@ -214,6 +222,7 @@ class Brain:
                             raise ValueError("invalid tool call")
                         rejected_confirmation = (
                             name == "confirm"
+                            and not tainted
                             and (
                                 allowed_confirm_id is None
                                 or arguments.get("confirm_id") != allowed_confirm_id
@@ -222,7 +231,13 @@ class Brain:
                         if rejected_confirmation:
                             result = ToolResult("error", "confirmation requires a later turn")
                         else:
-                            result = await self.registry.call(name, arguments)
+                            result = await self.registry.call(
+                                name,
+                                arguments,
+                                tainted=tainted,
+                            )
+                        if "__" in name:
+                            external_result = True
                         result_content = result.content
                         if result.status == "needs_confirmation" and result.confirm_id:
                             self._pending_confirm_id = result.confirm_id
@@ -230,7 +245,11 @@ class Brain:
                                 f"needs_confirmation (confirm_id: {result.confirm_id}): "
                                 f"{result.content}"
                             )
-                        elif name in {"confirm", "cancel_pending"} and not rejected_confirmation:
+                        elif (
+                            name in {"confirm", "cancel_pending"}
+                            and not rejected_confirmation
+                            and not (name == "confirm" and tainted)
+                        ):
                             self._pending_confirm_id = None
                         results.append({
                             "type": "tool_result",
@@ -244,6 +263,7 @@ class Brain:
                         {"role": "assistant", "content": [_block_dict(block) for block in content]},
                         {"role": "user", "content": results},
                     ))
+                    tainted = tainted or external_result
                     tool_rounds += 1
 
                 if buffer:

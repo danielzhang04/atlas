@@ -14,10 +14,11 @@ import re
 import secrets
 import time
 from typing import Any, Callable
+from urllib.parse import quote
 
 from aiohttp import web
 
-__all__ = ["HEADER", "HOST", "PairingAuthorizer", "StateServer", "start"]
+__all__ = ["HEADER", "HOST", "PairingAuthorizer", "StateServer", "pairing_url", "start"]
 
 logger = logging.getLogger("atlas.stateserver")
 
@@ -99,15 +100,35 @@ class PairingAuthorizer:
             raise PermissionError("Atlas UI pairing is invalid or expired")
 
 
-@web.middleware
-async def _security_headers(request: web.Request, handler) -> web.StreamResponse:
+def pairing_url(authorizer: PairingAuthorizer, port: int) -> str | None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        return None
     try:
-        response = await handler(request)
-    except web.HTTPException as exc:
-        _add_security_headers(exc)
-        raise
-    _add_security_headers(response)
-    return response
+        token = authorizer.pairing_token
+    except PermissionError:
+        return None
+    return f"http://{HOST}:{port}/#pair={quote(token, safe='')}"
+
+
+def _security_middleware(port: Callable[[], int]):
+    @web.middleware
+    async def middleware(request: web.Request, handler) -> web.StreamResponse:
+        try:
+            serving_port = port()
+            allowed_hosts = {
+                f"127.0.0.1:{serving_port}",
+                f"localhost:{serving_port}",
+            }
+            if request.headers.get("Host") not in allowed_hosts:
+                raise web.HTTPForbidden(text="loopback Host required")
+            response = await handler(request)
+        except web.HTTPException as exc:
+            _add_security_headers(exc)
+            raise
+        _add_security_headers(response)
+        return response
+
+    return middleware
 
 
 def _add_security_headers(response: web.StreamResponse) -> None:
@@ -288,6 +309,7 @@ class StateServer:
         )
 
     async def _handle_job_events(self, request: web.Request) -> web.Response:
+        self._authorize(request)
         job_id = request.match_info["job_id"]
         if JOB_ID.fullmatch(job_id) is None or self._job_event_provider is None:
             raise web.HTTPNotFound()
@@ -414,7 +436,7 @@ class StateServer:
         return web.json_response({"job": job}, headers={"cache-control": "no-store"})
 
     async def start(self, port: int) -> "StateServer":
-        app = web.Application(middlewares=[_security_headers])
+        app = web.Application(middlewares=[_security_middleware(lambda: self.port)])
         app.router.add_get("/", self._handle_index)
         for route in UI_ASSETS:
             app.router.add_get(route, self._handle_asset)

@@ -76,8 +76,11 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
     }]
 
     async def scenario():
+        authorizer = stateserver.PairingAuthorizer(token="pair-token")
+        bearer = authorizer.pair("pair-token")
         server = await stateserver.start(
             StatePublisher(clock=lambda: _dt(0)), 0,
+            authorizer=authorizer,
             job_provider=lambda: jobs,
             job_event_provider=lambda requested, after: (
                 after_seen.append((requested, after)) or events
@@ -85,14 +88,27 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
             mcp_provider=lambda: mcp,
             health_provider=lambda: {"claude": True, "mcp": mcp},
         )
+        event_headers = {stateserver.HEADER: bearer}
         try:
             return (
                 await _request(server, path="/jobs"),
-                await _request(server, path=f"/jobs/{job_id}/events?after=3"),
+                await _request(
+                    server,
+                    path=f"/jobs/{job_id}/events?after=3",
+                    headers=event_headers,
+                ),
                 await _request(server, path="/mcp"),
                 await _request(server, path="/health"),
-                await _request(server, path=f"/jobs/{job_id}/events?after=bad"),
-                await _request(server, path=f"/jobs/{job_id}/events?after={'9' * 21}"),
+                await _request(
+                    server,
+                    path=f"/jobs/{job_id}/events?after=bad",
+                    headers=event_headers,
+                ),
+                await _request(
+                    server,
+                    path=f"/jobs/{job_id}/events?after={'9' * 21}",
+                    headers=event_headers,
+                ),
             )
         finally:
             await server.stop()
@@ -116,15 +132,24 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
     assert oversized[0] == 400
 
 
-def test_pairing_protects_private_results_and_job_cancellation():
+def test_pairing_protects_job_events_private_results_and_cancellation():
     job_id = str(uuid4())
     cancelled = []
+    events = [SimpleNamespace(
+        sequence=2,
+        timestamp=12.5,
+        kind="output",
+        text="private output",
+    )]
 
     async def scenario():
         authorizer = stateserver.PairingAuthorizer(token="pair-token")
         server = await stateserver.start(
             StatePublisher(clock=lambda: _dt(0)), 0,
             authorizer=authorizer,
+            job_event_provider=lambda requested, _after: (
+                events if requested == job_id else []
+            ),
             result_provider=lambda requested: "Private result" if requested == job_id else None,
             cancel_provider=lambda requested: cancelled.append(requested) or {
                 "id": requested, "title": "Work", "status": "cancelled",
@@ -135,6 +160,10 @@ def test_pairing_protects_private_results_and_job_cancellation():
         origin = f"http://127.0.0.1:{server.port}"
         json_headers = {"content-type": "application/json", "origin": origin}
         try:
+            denied_events = await _request(
+                server,
+                path=f"/jobs/{job_id}/events",
+            )
             denied = await _request(server, path=f"/jobs/{job_id}/result")
             bad_pair = await _request(
                 server, "POST", "/pair", body=json.dumps({"token": "\u2603"}),
@@ -146,21 +175,73 @@ def test_pairing_protects_private_results_and_job_cancellation():
             )
             bearer = json.loads(paired[2])["action_token"]
             authorized = {**json_headers, stateserver.HEADER: bearer}
+            event_response = await _request(
+                server,
+                path=f"/jobs/{job_id}/events",
+                headers=authorized,
+            )
             result = await _request(
                 server, path=f"/jobs/{job_id}/result", headers=authorized,
             )
             cancel = await _request(
                 server, "POST", f"/jobs/{job_id}/cancel", body="{}", headers=authorized,
             )
-            return denied, bad_pair, paired, result, cancel
+            return denied_events, denied, bad_pair, paired, event_response, result, cancel
         finally:
             await server.stop()
 
-    denied, bad_pair, paired, result, cancel = asyncio.run(scenario())
-    assert denied[0] == 401 and bad_pair[0] == 401 and paired[0] == 200
+    denied_events, denied, bad_pair, paired, event_response, result, cancel = asyncio.run(
+        scenario()
+    )
+    assert denied_events[0] == 401
+    assert denied[0] == 401
+    assert bad_pair[0] == 401
+    assert paired[0] == 200
+    assert json.loads(event_response[2]) == {"events": [{
+        "sequence": 2,
+        "timestamp": 12.5,
+        "kind": "output",
+        "text": "private output",
+    }]}
     assert json.loads(result[2]) == {"job_id": job_id, "result": "Private result"}
     assert json.loads(cancel[2])["job"]["status"] == "cancelled"
     assert cancelled == [job_id]
+
+
+def test_host_allowlist_rejects_every_method_and_route_before_dispatch():
+    async def scenario():
+        server = await stateserver.start(StatePublisher(clock=lambda: _dt(0)), 0)
+        allowed = {"Host": f"localhost:{server.port}"}
+        rejected = [
+            ("GET", "/state", {"Host": f"evil.test:{server.port}"}),
+            ("POST", "/pair", {"Host": "localhost"}),
+            ("DELETE", "/not-a-route", {"Host": f"LOCALHOST:{server.port}"}),
+        ]
+        try:
+            accepted = await _request(server, path="/state", headers=allowed)
+            denied = [
+                await _request(server, method, path, headers=headers)
+                for method, path, headers in rejected
+            ]
+            return accepted, denied
+        finally:
+            await server.stop()
+
+    accepted, denied = asyncio.run(scenario())
+
+    assert accepted[0] == 200
+    assert [response[0] for response in denied] == [403, 403, 403]
+    assert all(response[1]["x-frame-options"] == "DENY" for response in denied)
+
+
+def test_pairing_url_contains_one_time_fragment_and_disappears_after_pairing():
+    authorizer = stateserver.PairingAuthorizer(token="pair token/+")
+
+    url = stateserver.pairing_url(authorizer, 4360)
+    authorizer.pair("pair token/+")
+
+    assert url == "http://127.0.0.1:4360/#pair=pair%20token%2F%2B"
+    assert stateserver.pairing_url(authorizer, 4360) is None
 
 
 def test_removed_routes_and_unknown_assets_are_absent():

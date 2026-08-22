@@ -11,8 +11,8 @@ async def _return(value):
     return value
 
 
-def _call(registry, name, arguments):
-    return asyncio.run(registry.call(name, arguments))
+def _call(registry, name, arguments, **kwargs):
+    return asyncio.run(registry.call(name, arguments, **kwargs))
 
 
 def _tool(name="sample", *, run=None, policy="instant"):
@@ -169,6 +169,51 @@ def test_open_exe_and_focus_use_signed_profiles():
     assert focused == ["vscode"]
     result = _call(registry, "focus", {"app": "gmail"})
     assert result.status == "error" and result.content == "unknown app"
+
+
+def test_open_atlas_uses_the_paired_fragment_url_when_available():
+    opened = []
+    registry = ToolRegistry()
+    apps = {
+        "atlas": AppEntry(
+            url="http://127.0.0.1:4360/",
+            words=("atlas", "command center"),
+        ),
+    }
+    paired = "http://127.0.0.1:4360/#pair=one-time"
+    builtin(
+        registry,
+        apps,
+        _FakeWork(),
+        opener=opened.append,
+        paired_url=lambda: paired,
+    )
+
+    result = _call(registry, "open", {"target": "command center"})
+
+    assert result.status == "ok"
+    assert opened == [paired]
+
+
+def test_open_atlas_uses_the_static_alias_without_a_paired_url():
+    opened = []
+    registry = ToolRegistry()
+    static = "http://127.0.0.1:4360/"
+    apps = {
+        "atlas": AppEntry(url=static, words=("atlas",)),
+    }
+    builtin(
+        registry,
+        apps,
+        _FakeWork(),
+        opener=opened.append,
+        paired_url=lambda: None,
+    )
+
+    result = _call(registry, "open", {"target": "atlas"})
+
+    assert result.status == "ok"
+    assert opened == [static]
 
 
 @dataclass

@@ -326,10 +326,18 @@ def _health(mcp: mcp_client_mod.McpServers, launcher) -> dict:
 async def entrypoint(ctx: JobContext) -> None:
     envload.load_private_environment()
     cfg = _cfg()
-    services = runtime.build(cfg)
+    authorizer = stateserver.PairingAuthorizer()
+    server_box: dict[str, stateserver.StateServer] = {}
+
+    def _paired_url() -> str | None:
+        server = server_box.get("server")
+        if server is None:
+            return None
+        return stateserver.pairing_url(authorizer, server.port)
+
+    services = runtime.build(cfg, paired_url=_paired_url)
     publisher = state.StatePublisher(voice=cfg.get("active_voice"))
     engagement = engagement_mod.Engagement()
-    authorizer = stateserver.PairingAuthorizer()
     publisher.set_output_device(_output_device_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
@@ -397,6 +405,7 @@ async def entrypoint(ctx: JobContext) -> None:
         mcp_provider=services.mcp.status,
         health_provider=lambda: _health(services.mcp, services.work.launcher),
     )
+    server_box["server"] = server
 
     async def _shutdown() -> None:
         stop_work.set()

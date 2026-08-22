@@ -3,6 +3,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from worker.jobstore import JobState, JobStore
 from worker.work import WorkManager
 
@@ -30,6 +32,7 @@ class FakeLauncher:
         status="running",
         launch_started=None,
         release_launch=None,
+        cancel_error=None,
     ):
         self.launch_delay = launch_delay
         self.launch_error = launch_error
@@ -38,6 +41,7 @@ class FakeLauncher:
         self.status_value = status
         self.launch_started = launch_started
         self.release_launch = release_launch
+        self.cancel_error = cancel_error
         self.launch_calls = []
         self.log_calls = []
         self.status_calls = []
@@ -67,6 +71,8 @@ class FakeLauncher:
 
     def cancel(self, session_id, *, cwd):
         self.cancel_calls.append((session_id, cwd))
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
 
 def make_store():
@@ -218,6 +224,25 @@ def test_done_succeeded_frame_stores_summary_and_result(tmp_path):
     assert store.result(job.job_id) == "finished"
 
 
+def test_output_cap_does_not_prevent_last_line_result_frame_from_succeeding(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    launcher = FakeLauncher(status="done")
+    manager = WorkManager(store, launcher, tmp_path)
+    lines = [f"line {index}" for index in range(2_499)]
+    lines.append(result_frame(manager, job.job_id, "succeeded", "finished"))
+    launcher.log_frames = [lines]
+
+    manager._poll(job)
+
+    terminal = store.get(job.job_id)
+    output = [event for event in store.events(job.job_id) if event.kind == "output"]
+    assert len(lines) == 2_500
+    assert len(output) == 2_000
+    assert terminal.state is JobState.SUCCEEDED
+    assert terminal.summary == "finished"
+
+
 def test_done_failed_frame_records_task_failed_and_summary(tmp_path):
     store = make_store()
     job = make_running_job(store)
@@ -296,6 +321,27 @@ def test_cancel_on_running_calls_launcher_and_records_cancelled(tmp_path):
 
     assert launcher.cancel_calls == [("fedcba98", tmp_path / job.job_id)]
     assert terminal.state is JobState.CANCELLED
+
+
+def test_cancel_failure_leaves_job_running_reports_output_and_polling_continues(tmp_path):
+    store = make_store()
+    job = make_running_job(store, session_id="fedcba98")
+    launcher = FakeLauncher(
+        status="done",
+        cancel_error=RuntimeError("private launcher detail"),
+    )
+    manager = WorkManager(store, launcher, tmp_path)
+    launcher.log_frames = [[result_frame(manager, job.job_id, "succeeded", "finished")]]
+
+    with pytest.raises(RuntimeError, match="^cancel failed$"):
+        manager.cancel(job.job_id)
+
+    assert store.get(job.job_id).state is JobState.RUNNING
+    assert "cancel failed; still running" in output_texts(store, job.job_id)
+
+    manager._poll(job)
+
+    assert store.get(job.job_id).state is JobState.SUCCEEDED
 
 
 def test_cancel_while_launching_never_becomes_running_and_cancels_session(tmp_path):

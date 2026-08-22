@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from worker.brain import BASE_SYSTEM, Brain, split_spoken
+from worker.tools import AppEntry, Tool, ToolRegistry, builtin
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +24,7 @@ class FakeRegistry:
     def __init__(self, *results: ToolResult) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.taints: list[bool] = []
         self.when_called = None
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -39,10 +41,17 @@ class FakeRegistry:
             },
         ]
 
-    async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        tainted: bool = False,
+    ) -> ToolResult:
         if self.when_called is not None:
             self.when_called()
         self.calls.append((name, dict(arguments)))
+        self.taints.append(tainted)
         return self.results.pop(0) if self.results else ToolResult("ok", "done")
 
 
@@ -111,6 +120,38 @@ def tool_block(call_id="toolu_1", name="lookup", arguments=None):
 
 async def collect(brain: Brain, transcript: str) -> list[str]:
     return [chunk async for chunk in brain.respond(transcript)]
+
+
+async def return_value(value):
+    return value
+
+
+def registry_tool(name, run, *, policy="instant"):
+    return Tool(
+        name=name,
+        description="Test tool.",
+        input_schema={"type": "object", "properties": {}},
+        run=run,
+        policy=policy,
+    )
+
+
+class BrainWork:
+    def __init__(self):
+        self.launches = []
+
+    def launch(self, title, brief):
+        self.launches.append((title, brief))
+        return SimpleNamespace(job_id="job-1", title=title)
+
+    def active(self):
+        return []
+
+    def recent(self, _n):
+        return []
+
+    def cancel(self, job_id):
+        return SimpleNamespace(job_id=job_id, title="Task", state="cancelled")
 
 
 def test_plain_reply_streams_chunks_and_remembers_exchange():
@@ -240,6 +281,136 @@ def test_confirmation_cannot_execute_in_the_turn_that_created_it():
     assert registry.calls == [("mutate", {})]
     assert events == [("mutate", "needs_confirmation"), ("confirm", "error")]
     assert brain._pending_confirm_id == "confirm-123"
+
+
+def test_mcp_result_refuses_later_confirm_without_consuming_pending_and_next_turn_resets_taint(
+    monkeypatch,
+):
+    mutation_calls = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "mutate",
+        lambda arguments: return_value(mutation_calls.append(arguments) or "sent"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__read",
+        lambda _arguments: return_value("external content"),
+    ))
+    builtin(registry, {}, BrainWork())
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe",
+        lambda _length: "confirm-123",
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Should I send it?"], content=[text_block("Should I send it?")]),
+        FakeStream(content=[tool_block(name="google__read")], stop_reason="tool_use"),
+        FakeStream(
+            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Ask again next turn."], content=[text_block("Ask again next turn.")]),
+        FakeStream(
+            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Sent."], content=[text_block("Sent.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        first = await collect(brain, "Send it")
+        second = await collect(brain, "Check mail, then yes")
+        third = await collect(brain, "Yes, send it")
+        return first, second, third
+
+    first, second, third = asyncio.run(scenario())
+
+    refusal = client.messages.calls[4]["messages"][-1]["content"][0]
+    assert first == ["Should I send it?"]
+    assert second == ["Ask again next turn."]
+    assert refusal["content"] == (
+        "refused after external content; ask Daniel again next turn"
+    )
+    assert mutation_calls == [{}]
+    assert third == ["Sent."]
+
+
+def test_mcp_result_refuses_later_launch_work_without_launching():
+    work = BrainWork()
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__read",
+        lambda _arguments: return_value("external content"),
+    ))
+    builtin(registry, {}, work)
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="google__read")], stop_reason="tool_use"),
+        FakeStream(
+            content=[tool_block(
+                name="launch_work",
+                arguments={"title": "Research", "brief": "Do the work"},
+            )],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Ask again next turn."], content=[text_block("Ask again next turn.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Read this and research it")) == [
+        "Ask again next turn."
+    ]
+    refusal = client.messages.calls[2]["messages"][-1]["content"][0]
+    assert refusal["content"] == (
+        "refused after external content; ask Daniel again next turn"
+    )
+    assert work.launches == []
+
+
+def test_mcp_result_refuses_later_https_open_but_allows_configured_alias():
+    opened = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__read",
+        lambda _arguments: return_value("external content"),
+    ))
+    builtin(
+        registry,
+        {"gmail": AppEntry(url="https://mail.google.com/", words=("gmail",))},
+        BrainWork(),
+        opener=opened.append,
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="google__read")], stop_reason="tool_use"),
+        FakeStream(
+            content=[
+                tool_block(
+                    call_id="toolu_url",
+                    name="open",
+                    arguments={"target": "https://example.com/"},
+                ),
+                tool_block(
+                    call_id="toolu_alias",
+                    name="open",
+                    arguments={"target": "gmail"},
+                ),
+            ],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Gmail is open."], content=[text_block("Gmail is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Read this, open the link and Gmail")) == [
+        "Gmail is open."
+    ]
+    results = client.messages.calls[2]["messages"][-1]["content"]
+    assert results[0]["content"] == (
+        "refused after external content; ask Daniel again next turn"
+    )
+    assert results[1]["is_error"] is False
+    assert opened == ["https://mail.google.com/"]
 
 
 def test_streamed_text_is_yielded_before_tool_runs():

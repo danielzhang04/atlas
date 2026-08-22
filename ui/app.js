@@ -129,10 +129,14 @@
   }
 
   async function refreshEvents(job) {
+    if (!actionToken) return;
     const existing = eventStore(job.id);
     const lastSequence = existing.length ? existing[existing.length - 1].sequence : 0;
     try {
-      const response = await fetch(`/jobs/${encodeURIComponent(job.id)}/events?after=${lastSequence}`, {cache: "no-store"});
+      const response = await fetch(`/jobs/${encodeURIComponent(job.id)}/events?after=${lastSequence}`, {
+        cache: "no-store",
+        headers: {"x-atlas-action-token": actionToken},
+      });
       if (!response.ok) return;
       const payload = await response.json();
       if (Array.isArray(payload.events)) existing.push(...payload.events);
@@ -161,7 +165,8 @@
     refs.workerOutput.append(header);
     const terminal = node("div", "terminal");
     const events = eventStore(job.id);
-    if (events.length === 0) terminal.append(node("p", "quiet", "Waiting for output."));
+    if (!actionToken) terminal.append(node("p", "quiet", "pair to view output"));
+    else if (events.length === 0) terminal.append(node("p", "quiet", "Waiting for output."));
     events.forEach((event) => {
       const row = node("div", `terminal-line is-${event.kind}`);
       row.append(node("span", "terminal-sequence", String(event.sequence).padStart(4, "0")));

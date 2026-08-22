@@ -34,6 +34,7 @@ _Status = Literal["ok", "error", "needs_confirmation"]
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTENT_LIMIT = 4096
+_TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TRUNCATED = "…[truncated]"
 
 
@@ -95,6 +96,7 @@ class ToolRegistry:
         self._timeout_s = timeout_s
         self._tools: dict[str, Tool] = {}
         self._pending: PendingAction | None = None
+        self._open_aliases: frozenset[str] = frozenset()
 
     def register(self, tool: Tool) -> None:
         if not _TOOL_NAME.fullmatch(tool.name):
@@ -120,12 +122,20 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
-    async def call(self, name: str, arguments: Mapping[str, Any]) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        tainted: bool = False,
+    ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult("error", "unknown tool")
         try:
             copied = deepcopy(dict(arguments))
+            if tainted and self._refused_after_external_content(name, copied):
+                return ToolResult("error", _TAINT_REFUSAL)
             if tool.policy == "confirm":
                 serialized = json.dumps(copied)
                 pending = PendingAction(
@@ -144,6 +154,24 @@ class ToolRegistry:
             return await self._execute(tool, copied)
         except Exception as exc:
             return ToolResult("error", type(exc).__name__)
+
+    def _configure_open_aliases(self, aliases: Mapping[str, Any]) -> None:
+        self._open_aliases = frozenset(aliases)
+
+    def _refused_after_external_content(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        if name in {"confirm", "launch_work"}:
+            return True
+        if name != "open":
+            return False
+        target = arguments.get("target")
+        return (
+            not isinstance(target, str)
+            or target.strip().casefold() not in self._open_aliases
+        )
 
     async def confirm(self, confirm_id: str) -> ToolResult:
         pending = self._pending
@@ -202,8 +230,10 @@ def builtin(
     opener: Callable[[str], None] = os.startfile,
     profile_opener: Callable[[str, str | None], object] = desktopapps.open_profile,
     profile_focuser: Callable[[str], object] = desktopapps.focus_profile,
+    paired_url: Callable[[], str | None] | None = None,
 ) -> None:
     aliases = _aliases(apps)
+    registry._configure_open_aliases(aliases)
 
     async def open_target(arguments: dict) -> ToolResult | dict:
         target = _text_argument(arguments, "target", maximum=2048)
@@ -211,7 +241,8 @@ def builtin(
         if entry is not None:
             name, app = entry
             if app.url is not None:
-                opener(app.url)
+                dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
+                opener(dynamic_url or app.url)
             else:
                 profile_opener(app.exe or "", None)
             return {"opened": name}

@@ -1,112 +1,112 @@
 import pytest
 
 from worker import desktopapps
-from worker.desktopapps import DesktopAppError, DesktopApps, TargetAlias, native_launcher
+from worker.desktopapps import DesktopAppError, DesktopApps, native_launcher
 
 
-def test_code_and_windows_terminal_profiles_are_allowlisted():
-    code = desktopapps.DEFAULT_PROFILES["vscode"]
-    terminal = desktopapps.DEFAULT_PROFILES["wt"]
+def test_default_profiles_match_configured_signed_desktop_apps():
+    assert set(desktopapps.DEFAULT_PROFILES) == {"vscode", "wt", "chrome"}
+    assert desktopapps.DEFAULT_PROFILES["vscode"].executable == "Code.exe"
+    assert desktopapps.DEFAULT_PROFILES["wt"].executable == "wt.exe"
+    assert desktopapps.DEFAULT_PROFILES["chrome"].executable == "chrome.exe"
 
-    assert (code.id, code.executable, code.target_kind) == ("vscode", "Code.exe", "path")
-    assert (terminal.id, terminal.executable, terminal.target_kind) == ("wt", "wt.exe", None)
+
+def test_open_and_focus_delegate_only_allowlisted_profiles():
+    launches = []
+    focuses = []
+    apps = DesktopApps(
+        launcher=lambda executable, url: launches.append((executable, url)) or "opened",
+        focuser=lambda app_id: focuses.append(app_id) or "focused",
+    )
+
+    assert apps.open("vscode") == "opened"
+    assert apps.focus("wt") == "focused"
+    assert launches == [("Code.exe", None)]
+    assert focuses == ["wt"]
+    with pytest.raises(DesktopAppError, match="allowlisted"):
+        apps.open("powershell")
 
 
-def test_profile_helpers_build_default_desktop_apps_and_delegate(monkeypatch):
+def test_only_chrome_accepts_an_optional_https_url():
     calls = []
-    launcher = object()
+    apps = DesktopApps(launcher=lambda executable, url: calls.append((executable, url)))
+
+    apps.open("chrome", "https://example.com/path")
+
+    assert calls == [("chrome.exe", "https://example.com/path")]
+    for app_id, url in (
+        ("chrome", "http://example.com/"),
+        ("chrome", "https://user:password@example.com/"),
+        ("vscode", "https://example.com/"),
+    ):
+        with pytest.raises(DesktopAppError, match="only Chrome"):
+            apps.open(app_id, url)
+
+
+def test_profile_helpers_delegate_open_and_focus(monkeypatch):
+    calls = []
 
     class FakeDesktopApps:
-        def __init__(self, aliases, *, profiles, launcher):
-            calls.append(("init", aliases, profiles, launcher))
+        def __init__(self, *, profiles, launcher):
+            calls.append(("init", profiles, launcher))
 
-        def open(self, app_id, target_alias=None):
-            calls.append(("open", app_id, target_alias))
+        def open(self, app_id, url=None):
+            calls.append(("open", app_id, url))
             return "opened"
 
         def focus(self, app_id):
             calls.append(("focus", app_id))
             return "focused"
 
+    launcher = object()
     monkeypatch.setattr(desktopapps, "DesktopApps", FakeDesktopApps)
     monkeypatch.setattr(desktopapps, "native_launcher", launcher)
 
-    assert desktopapps.open_profile("vscode") == "opened"
+    assert desktopapps.open_profile("chrome", "https://example.com/") == "opened"
     assert desktopapps.focus_profile("wt") == "focused"
     assert calls == [
-        ("init", {}, desktopapps.DEFAULT_PROFILES, launcher),
-        ("open", "vscode", None),
-        ("init", {}, desktopapps.DEFAULT_PROFILES, launcher),
+        ("init", desktopapps.DEFAULT_PROFILES, launcher),
+        ("open", "chrome", "https://example.com/"),
+        ("init", desktopapps.DEFAULT_PROFILES, launcher),
         ("focus", "wt"),
     ]
 
 
-def test_profile_helper_wraps_an_optional_url_as_a_typed_alias(monkeypatch):
-    calls = []
-
-    class FakeDesktopApps:
-        def __init__(self, aliases, *, profiles, launcher):
-            calls.append((aliases, profiles, launcher))
-
-        def open(self, app_id, target_alias=None):
-            calls.append((app_id, target_alias))
-            return "opened"
-
-    monkeypatch.setattr(desktopapps, "DesktopApps", FakeDesktopApps)
-
-    assert desktopapps.open_profile("chrome", "https://example.com/") == "opened"
-    assert calls[0][0] == {"target": TargetAlias("url", "https://example.com/")}
-    assert calls[1] == ("chrome", "target")
-
-
-def test_fixed_profiles_accept_only_typed_compatible_aliases(tmp_path):
-    workspace = tmp_path / "workspace"; workspace.mkdir()
-    calls = []
-    apps = DesktopApps({"workspace": TargetAlias("path", workspace), "docs": TargetAlias("url", "https://docs.google.com/document/d/1"), "focus": TargetAlias("spotify_uri", "spotify:playlist:abc")}, launcher=lambda exe, arg: calls.append((exe, arg)), focuser=lambda app: app)
-    apps.open("vscode", "workspace"); apps.open("file_explorer", "workspace"); apps.open("chrome", "docs"); apps.open("spotify", "focus")
-    assert calls[0][0] == "Code.exe" and calls[0][1].startswith("vscode://file/")
-    assert calls[2] == ("chrome.exe", "https://docs.google.com/document/d/1")
-    assert calls[3] == ("Spotify.exe", "spotify:playlist:abc") and apps.focus("spotify") == "spotify"
-    with pytest.raises(DesktopAppError): apps.open("chrome", "workspace")
-    with pytest.raises(DesktopAppError): apps.open("powershell", "workspace")
-
-
-def test_aliases_are_typed_and_validate_url_spotify_and_unknown_target(tmp_path):
-    workspace = tmp_path / "workspace"; workspace.mkdir()
-    with pytest.raises(DesktopAppError): DesktopApps({"bad": workspace}, launcher=lambda *_: None)
-    with pytest.raises(DesktopAppError): DesktopApps({"bad": TargetAlias("url", "file:///x")}, launcher=lambda *_: None)
-    with pytest.raises(DesktopAppError): DesktopApps({"bad": TargetAlias("spotify_uri", "https://spotify.com/x")}, launcher=lambda *_: None)
-    apps = DesktopApps({"workspace": TargetAlias("path", workspace)}, launcher=lambda *_: None)
-    with pytest.raises(DesktopAppError): apps.open("vscode", "C:\\arbitrary")
-
-
 def test_native_launcher_uses_resolved_executable_without_shell(monkeypatch):
     captured = {}
-    monkeypatch.setattr("worker.desktopapps._resolve_executable", lambda name: "C:/fixed/Code.exe")
+    monkeypatch.setattr(
+        "worker.desktopapps._resolve_executable",
+        lambda _name: "C:/fixed/chrome.exe",
+    )
+
     class Proc:
         pid = 42
+
     def popen(command, **kwargs):
         captured.update(command=command, kwargs=kwargs)
         return Proc()
+
     monkeypatch.setattr("worker.desktopapps.subprocess.Popen", popen)
-    result = native_launcher("Code.exe", "vscode://file/C:/notes")
-    assert captured["command"] == ["C:/fixed/Code.exe", "vscode://file/C:/notes"]
+
+    result = native_launcher("chrome.exe", "https://example.com/")
+
+    assert captured["command"] == ["C:/fixed/chrome.exe", "https://example.com/"]
     assert captured["kwargs"]["shell"] is False
     assert "PATH" not in captured["kwargs"]["env"]
-    assert result == {"application": "Code.exe", "pid": 42, "targeted": True}
+    assert result == {"application": "chrome.exe", "pid": 42, "targeted": True}
 
 
-def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publisher(tmp_path, monkeypatch):
+def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publisher(
+    tmp_path,
+    monkeypatch,
+):
     roots = {
         "local_app_data": tmp_path / "local",
-        "roaming_app_data": tmp_path / "roaming",
         "program_files": tmp_path / "program-files",
         "program_files_x86": tmp_path / "program-files-x86",
     }
     for root in roots.values():
         root.mkdir()
-    windows = tmp_path / "windows"
-    windows.mkdir()
     candidate = roots["local_app_data"] / "Programs/Microsoft VS Code/Code.exe"
     candidate.parent.mkdir(parents=True)
     candidate.write_text("test executable", encoding="utf-8")
@@ -114,9 +114,11 @@ def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publis
 
     monkeypatch.setattr(desktopapps.os, "name", "nt")
     monkeypatch.setattr(desktopapps, "_known_folder_path", lambda name: roots[name])
-    monkeypatch.setattr(desktopapps, "_windows_directory", lambda: windows)
-    monkeypatch.setattr(desktopapps, "_verify_authenticode_publisher",
-                        lambda path, publisher: calls.append((path, publisher)) or True)
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: calls.append((path, publisher)) or True,
+    )
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "attacker-controls-this"))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "attacker-controls-this-too"))
 
@@ -124,7 +126,10 @@ def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publis
     assert calls == [(candidate.resolve(), "Microsoft Corporation")]
 
 
-def test_windows_terminal_resolver_uses_windows_apps_and_checks_publisher(tmp_path, monkeypatch):
+def test_windows_terminal_resolver_uses_windows_apps_and_checks_publisher(
+    tmp_path,
+    monkeypatch,
+):
     local = tmp_path / "local"
     candidate = local / "Microsoft/WindowsApps/wt.exe"
     candidate.parent.mkdir(parents=True)
@@ -132,38 +137,43 @@ def test_windows_terminal_resolver_uses_windows_apps_and_checks_publisher(tmp_pa
     calls = []
 
     monkeypatch.setattr(desktopapps.os, "name", "nt")
-    monkeypatch.setattr(desktopapps, "_known_folder_path", lambda name: local)
-    monkeypatch.setattr(desktopapps, "_verify_authenticode_publisher",
-                        lambda path, publisher: calls.append((path, publisher)) or True)
+    monkeypatch.setattr(desktopapps, "_known_folder_path", lambda _name: local)
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: calls.append((path, publisher)) or True,
+    )
 
     assert desktopapps._resolve_executable("wt.exe") == str(candidate.resolve())
     assert calls == [(candidate.resolve(), "Microsoft Corporation")]
 
 
-def test_resolver_fails_closed_when_expected_publisher_does_not_match(tmp_path, monkeypatch):
+def test_resolver_fails_closed_when_expected_publisher_does_not_match(
+    tmp_path,
+    monkeypatch,
+):
     roots = {
         "local_app_data": tmp_path / "local",
-        "roaming_app_data": tmp_path / "roaming",
         "program_files": tmp_path / "program-files",
         "program_files_x86": tmp_path / "program-files-x86",
     }
     for root in roots.values():
         root.mkdir()
-    windows = tmp_path / "windows"
-    windows.mkdir()
     candidate = roots["local_app_data"] / "Programs/Microsoft VS Code/Code.exe"
     candidate.parent.mkdir(parents=True)
     candidate.write_text("test executable", encoding="utf-8")
     monkeypatch.setattr(desktopapps.os, "name", "nt")
     monkeypatch.setattr(desktopapps, "_known_folder_path", lambda name: roots[name])
-    monkeypatch.setattr(desktopapps, "_windows_directory", lambda: windows)
-    monkeypatch.setattr(desktopapps, "_verify_authenticode_publisher", lambda *_: False)
+    monkeypatch.setattr(desktopapps, "_verify_authenticode_publisher", lambda *_args: False)
 
     with pytest.raises(DesktopAppError, match="approved location"):
         desktopapps._resolve_executable("Code.exe")
 
 
-def test_authenticode_verification_uses_fixed_windows_powershell_and_exact_publisher(tmp_path, monkeypatch):
+def test_authenticode_verification_uses_fixed_powershell_and_exact_publisher(
+    tmp_path,
+    monkeypatch,
+):
     windows = tmp_path / "windows"
     powershell = windows / "System32/WindowsPowerShell/v1.0/powershell.exe"
     powershell.parent.mkdir(parents=True)
@@ -186,7 +196,8 @@ def test_authenticode_verification_uses_fixed_windows_powershell_and_exact_publi
 
     assert desktopapps._verify_authenticode_publisher(target, "Google LLC") is True
     assert captured["command"][0] == str(powershell.resolve())
-    assert "-NoProfile" in captured["command"] and str(target) not in captured["command"]
+    assert "-NoProfile" in captured["command"]
+    assert str(target) not in captured["command"]
     assert captured["kwargs"]["env"]["ATLAS_SIGNATURE_PATH"] == str(target)
     assert "PATH" not in captured["kwargs"]["env"]
     assert captured["kwargs"]["stdin"] is desktopapps.subprocess.DEVNULL

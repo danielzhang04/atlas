@@ -127,7 +127,11 @@ class WorkManager:
                         cwd=self.workspace_root / job.job_id,
                     )
                 except Exception:
-                    pass
+                    self.store.append_output(
+                        job_id,
+                        "cancel failed; still running",
+                    )
+                    raise RuntimeError("cancel failed") from None
             terminal = self.store.transition(job_id, JobState.CANCELLED)
         self._terminal(terminal)
         return terminal
