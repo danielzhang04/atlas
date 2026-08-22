@@ -1,0 +1,8 @@
+# Explicit voice-session controls. Wake is handled by the local wake-word model; these exact
+# dismiss phrases are the only speech that bypasses Claude after Atlas is awake. Everything else
+# remains normal conversation, with host-validated work routing behind the model when needed.
+intents:
+  dismiss:
+    phrases:
+      - that's all
+      - go to sleep

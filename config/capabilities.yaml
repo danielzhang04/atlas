@@ -1,0 +1,36 @@
+# Declarative capability vocabulary. Runtime-specific roots, browser endpoints, and OAuth details are
+# user-private configuration and intentionally do not appear here.
+capabilities:
+  - {id: local_files.list, domain: local_files, operation: read, risk: T1, availability: local_agent, required_connection: local_desktop, confirmation: none}
+  - {id: local_files.read, domain: local_files, operation: read, risk: T1, availability: local_agent, required_connection: local_desktop, confirmation: none}
+  - {id: local_files.search, domain: local_files, operation: read, risk: T1, availability: local_agent, required_connection: local_desktop, confirmation: none}
+  - {id: local_files.create, domain: local_files, operation: write, risk: T2, availability: local_agent, required_connection: local_desktop, confirmation: trusted_action}
+  - {id: local_files.edit, domain: local_files, operation: write, risk: T2, availability: local_agent, required_connection: local_desktop, confirmation: trusted_action}
+  - {id: desktop.open, domain: desktop, operation: execute, risk: T2, availability: local_agent, required_connection: local_desktop, confirmation: trusted_action}
+  - {id: desktop.focus, domain: desktop, operation: execute, risk: T1, availability: local_agent, required_connection: local_desktop, confirmation: trusted_action}
+  - {id: spotify.open, domain: spotify, operation: execute, risk: T1, availability: local_agent, required_connection: local_desktop, confirmation: trusted_action}
+  - {id: spotify.playback, domain: spotify, operation: interact, risk: T2, availability: oauth, required_connection: spotify_oauth, confirmation: trusted_action}
+  - {id: browser.inspect, domain: browser, operation: read, risk: T1, availability: paired_browser, required_connection: browser_bridge, confirmation: none}
+  - {id: browser.research, domain: browser, operation: read, risk: T1, availability: paired_browser, required_connection: browser_bridge, confirmation: none}
+  - {id: browser.navigate, domain: browser, operation: interact, risk: T2, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.extract, domain: browser, operation: read, risk: T1, availability: paired_browser, required_connection: browser_bridge, confirmation: none}
+  - {id: browser.click, domain: browser, operation: interact, risk: T2, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.type, domain: browser, operation: interact, risk: T2, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.select, domain: browser, operation: interact, risk: T2, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.scroll, domain: browser, operation: interact, risk: T1, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.upload, domain: browser, operation: write, risk: T3, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.download, domain: browser, operation: write, risk: T2, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: browser.submit, domain: browser, operation: execute, risk: T3, availability: paired_browser, required_connection: browser_bridge, confirmation: trusted_action}
+  - {id: google.drive.list, domain: google_drive, operation: read, risk: T1, availability: oauth, required_connection: google_oauth, confirmation: none}
+  - {id: google.drive.read, domain: google_drive, operation: read, risk: T1, availability: oauth, required_connection: google_oauth, confirmation: none}
+  - {id: google.docs.read, domain: google_docs, operation: read, risk: T1, availability: oauth, required_connection: google_oauth, confirmation: none}
+  - {id: google.docs.write, domain: google_docs, operation: write, risk: T2, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.gmail.read, domain: gmail, operation: read, risk: T1, availability: oauth, required_connection: google_oauth, confirmation: none}
+  - {id: google.gmail.draft, domain: gmail, operation: draft, risk: T2, availability: oauth, required_connection: google_oauth, confirmation: proposal}
+  - {id: google.gmail.send, domain: gmail, operation: send, risk: T3, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.calendar.read, domain: google_calendar, operation: read, risk: T1, availability: oauth, required_connection: google_oauth, confirmation: none}
+  - {id: google.calendar.create, domain: google_calendar, operation: write, risk: T2, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.calendar.update, domain: google_calendar, operation: write, risk: T2, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.calendar.delete, domain: google_calendar, operation: delete, risk: T3, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.drive.share, domain: google_drive, operation: share, risk: T3, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}
+  - {id: google.drive.delete, domain: google_drive, operation: delete, risk: T3, availability: oauth, required_connection: google_oauth, confirmation: trusted_action}

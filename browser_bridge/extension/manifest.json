@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Atlas Browser Bridge",
+  "version": "0.1.0",
+  "description": "A dedicated-profile, explicitly allowlisted browser bridge for Atlas.",
+  "permissions": ["activeTab", "storage", "tabs", "scripting"],
+  "host_permissions": [],
+  "background": {"service_worker": "service_worker.js"},
+  "action": {"default_title": "Atlas Browser Bridge"},
+  "incognito": "not_allowed",
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'self'"}
+}

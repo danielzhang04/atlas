@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.codex-*/
+.live-smoke-*/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.log
+.env
+env
+node_modules/
+dist/
+build/
