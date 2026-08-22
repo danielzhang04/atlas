@@ -112,7 +112,14 @@ class WorkManager:
             callback(job)
 
     def _append_new_lines(self, job_id: str, lines: list[str]) -> None:
-        seen = self._seen.setdefault(job_id, set())
+        seen = self._seen.get(job_id)
+        if seen is None:
+            seen = {
+                event.text
+                for event in self.store.events(job_id)
+                if event.kind == "output"
+            }
+            self._seen[job_id] = seen
         for line in lines:
             if line in seen:
                 continue

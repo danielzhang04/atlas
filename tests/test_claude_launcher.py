@@ -138,11 +138,18 @@ def test_status_maps_unknown_literal():
 
 
 def test_logs_strip_ansi_and_collapse_only_consecutive_identical_lines():
-    stdout = "\x1b[31mA\x1b[0m\n\x1b[31mA\x1b[0m\nB\nA\nA\n"
+    stdout = (
+        "\x1b[31mA\x1b[0m\n"
+        "\x1b[31mA\x1b[0m\n"
+        "B\n"
+        "\x1b[32mA\x1b[0m\n"
+        "\x1b[34mA\x1b[0m\n"
+        "\x1b[34mA\x1b[0m\n"
+    )
     runner = RecordingRunner([command_result(stdout)])
     launcher = ClaudeLauncher("claude", runner=runner)
 
-    assert launcher.logs("abcdef12") == ["A", "B", "A"]
+    assert launcher.logs("abcdef12") == ["A", "B", "A", "A"]
 
 
 def test_parse_result_accepts_succeeded_status():

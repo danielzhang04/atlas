@@ -282,7 +282,11 @@ def test_on_terminal_fires_exactly_once_for_each_job(tmp_path):
 def test_restart_reattaches_and_polls_running_rows(tmp_path):
     store = make_store()
     job = make_running_job(store, session_id="fedcba98")
-    launcher = FakeLauncher(log_frames=[["reattached"]], status="running")
+    store.append_output(job.job_id, "already stored")
+    launcher = FakeLauncher(
+        log_frames=[["already stored", "reattached"]],
+        status="running",
+    )
     manager = WorkManager(store, launcher, tmp_path, poll_s=0.005)
 
     async def scenario():
@@ -299,7 +303,7 @@ def test_restart_reattaches_and_polls_running_rows(tmp_path):
     asyncio.run(scenario())
 
     assert launcher.log_calls[0] == "fedcba98"
-    assert output_texts(store, job.job_id) == ["reattached"]
+    assert output_texts(store, job.job_id) == ["already stored", "reattached"]
     assert store.get(job.job_id).state is JobState.RUNNING
 
 

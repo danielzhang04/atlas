@@ -320,10 +320,12 @@ class ClaudeLauncher:
         if result.returncode != 0:
             raise LauncherError("logs unavailable")
         collapsed = []
+        previous = None
         for line in result.stdout.splitlines():
-            clean = _ANSI_ESCAPE.sub("", line).rstrip("\r")
-            if collapsed and collapsed[-1] == clean:
+            if line == previous:
                 continue
+            previous = line
+            clean = _ANSI_ESCAPE.sub("", line).rstrip("\r")
             collapsed.append(clean)
         return collapsed
 
