@@ -4,6 +4,61 @@ from worker import desktopapps
 from worker.desktopapps import DesktopAppError, DesktopApps, TargetAlias, native_launcher
 
 
+def test_code_and_windows_terminal_profiles_are_allowlisted():
+    code = desktopapps.DEFAULT_PROFILES["vscode"]
+    terminal = desktopapps.DEFAULT_PROFILES["wt"]
+
+    assert (code.id, code.executable, code.target_kind) == ("vscode", "Code.exe", "path")
+    assert (terminal.id, terminal.executable, terminal.target_kind) == ("wt", "wt.exe", None)
+
+
+def test_profile_helpers_build_default_desktop_apps_and_delegate(monkeypatch):
+    calls = []
+    launcher = object()
+
+    class FakeDesktopApps:
+        def __init__(self, aliases, *, profiles, launcher):
+            calls.append(("init", aliases, profiles, launcher))
+
+        def open(self, app_id, target_alias=None):
+            calls.append(("open", app_id, target_alias))
+            return "opened"
+
+        def focus(self, app_id):
+            calls.append(("focus", app_id))
+            return "focused"
+
+    monkeypatch.setattr(desktopapps, "DesktopApps", FakeDesktopApps)
+    monkeypatch.setattr(desktopapps, "native_launcher", launcher)
+
+    assert desktopapps.open_profile("vscode") == "opened"
+    assert desktopapps.focus_profile("wt") == "focused"
+    assert calls == [
+        ("init", {}, desktopapps.DEFAULT_PROFILES, launcher),
+        ("open", "vscode", None),
+        ("init", {}, desktopapps.DEFAULT_PROFILES, launcher),
+        ("focus", "wt"),
+    ]
+
+
+def test_profile_helper_wraps_an_optional_url_as_a_typed_alias(monkeypatch):
+    calls = []
+
+    class FakeDesktopApps:
+        def __init__(self, aliases, *, profiles, launcher):
+            calls.append((aliases, profiles, launcher))
+
+        def open(self, app_id, target_alias=None):
+            calls.append((app_id, target_alias))
+            return "opened"
+
+    monkeypatch.setattr(desktopapps, "DesktopApps", FakeDesktopApps)
+
+    assert desktopapps.open_profile("chrome", "https://example.com/") == "opened"
+    assert calls[0][0] == {"target": TargetAlias("url", "https://example.com/")}
+    assert calls[1] == ("chrome", "target")
+
+
 def test_fixed_profiles_accept_only_typed_compatible_aliases(tmp_path):
     workspace = tmp_path / "workspace"; workspace.mkdir()
     calls = []
@@ -66,6 +121,22 @@ def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publis
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "attacker-controls-this-too"))
 
     assert desktopapps._resolve_executable("Code.exe") == str(candidate.resolve())
+    assert calls == [(candidate.resolve(), "Microsoft Corporation")]
+
+
+def test_windows_terminal_resolver_uses_windows_apps_and_checks_publisher(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    candidate = local / "Microsoft/WindowsApps/wt.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("test executable", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(desktopapps.os, "name", "nt")
+    monkeypatch.setattr(desktopapps, "_known_folder_path", lambda name: local)
+    monkeypatch.setattr(desktopapps, "_verify_authenticode_publisher",
+                        lambda path, publisher: calls.append((path, publisher)) or True)
+
+    assert desktopapps._resolve_executable("wt.exe") == str(candidate.resolve())
     assert calls == [(candidate.resolve(), "Microsoft Corporation")]
 
 

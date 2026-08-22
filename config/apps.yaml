@@ -1,0 +1,13 @@
+apps:
+  gmail:     {url: https://mail.google.com/,      words: [gmail, email, mail, inbox]}
+  calendar:  {url: https://calendar.google.com/,  words: [calendar, gcal]}
+  drive:     {url: https://drive.google.com/,     words: [drive, google drive]}
+  youtube:   {url: https://www.youtube.com/,      words: [youtube]}
+  github:    {url: https://github.com/,           words: [github]}
+  notion:    {url: https://www.notion.so/,        words: [notion]}
+  dashboard: {url: http://127.0.0.1:5317/,        words: [dashboard, kb dashboard, mission control]}
+  atlas:     {url: http://127.0.0.1:4360/,        words: [atlas, command center]}
+  chrome:    {exe: chrome,                        words: [chrome, browser]}
+  vscode:    {exe: vscode,                        words: [vs code, vscode, code, editor]}
+  terminal:  {exe: wt,                            words: [terminal, windows terminal, shell]}
+  spotify:   {url: https://open.spotify.com/,     words: [spotify, music]}

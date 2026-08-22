@@ -10,6 +10,17 @@ import subprocess
 from typing import Callable
 from urllib.parse import urlsplit
 
+__all__ = [
+    "AppProfile",
+    "DEFAULT_PROFILES",
+    "DesktopAppError",
+    "DesktopApps",
+    "TargetAlias",
+    "focus_profile",
+    "native_launcher",
+    "open_profile",
+]
+
 class DesktopAppError(RuntimeError): pass
 
 @dataclass(frozen=True)
@@ -27,6 +38,7 @@ class AppProfile:
 
 DEFAULT_PROFILES = {
     "vscode": AppProfile("vscode", "Code.exe", "path", "vscode://file/{target}"),
+    "wt": AppProfile("wt", "wt.exe", None),
     "chrome": AppProfile("chrome", "chrome.exe", "url", "{target}"),
     "spotify": AppProfile("spotify", "Spotify.exe", "spotify_uri", "{target}"),
     "file_explorer": AppProfile("file_explorer", "explorer.exe", "path", "{target}"),
@@ -49,6 +61,7 @@ _LEGACY_FOLDER_IDS = {
 }
 _EXPECTED_PUBLISHERS = {
     "Code.exe": "Microsoft Corporation",
+    "wt.exe": "Microsoft Corporation",
     "chrome.exe": "Google LLC",
     "Spotify.exe": "Spotify AB",
     "explorer.exe": "Microsoft Windows",
@@ -111,6 +124,17 @@ class DesktopApps:
         raise DesktopAppError("unsupported desktop target type")
 
 
+def open_profile(app_id: str, url: str | None = None) -> object:
+    aliases = {} if url is None else {"target": TargetAlias("url", url)}
+    apps = DesktopApps(aliases, profiles=DEFAULT_PROFILES, launcher=native_launcher)
+    return apps.open(app_id, "target" if url is not None else None)
+
+
+def focus_profile(app_id: str) -> object:
+    apps = DesktopApps({}, profiles=DEFAULT_PROFILES, launcher=native_launcher)
+    return apps.focus(app_id)
+
+
 def native_launcher(executable: str, argument: str | None) -> dict[str, object]:
     """Launch one already-allowlisted executable without a shell or inherited stdin."""
     resolved = _resolve_executable(executable)
@@ -136,6 +160,7 @@ def _resolve_executable(executable: str) -> str:
             ("local_app_data", "Programs/Microsoft VS Code/Code.exe"),
             ("program_files", "Microsoft VS Code/Code.exe"),
         ],
+        "wt.exe": [("local_app_data", "Microsoft/WindowsApps/wt.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
             ("program_files_x86", "Google/Chrome/Application/chrome.exe"),
