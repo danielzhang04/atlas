@@ -33,6 +33,7 @@ _TRUNCATED = "…[truncated]"
 SessionFactory = Callable[
     [str, StdioServerParameters], AsyncContextManager[ClientSession]
 ]
+ServerHook = Callable[[str, "ToolRegistry"], None]
 
 
 def load_mcp_config(path: Path) -> dict:
@@ -66,10 +67,12 @@ class McpServers:
         *,
         claude_config_path: Path = Path.home() / ".claude.json",
         session_factory: SessionFactory | None = None,
+        on_server: ServerHook | None = None,
     ):
         self._config = config
         self._claude_config_path = Path(claude_config_path)
         self._session_factory = session_factory or _stdio_session
+        self._on_server = on_server
         self._stacks: dict[str, AsyncExitStack] = {}
         self._closed = False
         servers = config.get("servers", {})
@@ -78,14 +81,20 @@ class McpServers:
             for name in servers
         }
 
-    async def connect(self, registry: ToolRegistry) -> None:
+    async def connect(
+        self,
+        registry: ToolRegistry,
+        *,
+        on_server: ServerHook | None = None,
+    ) -> None:
         if self._closed:
             raise RuntimeError("MCP servers are closed")
         servers = self._config.get("servers", {})
         defaults = self._config.get("defaults", {})
         timeout_s = float(defaults.get("connect_timeout_s", 20))
+        server_hook = on_server or self._on_server
         await asyncio.gather(*(
-            self._connect_one(name, server_cfg, defaults, timeout_s, registry)
+            self._connect_one(name, server_cfg, defaults, timeout_s, registry, server_hook)
             for name, server_cfg in servers.items()
         ))
 
@@ -96,6 +105,7 @@ class McpServers:
         defaults: Mapping,
         timeout_s: float,
         registry: ToolRegistry,
+        on_server: ServerHook | None,
     ) -> None:
         stack = AsyncExitStack()
         try:
@@ -111,6 +121,12 @@ class McpServers:
                     registry.register(tool)
             self._stacks[name] = stack
             self._status[name].update(connected=True, tools=len(mirrored), error=None)
+            if on_server is not None:
+                try:
+                    on_server(name, registry)
+                except Exception as exc:
+                    _LOGGER.warning("MCP server %s hook failed: %s",
+                                    name, type(exc).__name__)
         except Exception as exc:
             with suppress(Exception):
                 await stack.aclose()

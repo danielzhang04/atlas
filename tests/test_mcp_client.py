@@ -154,6 +154,64 @@ def test_connect_registers_schema_policy_and_bounded_concatenated_text():
     assert status == [{"name": "google", "connected": True, "tools": 3, "error": None}]
 
 
+def test_connect_runs_the_server_hook_after_successful_tool_registration():
+    async def scenario():
+        registry = FakeRegistry()
+        observations = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_server()),
+        )
+        await servers.connect(
+            registry,
+            on_server=lambda name, current: observations.append(
+                (name, [tool.name for tool in current.tools]),
+            ),
+        )
+        await servers.close()
+        return observations
+
+    observations = asyncio.run(scenario())
+
+    assert observations == [(
+        "google",
+        [
+            "google__get_events",
+            "google__search_drive_files",
+            "google__send_gmail_message",
+        ],
+    )] or observations == [(
+        "google",
+        [
+            "google__get_events",
+            "google__send_gmail_message",
+            "google__search_drive_files",
+        ],
+    )]
+
+
+def test_constructor_hook_is_used_when_connect_has_no_override():
+    async def scenario():
+        registry = FakeRegistry()
+        called = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_server()),
+            on_server=lambda name, _registry: called.append(name),
+        )
+        await servers.connect(registry)
+        await servers.close()
+        return called
+
+    assert asyncio.run(scenario()) == ["google"]
+
+
 def test_default_prefix_policy_applies_only_without_explicit_instant_list():
     defaults = {"instant_prefixes": ["get_", "list_", "search_", "query_", "read_", "check_"]}
     assert policy_for({}, defaults, "search_drive_files") == "instant"

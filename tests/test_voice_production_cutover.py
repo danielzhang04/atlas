@@ -13,7 +13,7 @@ from worker.app import AtlasAgent, _stt_keyterms
 ROOT = Path(__file__).resolve().parents[1]
 REMOVED = {
     "actionauth", "actionbroker", "browser_protocol", "browser_transport", "capabilities",
-    "capability_runner", "connectors", "contracts", "frontdesk", "guided_setup", "localfiles",
+    "capability_runner", "connectors", "contracts", "frontdesk", "guided_setup",
     "receipts", "routing_policy", "turn_interpreter", "voice_frontdesk", "voice_runtime",
 }
 

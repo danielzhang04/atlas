@@ -72,6 +72,27 @@ def test_profile_helpers_delegate_open_and_focus(monkeypatch):
     ]
 
 
+def test_close_profile_uses_allowlisted_image_without_forcing_termination(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(desktopapps, "_taskkill_executable", lambda: "C:/Windows/taskkill.exe")
+
+    class Result:
+        returncode = 0
+
+    def killer(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        return Result()
+
+    result = desktopapps.close_profile("vscode", killer=killer)
+
+    assert captured["command"] == ["C:/Windows/taskkill.exe", "/IM", "Code.exe"]
+    assert "/F" not in captured["command"]
+    assert captured["kwargs"]["shell"] is False
+    assert result == {"application": "vscode", "closed": True}
+    with pytest.raises(DesktopAppError, match="allowlisted"):
+        desktopapps.close_profile("notepad", killer=killer)
+
+
 def test_native_launcher_uses_resolved_executable_without_shell(monkeypatch):
     captured = {}
     monkeypatch.setattr(
