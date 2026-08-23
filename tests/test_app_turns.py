@@ -300,6 +300,34 @@ def test_addressed_turn_refreshes_engagement_and_reply_window():
     assert addressing.is_addressed("ordinary follow up")
 
 
+def test_reply_restamps_clocks_before_turn_releases_ownership():
+    ownership = app.TurnOwnership()
+    marks = []
+
+    class RecordingAddressing(Addressing):
+        def mark_activity(self):
+            marks.append(ownership.in_flight)
+            super().mark_activity()
+
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_audio_turn(
+        "question",
+        intents={},
+        brain=FakeBrain(chunks=("Answer.",)),
+        session=FakeSession(),
+        publisher=StatePublisher(),
+        engagement=engagement,
+        addressing=RecordingAddressing(30, ("question",)),
+        sleep=lambda announce=True: None,
+        turn_ownership=ownership,
+    ))
+
+    assert marks == [True]
+    assert not ownership.in_flight
+
+
 def test_cancel_outside_address_window_is_ambient_and_does_not_refresh_engagement():
     clock = FakeClock()
     brain = FakeBrain()

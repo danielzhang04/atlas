@@ -399,17 +399,20 @@ async def _handle_audio_turn(
             on_spoken=_repeated,
         ))
         return ""
-    response = await ownership.run(lambda: _submit_voice_turn(
-        text,
-        brain=brain,
-        session=session,
-        publisher=publisher,
-        engagement=engagement,
-    ))
-    if response and engagement.state == engagement_mod.ENGAGED:
-        engagement.interacted()
-        addressing.mark_activity()
-    return response
+    async def _respond() -> str:
+        response = await _submit_voice_turn(
+            text,
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+        )
+        if response and engagement.state == engagement_mod.ENGAGED:
+            engagement.interacted()
+            addressing.mark_activity()
+        return response
+
+    return await ownership.run(_respond)
 
 
 async def _sleep_watch(

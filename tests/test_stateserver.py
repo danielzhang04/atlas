@@ -288,6 +288,36 @@ def test_shutdown_requires_exact_launcher_token_before_invoking_provider():
     assert shutdown_calls == ["requested"]
 
 
+def test_authorized_shutdown_continues_after_the_request_task_is_cancelled():
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        shutdown_calls = []
+
+        async def shutdown():
+            started.set()
+            await release.wait()
+            shutdown_calls.append("completed")
+
+        server = stateserver.StateServer(
+            StatePublisher(clock=lambda: _dt(0)),
+            shutdown_token="shutdown-token",
+            shutdown_provider=shutdown,
+        )
+        request = SimpleNamespace(headers={
+            stateserver.SHUTDOWN_HEADER: "shutdown-token",
+        })
+        request_task = asyncio.create_task(server._handle_shutdown(request))
+        await started.wait()
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        release.set()
+        await asyncio.wait_for(server._shutdown_task, timeout=1.0)
+        return shutdown_calls
+
+    assert asyncio.run(scenario()) == ["completed"]
+
+
 def test_pairing_url_contains_one_time_fragment_and_disappears_after_pairing():
     authorizer = stateserver.PairingAuthorizer(token="pair token/+")
 

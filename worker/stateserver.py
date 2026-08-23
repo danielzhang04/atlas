@@ -462,7 +462,7 @@ class StateServer:
         if self._shutdown_task is None:
             self._shutdown_task = asyncio.create_task(_provide(self._shutdown_provider))
         try:
-            await self._shutdown_task
+            await asyncio.shield(self._shutdown_task)
         except Exception as exc:
             logger.warning("shutdown provider failed: %s", type(exc).__name__)
             raise web.HTTPInternalServerError(text="shutdown failed") from None
