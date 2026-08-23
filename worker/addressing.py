@@ -7,7 +7,11 @@ from typing import Callable
 
 from worker import router
 
-__all__ = ["Addressing"]
+__all__ = ["Addressing", "vocabulary"]
+
+
+def vocabulary(cfg: dict) -> list[str]:
+    return cfg["address_vocab"]
 
 
 def _vocab_forms(raw: str) -> set[str]:

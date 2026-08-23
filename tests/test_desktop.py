@@ -1,6 +1,7 @@
 """Native Atlas desktop launcher behavior without real processes or windows."""
 from __future__ import annotations
 
+import ctypes
 from io import StringIO
 import json
 from pathlib import Path
@@ -43,6 +44,7 @@ class FakeProcess:
     def __init__(self, output="", *, pid=4321, running=True) -> None:
         self.stdout = StringIO(output)
         self.pid = pid
+        self._handle = 8765
         self.running = running
         self.waits = []
 
@@ -111,6 +113,8 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     window_calls = []
     start_calls = []
     stop_calls = []
+    assigned = []
+    closed_handles = []
     window = FakeWindow()
 
     def spawn(command, **kwargs):
@@ -129,7 +133,11 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
         spawn=spawn,
         window_factory=window_factory,
         start=start,
-        terminate=lambda child: stop_calls.append(child),
+        terminate=lambda child, url, token: stop_calls.append((child, url, token)),
+        create_mutex=lambda: (111, False),
+        assign_job=lambda child: assigned.append(child) or 222,
+        close_handle=closed_handles.append,
+        token_factory=lambda: "shutdown-token",
     )
 
     command, options = spawn_calls[0]
@@ -142,6 +150,8 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     assert options["encoding"] == "utf-8"
     assert options["errors"] == "replace"
     assert options["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert options["env"]["PYTHONUTF8"] == "1"
+    assert options["env"]["ATLAS_SHUTDOWN_TOKEN"] == "shutdown-token"
     assert window_calls == [(
         "Atlas",
         "http://127.0.0.1:4360/#pair=one-use",
@@ -150,8 +160,109 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     assert len(window.events.closing.handlers) == 1
     assert len(window.events.closed.handlers) == 1
     assert start_calls == [(desktop._watch_child, (process, window, start_calls[0][1][2]))]
-    assert stop_calls == [process]
+    assert assigned == [process]
+    assert stop_calls == [(
+        process,
+        "http://127.0.0.1:4360/#pair=one-use",
+        "shutdown-token",
+    )]
+    assert closed_handles == [222, 111]
     assert result == 0
+
+
+def test_existing_desktop_mutex_reports_already_running_without_spawning():
+    spawn_calls = []
+    messages = []
+    closed_handles = []
+
+    result = desktop.run(
+        spawn=lambda *_args, **_kwargs: spawn_calls.append(True),
+        create_mutex=lambda: (333, True),
+        show_already_running=lambda: messages.append("Atlas is already running"),
+        close_handle=closed_handles.append,
+    )
+
+    assert result == 1
+    assert spawn_calls == []
+    assert messages == ["Atlas is already running"]
+    assert closed_handles == [333]
+
+
+def test_instance_mutex_uses_the_required_local_name_and_last_error():
+    calls = []
+
+    handle, already_running = desktop._create_instance_mutex(
+        platform="nt",
+        create_mutex=lambda security, owner, name: (
+            calls.append((security, owner, name)) or 444
+        ),
+        get_last_error=lambda: desktop.ERROR_ALREADY_EXISTS,
+    )
+
+    assert handle == 444
+    assert already_running is True
+    assert calls == [(None, False, "Local\\AtlasDesktop")]
+
+
+def test_worker_is_assigned_to_a_kill_on_close_job_object_after_spawn():
+    calls = []
+
+    def set_information(handle, info_class, pointer, size):
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(desktop._ExtendedLimitInformation),
+        ).contents
+        calls.append((
+            "configure",
+            handle,
+            info_class,
+            information.BasicLimitInformation.LimitFlags,
+            size,
+        ))
+        return True
+
+    handle = desktop.create_kill_on_close_job(
+        FakeProcess(),
+        platform="nt",
+        create_job=lambda security, name: calls.append(("create", security, name)) or 555,
+        set_information=set_information,
+        assign_process=lambda job, process: calls.append(("assign", job, process)) or True,
+    )
+
+    assert handle == 555
+    assert calls[0] == ("create", None, None)
+    assert calls[1][0:4] == (
+        "configure",
+        555,
+        desktop.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        desktop.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    )
+    assert calls[2] == ("assign", 555, 8765)
+
+
+def test_job_object_failure_logs_warning_and_continues(caplog):
+    with caplog.at_level("WARNING", logger="atlas.desktop"):
+        handle = desktop.create_kill_on_close_job(
+            FakeProcess(),
+            platform="nt",
+            create_job=lambda *_args: 0,
+            set_information=lambda *_args: True,
+            assign_process=lambda *_args: True,
+        )
+
+    assert handle is None
+    assert "kill-on-close Job Object" in caplog.text
+
+
+def test_non_windows_job_object_logs_warning_and_continues(caplog):
+    with caplog.at_level("WARNING", logger="atlas.desktop"):
+        handle = desktop.create_kill_on_close_job(
+            FakeProcess(),
+            platform="posix",
+        )
+
+    assert handle is None
+    assert "Job Objects are unavailable" in caplog.text
 
 
 def test_close_confirmation_lists_active_jobs_and_can_veto_close():
@@ -169,7 +280,7 @@ def test_close_confirmation_lists_active_jobs_and_can_veto_close():
     assert title == "Close Atlas?"
     assert "Quarterly analysis" in message
     assert "Draft launch brief" in message
-    assert "running jobs will be stopped" in message
+    assert "jobs will be cancelled" in message
 
 
 def test_close_without_active_jobs_needs_no_confirmation():
@@ -209,32 +320,100 @@ def test_expected_child_stop_does_not_replace_the_window():
     assert window.loaded_html == []
 
 
-def test_stop_child_uses_tree_kill_then_waits_up_to_ten_seconds():
+def test_shutdown_request_uses_token_header_and_never_sends_pairing_fragment():
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit):
+            requests.append(("read", limit))
+            return b'{"ok": true}'
+
+    def opener(request, *, timeout):
+        requests.append((request.full_url, dict(request.header_items()), timeout))
+        return Response()
+
+    desktop._request_shutdown(
+        "http://127.0.0.1:4360/#pair=one-use",
+        "shutdown-token",
+        opener=opener,
+    )
+
+    url, headers, timeout = requests[0]
+    assert url == "http://127.0.0.1:4360/shutdown"
+    assert headers["X-atlas-shutdown"] == "shutdown-token"
+    assert timeout == 16.0
+    assert requests[1] == ("read", 65_537)
+
+
+def test_stop_child_requests_shutdown_then_waits_up_to_twenty_seconds():
     process = FakeProcess(pid=77)
+    shutdown_calls = []
+    kill_calls = []
+
+    desktop.stop_child(
+        process,
+        "http://127.0.0.1:4360/#pair=one-use",
+        "shutdown-token",
+        shutdown_request=lambda url, token: shutdown_calls.append((url, token)),
+        killer=lambda command, **kwargs: kill_calls.append((command, kwargs)),
+    )
+
+    assert shutdown_calls == [(
+        "http://127.0.0.1:4360/#pair=one-use",
+        "shutdown-token",
+    )]
+    assert kill_calls == []
+    assert process.waits == [20]
+
+
+def test_stop_child_uses_tree_kill_after_graceful_timeout():
+    class SlowProcess(FakeProcess):
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            if timeout == 20:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            self.running = False
+            return 0
+
+    process = SlowProcess(pid=88)
     calls = []
 
-    desktop.stop_child(process, killer=lambda command, **kwargs: calls.append((command, kwargs)))
+    desktop.stop_child(
+        process,
+        killer=lambda command, **kwargs: calls.append((command, kwargs)),
+    )
 
-    assert calls == [(["taskkill", "/T", "/PID", "77"], {"check": False})]
-    assert process.waits == [10]
+    assert calls == [
+        (["taskkill", "/T", "/PID", "88"], {"check": False}),
+    ]
+    assert process.waits == [20, 10]
 
 
-def test_stop_child_escalates_to_force_after_timeout():
+def test_stop_child_forces_tree_after_another_ten_seconds():
     class StuckProcess(FakeProcess):
         def wait(self, timeout=None):
             self.waits.append(timeout)
             raise subprocess.TimeoutExpired("worker", timeout)
 
-    process = StuckProcess(pid=88)
+    process = StuckProcess(pid=99)
     calls = []
 
-    desktop.stop_child(process, killer=lambda command, **kwargs: calls.append((command, kwargs)))
+    desktop.stop_child(
+        process,
+        killer=lambda command, **kwargs: calls.append((command, kwargs)),
+    )
 
     assert calls == [
-        (["taskkill", "/T", "/PID", "88"], {"check": False}),
-        (["taskkill", "/T", "/PID", "88", "/F"], {"check": False}),
+        (["taskkill", "/T", "/PID", "99"], {"check": False}),
+        (["taskkill", "/T", "/PID", "99", "/F"], {"check": False}),
     ]
-    assert process.waits == [10]
+    assert process.waits == [20, 10]
 
 
 def test_stop_child_is_a_noop_after_child_exit():

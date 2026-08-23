@@ -39,9 +39,9 @@ class Engagement:
         """Leave the engaged state immediately."""
         self._state = ASLEEP
 
-    def tick(self) -> str:
+    def tick(self, *, turn_in_flight: bool = False) -> str:
         """Apply the silence timeout and return the current state."""
-        if self._state == ENGAGED:
+        if self._state == ENGAGED and not turn_in_flight:
             elapsed = self._clock() - self._last_activity
             if elapsed > self.timeout_s:
                 self._state = ASLEEP

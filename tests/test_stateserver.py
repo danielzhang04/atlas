@@ -215,6 +215,14 @@ def test_host_allowlist_rejects_every_method_and_route_before_dispatch():
         rejected = [
             ("GET", "/state", {"Host": f"evil.test:{server.port}"}),
             ("POST", "/pair", {"Host": "localhost"}),
+            (
+                "POST",
+                "/shutdown",
+                {
+                    "Host": f"evil.test:{server.port}",
+                    stateserver.SHUTDOWN_HEADER: "shutdown-token",
+                },
+            ),
             ("DELETE", "/not-a-route", {"Host": f"LOCALHOST:{server.port}"}),
         ]
         try:
@@ -230,8 +238,54 @@ def test_host_allowlist_rejects_every_method_and_route_before_dispatch():
     accepted, denied = asyncio.run(scenario())
 
     assert accepted[0] == 200
-    assert [response[0] for response in denied] == [403, 403, 403]
+    assert [response[0] for response in denied] == [403, 403, 403, 403]
     assert all(response[1]["x-frame-options"] == "DENY" for response in denied)
+
+
+def test_shutdown_requires_exact_launcher_token_before_invoking_provider():
+    async def scenario():
+        shutdown_calls = []
+
+        async def shutdown():
+            shutdown_calls.append("requested")
+
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            shutdown_token="shutdown-token",
+            shutdown_provider=shutdown,
+        )
+        try:
+            missing = await _request(server, "POST", "/shutdown")
+            wrong = await _request(
+                server,
+                "POST",
+                "/shutdown",
+                headers={stateserver.SHUTDOWN_HEADER: "wrong"},
+            )
+            accepted = await _request(
+                server,
+                "POST",
+                "/shutdown",
+                headers={stateserver.SHUTDOWN_HEADER: "shutdown-token"},
+            )
+            repeated = await _request(
+                server,
+                "POST",
+                "/shutdown",
+                headers={stateserver.SHUTDOWN_HEADER: "shutdown-token"},
+            )
+            return missing, wrong, accepted, repeated, shutdown_calls
+        finally:
+            await server.stop()
+
+    missing, wrong, accepted, repeated, shutdown_calls = asyncio.run(scenario())
+
+    assert missing[0] == 403
+    assert wrong[0] == 403
+    assert json.loads(accepted[2]) == {"ok": True}
+    assert json.loads(repeated[2]) == {"ok": True}
+    assert shutdown_calls == ["requested"]
 
 
 def test_pairing_url_contains_one_time_fragment_and_disappears_after_pairing():

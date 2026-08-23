@@ -18,12 +18,21 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-__all__ = ["HEADER", "HOST", "PairingAuthorizer", "StateServer", "pairing_url", "start"]
+__all__ = [
+    "HEADER",
+    "HOST",
+    "SHUTDOWN_HEADER",
+    "PairingAuthorizer",
+    "StateServer",
+    "pairing_url",
+    "start",
+]
 
 logger = logging.getLogger("atlas.stateserver")
 
 HOST = "127.0.0.1"
 HEADER = "x-atlas-action-token"
+SHUTDOWN_HEADER = "X-Atlas-Shutdown"
 UI_ROOT = Path(__file__).resolve().parents[1] / "ui"
 UI_ASSETS = {
     "/ui/styles.css": ("styles.css", "text/css"),
@@ -249,6 +258,8 @@ class StateServer:
         cancel_provider=None,
         mcp_provider=None,
         health_provider=None,
+        shutdown_token: str | None = None,
+        shutdown_provider=None,
     ) -> None:
         self._publisher = publisher
         self._clock = clock
@@ -259,6 +270,9 @@ class StateServer:
         self._cancel_provider = cancel_provider
         self._mcp_provider = mcp_provider
         self._health_provider = health_provider
+        self._shutdown_token = shutdown_token
+        self._shutdown_provider = shutdown_provider
+        self._shutdown_task: asyncio.Task | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
 
@@ -435,6 +449,28 @@ class StateServer:
             raise web.HTTPServiceUnavailable(text="job cancellation returned invalid state")
         return web.json_response({"job": job}, headers={"cache-control": "no-store"})
 
+    async def _handle_shutdown(self, request: web.Request) -> web.Response:
+        supplied = request.headers.get(SHUTDOWN_HEADER)
+        if (
+            not self._shutdown_token
+            or not supplied
+            or not hmac.compare_digest(supplied, self._shutdown_token)
+        ):
+            raise web.HTTPForbidden(text="valid shutdown token required")
+        if self._shutdown_provider is None:
+            raise web.HTTPServiceUnavailable(text="shutdown is unavailable")
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(_provide(self._shutdown_provider))
+        try:
+            await self._shutdown_task
+        except Exception as exc:
+            logger.warning("shutdown provider failed: %s", type(exc).__name__)
+            raise web.HTTPInternalServerError(text="shutdown failed") from None
+        return web.json_response(
+            {"ok": True},
+            headers={"cache-control": "no-store"},
+        )
+
     async def start(self, port: int) -> "StateServer":
         app = web.Application(middlewares=[_security_middleware(lambda: self.port)])
         app.router.add_get("/", self._handle_index)
@@ -449,6 +485,7 @@ class StateServer:
         app.router.add_get("/jobs/{job_id}/events", self._handle_job_events)
         app.router.add_get("/jobs/{job_id}/result", self._handle_job_result)
         app.router.add_post("/jobs/{job_id}/cancel", self._handle_cancel_job)
+        app.router.add_post("/shutdown", self._handle_shutdown)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, HOST, port)
@@ -483,6 +520,8 @@ async def start(
     cancel_provider=None,
     mcp_provider=None,
     health_provider=None,
+    shutdown_token: str | None = None,
+    shutdown_provider=None,
 ) -> StateServer:
     server = StateServer(
         publisher,
@@ -494,5 +533,7 @@ async def start(
         cancel_provider=cancel_provider,
         mcp_provider=mcp_provider,
         health_provider=health_provider,
+        shutdown_token=shutdown_token,
+        shutdown_provider=shutdown_provider,
     )
     return await server.start(port)

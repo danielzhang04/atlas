@@ -4,7 +4,7 @@
 **Branch:** `claude/atlas-revamp` in worktree `C:\Users\danie\Atlas-worktrees\revamp`
 (baseline `130c4a7` on `codex/atlas-standalone-bootstrap` = the 2026-08-21 tree, committed verbatim).
 **Spec:** `docs/specs/2026-08-22-atlas-revamp-design.md` · **Plan:** `docs/plans/2026-08-22-atlas-revamp-plan.md`
-**One human gate left:** PM2 cutover + a spoken acceptance round (§ "Exact next step").
+**Next step:** superseded by the wave-2 app handoff (§ "Exact next step").
 
 ## What changed (one paragraph)
 
@@ -69,16 +69,5 @@ worker connects MCP once at startup in the background, so voice turns do not pay
 
 ## Exact next step (Daniel)
 
-1. Cut the live checkout over and restart PM2 (single app now):
-   ```powershell
-   cd C:\Users\danie\Atlas
-   git merge --ff-only claude/atlas-revamp      # or: git checkout claude/atlas-revamp
-   pm2 delete atlas-subscription; pm2 start pm2.config.cjs --only atlas-worker; pm2 save
-   ```
-2. Spoken acceptance: wake → "how's it going" → "pull up gmail" → "what's on my calendar today" →
-   "research X and write me a summary" (expect "launching…", a Workers tab with live output, spoken
-   "Done — …") → "go to sleep".
-3. If a voice turn feels slow, `python -m worker.chat "<same words>"` prints chunks with timings.
-
-Text console without audio: `python -m worker.chat "pull up gmail"`. Command center only:
-`python -m worker.ui_server`. Teach new apps in `config/apps.yaml`; add MCP servers in `config/mcp.yaml`.
+Open `handoffs/2026-08-22-atlas-wave2.md` and follow **Open the app**. PM2 and the standalone
+browser-host process are retired.

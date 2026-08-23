@@ -48,6 +48,16 @@ def test_dismiss_sleeps_immediately_and_tick_is_stable_while_asleep():
     assert e.tick() == "ASLEEP"
 
 
+def test_tick_holds_expired_engagement_while_turn_is_in_flight_without_restamping():
+    clock = FakeClock()
+    e = Engagement(10, clock=clock)
+    e.wake()
+    clock.value = 20
+
+    assert e.tick(turn_in_flight=True) == "ENGAGED"
+    assert e.tick() == "ASLEEP"
+
+
 def test_resolve_input_device_pins_by_substring():
     from worker.wakeword import resolve_input_device
     devices = [

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 
+from worker import addressing as addressing_mod
 from worker import app
 from worker.addressing import Addressing
 from worker.engagement import ENGAGED, Engagement
@@ -64,9 +64,15 @@ def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
     session = FakeSession()
     publisher = StatePublisher()
     publisher.set_state(LISTENING)
+    engagement = Engagement(120)
+    engagement.wake()
 
     result = asyncio.run(app._submit_voice_turn(
-        "tell me something", brain=brain, session=session, publisher=publisher,
+        "tell me something",
+        brain=brain,
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
     ))
 
     assert result == "First sentence. Second sentence."
@@ -77,6 +83,28 @@ def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
         ("user", "tell me something"),
         ("atlas", "First sentence. Second sentence."),
     ]
+
+
+def test_submit_voice_turn_does_not_restore_listening_after_dismissal():
+    engagement = Engagement(120)
+    engagement.wake()
+    publisher = StatePublisher()
+
+    class DismissingSession(FakeSession):
+        async def say(self, source, *, add_to_chat_ctx):
+            async for _chunk in source:
+                engagement.dismiss()
+                publisher.set_state("ASLEEP")
+
+    asyncio.run(app._submit_voice_turn(
+        "tell me something",
+        brain=FakeBrain(chunks=("Answer.",)),
+        session=DismissingSession(),
+        publisher=publisher,
+        engagement=engagement,
+    ))
+
+    assert publisher.state == "ASLEEP"
 
 
 def test_reflex_dismiss_cancel_and_repeat_never_call_the_brain():
@@ -162,6 +190,24 @@ def test_engaged_completion_refreshes_silence_and_address_windows():
     clock.value = 70
     assert engagement.tick() == "ENGAGED"
     assert addressing.is_addressed("ordinary follow up")
+
+
+def test_completion_callback_does_not_refresh_clocks_after_dismissal():
+    clock = FakeClock()
+    publisher = StatePublisher()
+    session = FakeSession()
+    engagement = Engagement(120, clock=clock)
+    addressing = Addressing(30, (), clock=clock)
+    engagement.wake()
+    addressing.mark_activity()
+    clock.value = 40
+    engagement.dismiss()
+
+    succeeded = SimpleNamespace(state=JobState.SUCCEEDED, summary="Finished.")
+    app._announce_terminal(succeeded, publisher, session, engagement, addressing)
+
+    assert session.spoken == []
+    assert not addressing.is_addressed("")
 
 
 def test_ambient_turn_is_recorded_without_model_speech_or_clock_refresh():
@@ -254,15 +300,16 @@ def test_addressed_turn_refreshes_engagement_and_reply_window():
     assert addressing.is_addressed("ordinary follow up")
 
 
-def test_reflex_runs_before_timeout_check_and_never_calls_brain():
+def test_cancel_outside_address_window_is_ambient_and_does_not_refresh_engagement():
     clock = FakeClock()
     brain = FakeBrain()
     session = FakeSession()
     publisher = StatePublisher()
-    engagement = Engagement(10, clock=clock)
+    engagement = Engagement(120, clock=clock)
     addressing = Addressing(5, (), clock=clock)
     engagement.wake()
-    clock.value = 11
+    addressing.mark_activity()
+    clock.value = 6
 
     asyncio.run(app._handle_audio_turn(
         "cancel",
@@ -275,9 +322,224 @@ def test_reflex_runs_before_timeout_check_and_never_calls_brain():
         sleep=lambda announce=True: None,
     ))
 
-    assert session.interruptions == 1
+    assert session.interruptions == 0
     assert brain.calls == []
     assert engagement.state == "ENGAGED"
+    assert [(line["role"], line["text"]) for line in publisher.snapshot()["transcript"]] == [
+        ("ambient", "cancel"),
+    ]
+    clock.value = 120.01
+    assert engagement.tick() == "ASLEEP"
+
+
+def test_cancel_inside_address_window_interrupts_without_refreshing_engagement():
+    clock = FakeClock()
+    brain = FakeBrain()
+    session = FakeSession()
+    publisher = StatePublisher()
+    engagement = Engagement(10, clock=clock)
+    addressing = Addressing(5, (), clock=clock)
+    engagement.wake()
+    addressing.mark_activity()
+    clock.value = 4
+
+    asyncio.run(app._handle_audio_turn(
+        "never mind",
+        intents={"cancel": {"phrases": ["never mind"]}},
+        brain=brain,
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.interruptions == 1
+    assert brain.calls == []
+    clock.value = 10.01
+    assert engagement.tick() == "ASLEEP"
+
+
+def test_cancel_during_response_cancels_owned_turn_outside_address_window():
+    async def scenario():
+        clock = FakeClock()
+        started = asyncio.Event()
+
+        class BlockingBrain(FakeBrain):
+            async def respond(self, text):
+                self.calls.append(text)
+                started.set()
+                await asyncio.Event().wait()
+                yield "unreachable"
+
+        brain = BlockingBrain()
+        session = FakeSession()
+        publisher = StatePublisher()
+        engagement = Engagement(120, clock=clock)
+        addressing = Addressing(5, ("question",), clock=clock)
+        ownership = app.TurnOwnership()
+        engagement.wake()
+        addressing.mark_activity()
+        clock.value = 40
+        response_task = asyncio.create_task(app._handle_audio_turn(
+            "question",
+            intents={"cancel": {"phrases": ["cancel"]}},
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=lambda announce=True: None,
+            turn_ownership=ownership,
+        ))
+        await started.wait()
+        clock.value = 80
+        await app._handle_audio_turn(
+            "cancel",
+            intents={"cancel": {"phrases": ["cancel"]}},
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=lambda announce=True: None,
+            turn_ownership=ownership,
+        )
+        result = await asyncio.gather(response_task, return_exceptions=True)
+        return clock, brain, session, publisher, engagement, ownership, result
+
+    clock, brain, session, publisher, engagement, ownership, result = asyncio.run(scenario())
+
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert not ownership.in_flight
+    assert brain.calls == ["question"]
+    assert session.interruptions == 1
+    assert [line["text"] for line in publisher.snapshot()["transcript"]] == [
+        "question",
+        "cancel",
+    ]
+    clock.value = 160.01
+    assert engagement.tick() == "ASLEEP"
+
+
+def test_dismiss_is_global_cancels_owned_turn_and_never_refreshes_clocks():
+    async def scenario():
+        clock = FakeClock()
+        engagement = Engagement(10, clock=clock)
+        addressing = Addressing(5, (), clock=clock)
+        ownership = app.TurnOwnership()
+        session = FakeSession()
+        publisher = StatePublisher()
+        started = asyncio.Event()
+
+        async def operation():
+            started.set()
+            await asyncio.Event().wait()
+
+        response_task = asyncio.create_task(ownership.run(operation))
+        await started.wait()
+        engagement.wake()
+        addressing.mark_activity()
+        clock.value = 20
+        sleep_calls = []
+        await app._handle_audio_turn(
+            "go to sleep",
+            intents={"dismiss": {"phrases": ["go to sleep"]}},
+            brain=FakeBrain(),
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=lambda announce=True: sleep_calls.append(announce),
+            turn_ownership=ownership,
+        )
+        result = await asyncio.gather(response_task, return_exceptions=True)
+        return engagement, addressing, ownership, session, sleep_calls, result
+
+    engagement, addressing, ownership, session, sleep_calls, result = asyncio.run(scenario())
+
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert engagement.state == "ASLEEP"
+    assert not addressing.is_addressed("")
+    assert not ownership.in_flight
+    assert session.interruptions == 1
+    assert sleep_calls == [True]
+
+
+def test_repeat_requires_an_addressed_engaged_turn():
+    clock = FakeClock()
+    session = FakeSession()
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The last answer.")
+    engagement = Engagement(120, clock=clock)
+    addressing = Addressing(5, (), clock=clock)
+    engagement.wake()
+    addressing.mark_activity()
+    clock.value = 6
+
+    asyncio.run(app._handle_audio_turn(
+        "repeat that",
+        intents={"repeat": {"phrases": ["repeat that"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.spoken == []
+    assert publisher.snapshot()["transcript"][-1]["role"] == "ambient"
+
+
+def test_repeat_does_nothing_while_asleep_even_when_explicitly_addressed():
+    session = FakeSession()
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The last answer.")
+
+    asyncio.run(app._handle_audio_turn(
+        "Atlas, repeat that",
+        intents={"repeat": {"phrases": ["repeat that"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=Engagement(120),
+        addressing=Addressing(30, ()),
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.spoken == []
+    assert [line["text"] for line in publisher.snapshot()["transcript"]] == [
+        "The last answer.",
+    ]
+
+
+def test_explicitly_addressed_repeat_speaks_and_refreshes_both_clocks():
+    clock = FakeClock()
+    session = FakeSession()
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The last answer.")
+    engagement = Engagement(20, clock=clock)
+    addressing = Addressing(5, (), clock=clock)
+    engagement.wake()
+    addressing.mark_activity()
+    clock.value = 6
+
+    asyncio.run(app._handle_audio_turn(
+        "Atlas, repeat that",
+        intents={"repeat": {"phrases": ["repeat that"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.spoken == ["The last answer."]
+    clock.value = 11
+    assert engagement.tick() == "ENGAGED"
+    assert addressing.is_addressed("")
 
 
 def test_expired_turn_sleeps_silently_before_address_check():
@@ -336,6 +598,54 @@ def test_sleep_watch_calls_unannounced_sleep_once_on_transition():
     assert calls == [False]
 
 
+def test_sleep_watch_holds_timeout_until_the_owned_turn_finishes():
+    async def scenario():
+        clock = FakeClock()
+        engagement = Engagement(10, clock=clock)
+        engagement.wake()
+        ownership = app.TurnOwnership()
+        release = asyncio.Event()
+        started = asyncio.Event()
+        sleep_calls = []
+        watch_box = {}
+
+        async def operation():
+            started.set()
+            await release.wait()
+            return "done"
+
+        response_task = asyncio.create_task(ownership.run(operation))
+        await started.wait()
+        clock.value = 11
+
+        def sleep(announce=True):
+            sleep_calls.append(announce)
+            watch_box["task"].cancel()
+
+        watch_task = asyncio.create_task(app._sleep_watch(
+            engagement,
+            sleep,
+            interval_s=0,
+            turn_ownership=ownership,
+        ))
+        watch_box["task"] = watch_task
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        still_engaged = engagement.state
+        calls_during_turn = list(sleep_calls)
+        release.set()
+        await response_task
+        await asyncio.gather(watch_task, return_exceptions=True)
+        return still_engaged, calls_during_turn, engagement.state, sleep_calls
+
+    still_engaged, calls_during_turn, final_state, sleep_calls = asyncio.run(scenario())
+
+    assert still_engaged == "ENGAGED"
+    assert calls_during_turn == []
+    assert final_state == "ASLEEP"
+    assert sleep_calls == [False]
+
+
 def test_unannounced_sleep_mutes_and_records_auto_sleep_without_speech():
     session = FakeSession()
     publisher = StatePublisher()
@@ -351,17 +661,13 @@ def test_unannounced_sleep_mutes_and_records_auto_sleep_without_speech():
     ]
 
 
-def test_address_vocab_combines_app_words_and_configured_terms(tmp_path: Path):
-    apps_path = tmp_path / "apps.yaml"
-    apps_path.write_text(
-        "apps:\n  mail: {url: 'https://mail.example/', words: [email, inbox]}\n",
-        encoding="utf-8",
-    )
+def test_address_vocabulary_uses_only_explicit_configuration():
+    cfg = {
+        "address_vocab": ["research", "draft"],
+        "apps": {"mail": {"words": ["email", "inbox"]}},
+    }
 
-    assert app._address_vocab(
-        {"address_vocab": ["research", "draft"]},
-        apps_path=apps_path,
-    ) == ("email", "inbox", "research", "draft")
+    assert addressing_mod.vocabulary(cfg) == ["research", "draft"]
 
 
 def test_production_listening_config_matches_wave_two_defaults():

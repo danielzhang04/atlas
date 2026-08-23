@@ -24,9 +24,9 @@ Run the Atlas app:
 .venv\Scripts\pythonw.exe -m worker.desktop
 ```
 
-The native window starts the voice worker and opens its paired command center. Closing the window
-stops Atlas. If background jobs are active, Atlas shows their titles and confirms that closing will
-stop them before it exits.
+The native window is the only command-center host. It starts the voice worker and opens the paired
+command center. Closing the window stops Atlas. If jobs are active, Atlas shows their titles and
+confirms that closing will cancel them before it exits.
 
 To add Atlas to the Start menu for the current user:
 
@@ -39,12 +39,6 @@ Run a single streaming text turn, with or without MCP connections:
 ```powershell
 .venv\Scripts\python -m worker.chat "pull up gmail"
 .venv\Scripts\python -m worker.chat --no-mcp "hello"
-```
-
-Run the command center without microphone or voice services:
-
-```powershell
-.venv\Scripts\python -m worker.ui_server
 ```
 
 The UI binds only to `127.0.0.1`. Its one-use pairing secret travels in the browser URL fragment,

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import threading
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import yaml
 
@@ -66,21 +66,6 @@ def _load_intents() -> dict:
 
 def _cfg() -> dict:
     return yaml.safe_load((ATLAS / "config" / "atlas.yaml").read_text(encoding="utf-8"))
-
-
-def _address_vocab(
-    cfg: dict,
-    *,
-    apps_path: Path | None = None,
-) -> tuple[str, ...]:
-    apps = tools_mod.load_apps(apps_path or ATLAS / "config" / "apps.yaml")
-    configured = cfg.get("address_vocab")
-    if not isinstance(configured, list):
-        raise ValueError("invalid Atlas configuration: address_vocab")
-    if not all(isinstance(value, str) and value.strip() for value in configured):
-        raise ValueError("invalid Atlas configuration: address_vocab")
-    app_words = [word for entry in apps.values() for word in entry.words]
-    return tuple([*app_words, *configured])
 
 
 def _stt_keyterms(cfg: dict) -> list[str]:
@@ -235,12 +220,45 @@ class AtlasAgent(Agent):
         return Agent.default.tts_node(self, _clean(), model_settings)
 
 
+class TurnOwnership:
+    """Identify the response task that owns brain and TTS work."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def run(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("voice turn has no asyncio task")
+        previous = self._task
+        if previous is not None and previous is not task and not previous.done():
+            previous.cancel()
+        self._task = task
+        try:
+            return await operation()
+        finally:
+            if self._task is task:
+                self._task = None
+
+    def cancel(self) -> bool:
+        task = self._task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+
 async def _submit_voice_turn(
     text: str,
     *,
     brain: brain_mod.Brain,
     session,
     publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
@@ -256,7 +274,8 @@ async def _submit_voice_turn(
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
     finally:
-        publisher.set_state(state.LISTENING)
+        if engagement.state == engagement_mod.ENGAGED:
+            publisher.set_state(state.LISTENING)
     response = "".join(spoken)
     if response:
         publisher.add_line("atlas", response)
@@ -270,6 +289,11 @@ def _last_atlas_line(publisher: state.StatePublisher) -> str | None:
     return None
 
 
+def _address_window_open(addressing: addressing_mod.Addressing) -> bool:
+    """Probe only the activity window; an empty utterance cannot hit vocabulary."""
+    return addressing.is_addressed("")
+
+
 async def _handle_reflex(
     text: str,
     *,
@@ -277,6 +301,7 @@ async def _handle_reflex(
     session,
     publisher: state.StatePublisher,
     dismiss,
+    cancel_turn=None,
     on_spoken=None,
 ) -> bool:
     if not isinstance(text, str) or not text.strip():
@@ -290,6 +315,8 @@ async def _handle_reflex(
         dismiss()
     elif intent == "cancel":
         session.interrupt()
+        if cancel_turn is not None:
+            cancel_turn()
     elif intent == "repeat" and repeated:
         await session.say(repeated, add_to_chat_ctx=False)
         if on_spoken is not None:
@@ -307,42 +334,79 @@ async def _handle_audio_turn(
     engagement: engagement_mod.Engagement,
     addressing: addressing_mod.Addressing,
     sleep,
+    turn_ownership: TurnOwnership | None = None,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
 
+    ownership = turn_ownership or TurnOwnership()
+    lane, intent = router.route(text, intents)
+
     def _dismiss() -> None:
         engagement.dismiss()
+        session.interrupt()
+        ownership.cancel()
         sleep()
 
-    handled = await _handle_reflex(
-        text,
-        intents=intents,
-        session=session,
-        publisher=publisher,
-        dismiss=_dismiss,
-        on_spoken=addressing.mark_activity,
-    )
-    if handled:
-        engagement.interacted()
+    if lane == "reflex" and intent == "dismiss":
+        await _handle_reflex(
+            text,
+            intents=intents,
+            session=session,
+            publisher=publisher,
+            dismiss=_dismiss,
+        )
         return ""
+    if lane == "reflex" and intent == "cancel":
+        cancel_allowed = ownership.in_flight or _address_window_open(addressing)
+        if cancel_allowed:
+            await _handle_reflex(
+                text,
+                intents=intents,
+                session=session,
+                publisher=publisher,
+                dismiss=_dismiss,
+                cancel_turn=ownership.cancel,
+            )
+            return ""
     previous = engagement.state
     if engagement.tick() != engagement_mod.ENGAGED:
         if previous == engagement_mod.ENGAGED:
             sleep(announce=False)
         return ""
     normalized = router.normalize(text)
+    if lane == "reflex" and intent == "cancel":
+        publisher.add_line("ambient", text)
+        return ""
     if not addressing.is_addressed(normalized):
         publisher.add_line("ambient", text)
         return ""
     engagement.interacted()
-    response = await _submit_voice_turn(
+    if lane == "reflex" and intent == "repeat":
+        def _repeated() -> None:
+            if engagement.state != engagement_mod.ENGAGED:
+                return
+            engagement.interacted()
+            addressing.mark_activity()
+
+        await ownership.run(lambda: _handle_reflex(
+            text,
+            intents=intents,
+            session=session,
+            publisher=publisher,
+            dismiss=_dismiss,
+            cancel_turn=ownership.cancel,
+            on_spoken=_repeated,
+        ))
+        return ""
+    response = await ownership.run(lambda: _submit_voice_turn(
         text,
         brain=brain,
         session=session,
         publisher=publisher,
-    )
-    if response:
+        engagement=engagement,
+    ))
+    if response and engagement.state == engagement_mod.ENGAGED:
         engagement.interacted()
         addressing.mark_activity()
     return response
@@ -353,11 +417,13 @@ async def _sleep_watch(
     sleep,
     *,
     interval_s: float = 5.0,
+    turn_ownership: TurnOwnership | None = None,
 ) -> None:
     while True:
         await asyncio.sleep(interval_s)
         previous = engagement.state
-        current = engagement.tick()
+        in_flight = turn_ownership is not None and turn_ownership.in_flight
+        current = engagement.tick(turn_in_flight=in_flight)
         if previous == engagement_mod.ENGAGED and current == engagement_mod.ASLEEP:
             sleep(announce=False)
 
@@ -453,8 +519,9 @@ async def entrypoint(ctx: JobContext) -> None:
     engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
     addressing = addressing_mod.Addressing(
         float(cfg["address_window_s"]),
-        _address_vocab(cfg),
+        addressing_mod.vocabulary(cfg),
     )
+    turn_ownership = TurnOwnership()
     publisher.set_output_device(_output_device_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
@@ -474,6 +541,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     stop_work = asyncio.Event()
     sleep_task: asyncio.Task | None = None
+    shutdown_jobs_requested = False
     mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
     work_task = asyncio.create_task(services.work.run(stop_work))
     _BG_TASKS.update((mcp_task, work_task))
@@ -503,14 +571,24 @@ async def entrypoint(ctx: JobContext) -> None:
     pending_terminal.clear()
 
     async def _submit(text: str) -> None:
-        await _submit_voice_turn(
+        await turn_ownership.run(lambda: _submit_voice_turn(
             text,
             brain=services.brain,
             session=session,
             publisher=publisher,
-        )
+            engagement=engagement,
+        ))
 
     agent.turn_handler = _submit
+
+    async def _request_shutdown() -> None:
+        nonlocal shutdown_jobs_requested
+        shutdown_jobs_requested = True
+        engagement.dismiss()
+        session.interrupt()
+        turn_ownership.cancel()
+        await services.work.cancel_active(timeout_s=15.0)
+        loop.call_later(0.05, ctx.shutdown, "desktop requested shutdown")
 
     server = await stateserver.start(
         publisher,
@@ -522,15 +600,23 @@ async def entrypoint(ctx: JobContext) -> None:
         cancel_provider=services.work.cancel,
         mcp_provider=services.mcp.status,
         health_provider=lambda: _health(services.mcp, services.work.launcher),
+        shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
+        shutdown_provider=_request_shutdown,
     )
     server_box["server"] = server
     _emit_ui_url(authorizer, server.port)
 
     async def _shutdown() -> None:
+        wakeword.shutting_down.set()
+        session.interrupt()
+        turn_ownership.cancel()
         if sleep_task is not None:
             sleep_task.cancel()
             await asyncio.gather(sleep_task, return_exceptions=True)
+        if not shutdown_jobs_requested:
+            await services.work.cancel_active(timeout_s=15.0)
         stop_work.set()
+        mcp_task.cancel()
         await asyncio.gather(work_task, return_exceptions=True)
         await asyncio.gather(mcp_task, return_exceptions=True)
         await services.mcp.close()
@@ -580,10 +666,15 @@ async def entrypoint(ctx: JobContext) -> None:
             engagement=engagement,
             addressing=addressing,
             sleep=_sleep,
+            turn_ownership=turn_ownership,
         )
 
     agent.turn_handler = _audio_turn
-    sleep_task = asyncio.create_task(_sleep_watch(engagement, _sleep))
+    sleep_task = asyncio.create_task(_sleep_watch(
+        engagement,
+        _sleep,
+        turn_ownership=turn_ownership,
+    ))
     _BG_TASKS.add(sleep_task)
     sleep_task.add_done_callback(_BG_TASKS.discard)
 

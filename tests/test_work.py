@@ -323,6 +323,42 @@ def test_cancel_on_running_calls_launcher_and_records_cancelled(tmp_path):
     assert terminal.state is JobState.CANCELLED
 
 
+def test_cancel_active_cancels_queued_launching_and_running_jobs_before_shutdown(tmp_path):
+    store = make_store()
+    queued = store.create("Queued", "brief")
+    launching = store.create("Launching", "brief")
+    store.transition(launching.job_id, JobState.LAUNCHING)
+    running = make_running_job(store, session_id="fedcba98")
+    launcher = FakeLauncher()
+    manager = WorkManager(store, launcher, tmp_path)
+
+    completed = asyncio.run(manager.cancel_active(timeout_s=0.5))
+
+    assert completed is True
+    assert manager.active() == []
+    assert [store.get(job.job_id).state for job in (queued, launching, running)] == [
+        JobState.CANCELLED,
+        JobState.CANCELLED,
+        JobState.CANCELLED,
+    ]
+    assert launcher.cancel_calls == [("fedcba98", tmp_path / running.job_id)]
+
+
+def test_cancel_active_returns_after_timeout_when_a_job_never_becomes_terminal(tmp_path):
+    store = make_store()
+    queued = store.create("Queued", "brief")
+    manager = WorkManager(store, FakeLauncher(), tmp_path)
+    manager.cancel = lambda _job_id: store.get(queued.job_id)
+
+    started = time.monotonic()
+    completed = asyncio.run(manager.cancel_active(timeout_s=0.01))
+    elapsed = time.monotonic() - started
+
+    assert completed is False
+    assert elapsed < 0.2
+    assert store.get(queued.job_id).state is JobState.QUEUED
+
+
 def test_cancel_failure_leaves_job_running_reports_output_and_polling_continues(tmp_path):
     store = make_store()
     job = make_running_job(store, session_id="fedcba98")

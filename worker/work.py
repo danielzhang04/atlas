@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from hashlib import sha256
 import logging
+import math
 from pathlib import Path
 import threading
 from typing import Callable
@@ -135,6 +136,42 @@ class WorkManager:
             terminal = self.store.transition(job_id, JobState.CANCELLED)
         self._terminal(terminal)
         return terminal
+
+    async def cancel_active(self, timeout_s: float = 15.0) -> bool:
+        """Cancel every active job and wait within a fixed shutdown budget."""
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(float(timeout_s))
+            or timeout_s < 0
+        ):
+            raise ValueError("invalid shutdown timeout")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        tasks = {
+            asyncio.create_task(asyncio.to_thread(self.cancel, job.job_id)): job.job_id
+            for job in self.active()
+        }
+        if tasks:
+            remaining = max(0.0, deadline - loop.time())
+            done, pending = await asyncio.wait(tasks, timeout=remaining)
+            for task in done:
+                try:
+                    task.result()
+                except Exception as exc:
+                    logger.warning(
+                        "shutdown cancellation failed for job %s: %s",
+                        tasks[task],
+                        type(exc).__name__,
+                    )
+            for task in pending:
+                task.cancel()
+        while self.active():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.05, remaining))
+        return True
 
     def on_terminal(self, fn: Callable[[Job], None]) -> None:
         if not callable(fn):
