@@ -34,8 +34,7 @@ body {
   background: var(--bg);
 }
 
-button,
-input {
+button {
   color: inherit;
   font: inherit;
 }

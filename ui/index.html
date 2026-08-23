@@ -17,9 +17,9 @@
           <span>Atlas</span>
         </button>
         <nav aria-label="Atlas sections" role="tablist">
-          <button class="nav-button" id="live-tab" type="button" role="tab" data-view-target="live">Live</button>
-          <button class="nav-button" id="history-tab" type="button" role="tab" data-view-target="history">History</button>
-          <button class="nav-button" id="settings-tab" type="button" role="tab" data-view-target="settings">Settings</button>
+          <button class="nav-button" id="live-tab" type="button" role="tab" aria-controls="live-view" data-view-target="live">Live</button>
+          <button class="nav-button" id="history-tab" type="button" role="tab" aria-controls="history-view" data-view-target="history">History</button>
+          <button class="nav-button" id="settings-tab" type="button" role="tab" aria-controls="settings-view" data-view-target="settings">Settings</button>
         </nav>
         <div class="connection" id="connection" role="status" aria-live="polite">
           <span class="connection-dot" aria-hidden="true"></span>

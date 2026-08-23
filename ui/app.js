@@ -49,6 +49,9 @@
   let transcriptSignature = "";
   let signalTimer = 0;
   let signalRequestPending = false;
+  let stateRequestPending = false;
+  let jobsRequestPending = false;
+  let settingsRequestPending = false;
   const eventsByJob = new Map();
   const resultsByJob = new Map();
 
@@ -89,6 +92,10 @@
     const barValues = new Float32Array(BAR_COUNT);
     const cosine = new Float32Array(BAR_COUNT);
     const sine = new Float32Array(BAR_COUNT);
+    const barStartX = new Float32Array(BAR_COUNT);
+    const barStartY = new Float32Array(BAR_COUNT);
+    const arcPaths = new Array(3);
+    const arcDirections = [1, -1, 1];
     const barColor = new Float32Array(3);
     const coreColor = new Float32Array(3);
     const fromBarColor = new Float32Array(palettes.OFFLINE.bar);
@@ -99,8 +106,8 @@
     const metrics = {samples: 0, lastMs: 0, averageMs: 0, maxMs: 0};
     let state = "OFFLINE";
     let energy = 0;
-    let width = 1;
-    let height = 1;
+    let width = 0;
+    let height = 0;
     let scale = 1;
     let centerX = .5;
     let centerY = .5;
@@ -158,6 +165,20 @@
       scale = Math.min(width, height);
       centerX = width / 2;
       centerY = height / 2;
+      const baseRadius = .34 * scale;
+      for (let index = 0; index < BAR_COUNT; index += 1) {
+        barStartX[index] = centerX + cosine[index] * baseRadius;
+        barStartY[index] = centerY + sine[index] * baseRadius;
+      }
+      const radii = [.415, .452, .486];
+      const starts = [-1.3, 1.04, 2.72];
+      const lengths = [.82, 1.1, .62];
+      for (let index = 0; index < arcPaths.length; index += 1) {
+        const path = new Path2D();
+        const end = starts[index] + lengths[index] * arcDirections[index];
+        path.arc(0, 0, radii[index] * scale, starts[index], end, arcDirections[index] < 0);
+        arcPaths[index] = path;
+      }
       canvas.width = Math.round(width * pixelRatio);
       canvas.height = Math.round(height * pixelRatio);
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
@@ -220,19 +241,16 @@
     function drawArcs(now) {
       if (state === "OFFLINE") return;
       const rotation = state === "THINKING" ? now * .00022 : 0;
-      const radii = [.415, .452, .486];
-      const starts = [-1.3, 1.04, 2.72];
-      const lengths = [.82, 1.1, .62];
-      const arcPath = new Path2D();
-      for (let index = 0; index < radii.length; index += 1) {
-        const direction = index === 1 ? -1 : 1;
-        const start = starts[index] + rotation * direction;
-        arcPath.arc(centerX, centerY, radii[index] * scale, start, start + lengths[index] * direction, direction < 0);
-      }
       context.lineWidth = Math.max(.55, scale * .0023);
       context.lineCap = "round";
       context.strokeStyle = colorString(barColor, state === "THINKING" ? .28 : .1);
-      context.stroke(arcPath);
+      for (let index = 0; index < arcPaths.length; index += 1) {
+        context.save();
+        context.translate(centerX, centerY);
+        context.rotate(rotation * arcDirections[index]);
+        context.stroke(arcPaths[index]);
+        context.restore();
+      }
     }
 
     function drawBars(now) {
@@ -255,8 +273,8 @@
         const length = state === "ASLEEP"
           ? minimumLength * breathing
           : minimumLength + lengthRange * barValues[index];
-        const innerX = centerX + cosine[index] * baseRadius;
-        const innerY = centerY + sine[index] * baseRadius;
+        const innerX = barStartX[index];
+        const innerY = barStartY[index];
         barPath.moveTo(innerX, innerY);
         barPath.lineTo(innerX + cosine[index] * length, innerY + sine[index] * length);
       }
@@ -311,7 +329,6 @@
     }
 
     function draw(now) {
-      resize();
       mixColors(now);
       context.fillStyle = "#0b0c10";
       context.fillRect(0, 0, width, height);
@@ -334,6 +351,7 @@
 
     function start() {
       if (running || document.visibilityState !== "visible") return;
+      resize();
       running = true;
       animationFrame = requestAnimationFrame(frame);
     }
@@ -389,6 +407,22 @@
       const target = button.dataset.viewTarget;
       if (window.location.hash === `#${target}`) selectView(target);
       else window.location.hash = target;
+    });
+  });
+
+  const viewTabs = [...document.querySelectorAll('.nav-button[role="tab"]')];
+  viewTabs.forEach((button, index) => {
+    button.addEventListener("keydown", (event) => {
+      let nextIndex = null;
+      if (event.key === "ArrowLeft") nextIndex = (index - 1 + viewTabs.length) % viewTabs.length;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % viewTabs.length;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = viewTabs.length - 1;
+      if (nextIndex === null) return;
+      event.preventDefault();
+      const nextTab = viewTabs[nextIndex];
+      nextTab.focus();
+      window.location.hash = nextTab.dataset.viewTarget;
     });
   });
 
@@ -468,6 +502,8 @@
   }
 
   async function refreshState() {
+    if (stateRequestPending) return;
+    stateRequestPending = true;
     try {
       const response = await fetch("/state", {cache: "no-store"});
       if (!response.ok) throw new Error("state unavailable");
@@ -481,6 +517,8 @@
       setConnection(false);
       setEngineState("OFFLINE");
       renderAudio(null);
+    } finally {
+      stateRequestPending = false;
     }
   }
 
@@ -519,6 +557,20 @@
     return eventsByJob.get(jobId);
   }
 
+  function clearPairing() {
+    actionToken = "";
+    eventsByJob.clear();
+    resultsByJob.clear();
+    refs.pairingStatus.textContent = "Not paired";
+    const selected = jobs.find((job) => job.id === selectedResultId);
+    setResultPanel(
+      selected ? selected.title : "No job selected",
+      selected ? "pair to view" : "Select a completed job.",
+    );
+    renderWorkers();
+    renderHistory();
+  }
+
   async function refreshEvents(job) {
     if (!actionToken) return;
     const existing = eventStore(job.id);
@@ -528,6 +580,10 @@
         cache: "no-store",
         headers: {[ACTION_HEADER]: actionToken},
       });
+      if (response.status === 401) {
+        clearPairing();
+        return;
+      }
       if (!response.ok) return;
       const payload = await response.json();
       if (Array.isArray(payload.events)) existing.push(...payload.events);
@@ -558,13 +614,15 @@
     const events = eventStore(job.id);
     if (!actionToken) terminal.append(node("p", "quiet", "pair to view output"));
     else if (events.length === 0) terminal.append(node("p", "quiet", "Waiting for output."));
-    events.forEach((event) => {
-      const row = node("div", `terminal-line is-${event.kind}`);
-      row.append(node("span", "terminal-sequence", String(event.sequence).padStart(4, "0")));
-      row.append(node("span", "terminal-kind", event.kind));
-      row.append(node("span", "terminal-text", event.text));
-      terminal.append(row);
-    });
+    if (actionToken) {
+      events.forEach((event) => {
+        const row = node("div", `terminal-line is-${event.kind}`);
+        row.append(node("span", "terminal-sequence", String(event.sequence).padStart(4, "0")));
+        row.append(node("span", "terminal-kind", event.kind));
+        row.append(node("span", "terminal-text", event.text));
+        terminal.append(row);
+      });
+    }
     refs.workerOutput.append(terminal);
   }
 
@@ -601,12 +659,13 @@
     return new Date(milliseconds).toLocaleDateString();
   }
 
-  function setResultPanel(title, message, result = "") {
+  function setResultPanel(title, message, result = null) {
+    const hasResult = typeof result === "string";
     refs.resultTitle.textContent = title;
     refs.resultPlaceholder.textContent = message;
-    refs.resultPlaceholder.hidden = Boolean(result);
-    refs.historyResult.hidden = !result;
-    refs.historyResult.textContent = result;
+    refs.resultPlaceholder.hidden = hasResult;
+    refs.historyResult.hidden = !hasResult;
+    refs.historyResult.textContent = hasResult ? result : "";
   }
 
   async function showResult(job) {
@@ -626,11 +685,7 @@
         headers: {[ACTION_HEADER]: actionToken},
       });
       if (response.status === 401) {
-        actionToken = "";
-        refs.pairingStatus.textContent = "Not paired";
-        renderWorkers();
-        renderHistory();
-        setResultPanel(job.title, "pair to view");
+        clearPairing();
         return;
       }
       if (!response.ok) throw new Error("result unavailable");
@@ -692,8 +747,7 @@
         body: "{}",
       });
       if (response.status === 401) {
-        actionToken = "";
-        refs.pairingStatus.textContent = "Not paired";
+        clearPairing();
       }
       await refreshJobs();
     } catch (_error) {
@@ -703,6 +757,8 @@
   }
 
   async function refreshJobs() {
+    if (jobsRequestPending) return;
+    jobsRequestPending = true;
     try {
       const response = await fetch("/jobs", {cache: "no-store"});
       if (!response.ok) return;
@@ -714,6 +770,8 @@
       renderHistory();
     } catch (_error) {
       return;
+    } finally {
+      jobsRequestPending = false;
     }
   }
 
@@ -735,6 +793,8 @@
   }
 
   async function refreshSettings() {
+    if (settingsRequestPending) return;
+    settingsRequestPending = true;
     try {
       const [mcpResponse, healthResponse] = await Promise.all([
         fetch("/mcp", {cache: "no-store"}),
@@ -749,6 +809,8 @@
     } catch (_error) {
       refs.claudeStatus.textContent = "Unavailable";
       refs.claudeStatus.classList.add("is-unavailable");
+    } finally {
+      settingsRequestPending = false;
     }
   }
 
