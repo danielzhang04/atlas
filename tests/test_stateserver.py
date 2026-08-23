@@ -36,18 +36,50 @@ def test_state_signal_assets_and_security_headers():
                 await _request(server),
                 await _request(server, path="/signal"),
                 await _request(server, path="/"),
+                await _request(server, path="/ui/styles.css"),
+                await _request(server, path="/ui/app.js"),
                 list(server.addresses),
             )
         finally:
             await server.stop()
 
-    state_response, signal, page, addresses = asyncio.run(scenario())
+    state_response, signal, page, styles, script, addresses = asyncio.run(scenario())
     payload = json.loads(state_response[2])
     assert state_response[0] == 200
     assert payload["heartbeat"] == _dt(1).isoformat()
     assert payload["state"] == "LISTENING"
-    assert json.loads(signal[2]) == {"energy": 0.625}
+    signal_payload = json.loads(signal[2])
+    assert signal_payload["energy"] == 0.625
+    if "bands" in signal_payload:
+        assert len(signal_payload["bands"]) == 24
     assert page[0] == 200 and "Atlas Engine" in page[2]
+    assert 'id="engine-canvas"' in page[2]
+    assert 'data-view="live"' in page[2]
+    assert 'aria-controls="history-view"' in page[2]
+    assert 'id="audio-line"' in page[2]
+    assert 'class="core"' not in page[2]
+    assert styles[0] == 200 and "--header: 40px" in styles[2]
+    assert ".view[hidden]" in styles[2]
+    assert "display: none !important" in styles[2]
+    assert ".view-home" not in styles[2]
+    assert ".engine::before" not in styles[2]
+    assert ".orbit" not in styles[2]
+    assert "background-size:" not in styles[2]
+    assert script[0] == 200 and "const BAR_COUNT = 96" in script[2]
+    assert "const INPUT_BANDS = 24" in script[2]
+    assert "const UNIQUE_BANDS = 48" in script[2]
+    assert "new Float32Array(BAR_COUNT)" in script[2]
+    assert "const barStartX = new Float32Array(BAR_COUNT)" in script[2]
+    assert "Math.min(2" in script[2]
+    assert "new Path2D()" in script[2]
+    assert "target > current ? .5 : .12" in script[2]
+    assert "requestAnimationFrame" in script[2]
+    assert "window.__atlasEngineMetrics" in script[2]
+    assert 'fetch("/signal"' in script[2]
+    assert 'currentView !== "live"' in script[2]
+    assert 'document.visibilityState !== "visible"' in script[2]
+    assert "/jobs/${encodeURIComponent(job.id)}/result" in script[2]
+    assert "renderAudio(payload.audio)" in script[2]
     assert state_response[1]["cache-control"] == "no-store"
     assert state_response[1]["x-frame-options"] == "DENY"
     assert all(address[0] == "127.0.0.1" for address in addresses)
