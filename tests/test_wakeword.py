@@ -121,12 +121,13 @@ def test_audio_bands_are_log_spaced_bounded_and_smoothed():
 
 
 class FakeWakeModel:
-    def __init__(self):
+    def __init__(self, scores=None):
         self.frames = []
+        self.scores = iter(scores or [])
 
     def predict(self, frame):
         self.frames.append(frame.copy())
-        return {"hey_test": 0.1}
+        return {"hey_test": next(self.scores, 0.1)}
 
 
 class FakeInputStream:
@@ -220,3 +221,22 @@ def test_listen_closes_and_reopens_on_input_switch_with_native_rates():
     assert all(frame.shape == (wakeword.FRAME_SAMPLES,) for frame in model.frames)
     assert len(signals) == 2
     assert all(len(bands) == wakeword.BAND_COUNT for _energy, bands in signals)
+
+
+def test_listen_detects_a_sustained_synthetic_hey_atlas_score_shape():
+    sd = FakeSoundDevice()
+    model = FakeWakeModel([0.1, 0.72, 0.83, 0.91, 0.2])
+    wakes = []
+
+    wakeword.listen(
+        lambda: wakes.append("hey atlas"),
+        model_name="hey_test",
+        device="follow",
+        patience=3,
+        sd_module=sd,
+        model_loader=lambda _name: (model, "hey_test"),
+        clock=iter([100.0, 100.08, 100.16, 100.24, 100.32]).__next__,
+        max_frames=5,
+    )
+
+    assert wakes == ["hey atlas"]

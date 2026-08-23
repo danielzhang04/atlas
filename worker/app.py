@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable
 import yaml
 
 from livekit.agents import Agent, AgentSession, JobContext, StopResponse, WorkerOptions, cli
-from livekit.plugins import deepgram, elevenlabs, silero
+from livekit.plugins import deepgram, silero
 
 from worker import addressing as addressing_mod
 from worker import brain as brain_mod
@@ -46,6 +46,7 @@ def _build_tts(cfg: dict):
         return deepgram.TTS(model=entry["model"])
     if entry["vendor"] == "elevenlabs":
         from livekit.agents.utils import http_context
+        from livekit.plugins import elevenlabs
 
         return elevenlabs.TTS(
             voice_id=entry["voice_id"],
@@ -651,6 +652,7 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=silero.VAD.load(),
         llm=None,
         tts=_build_tts(cfg),
+        turn_detection="stt",
     )
     agent = AtlasAgent(
         instructions="Atlas voice I/O is host controlled.",

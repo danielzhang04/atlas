@@ -82,6 +82,35 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         built.store.close()
 
 
+def test_default_anthropic_client_is_built_on_first_turn_access(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    monkeypatch.setattr(runtime, "ATLAS", root)
+    created = []
+    messages = object()
+
+    class Client:
+        def __init__(self):
+            self.messages = messages
+
+    lazy_client = runtime._LazyAnthropicClient(
+        factory=lambda: created.append(Client()) or created[-1],
+    )
+    built = runtime.build({
+        "fast_model": "claude-test",
+        "google_account": "owner@example.test",
+        "job_store_path": ":memory:",
+        "work_workspace_path": str(tmp_path / "jobs"),
+    }, client=lazy_client, launcher=FakeLauncher())
+    try:
+        assert created == []
+        assert built.brain.client.messages is messages
+        assert len(created) == 1
+        assert built.brain.client.messages is messages
+        assert len(created) == 1
+    finally:
+        built.store.close()
+
+
 def test_build_requires_the_small_trusted_configuration(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "ATLAS", _root(tmp_path))
     try:

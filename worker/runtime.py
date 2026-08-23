@@ -19,6 +19,25 @@ __all__ = ["Runtime", "build"]
 ATLAS = Path(__file__).resolve().parents[1]
 
 
+class _LazyAnthropicClient:
+    """Delay the provider import and client allocation until the first turn."""
+
+    def __init__(self, factory=None) -> None:
+        self._factory = factory
+        self._client = None
+
+    @property
+    def messages(self):
+        if self._client is None:
+            factory = self._factory
+            if factory is None:
+                from anthropic import AsyncAnthropic
+
+                factory = AsyncAnthropic
+            self._client = factory()
+        return self._client.messages
+
+
 @dataclass(frozen=True, slots=True)
 class Runtime:
     registry: ToolRegistry
@@ -106,9 +125,7 @@ def build(
         **mcp_kwargs,
     )
     if client is None:
-        from anthropic import AsyncAnthropic
-
-        client = AsyncAnthropic()
+        client = _LazyAnthropicClient()
     persona = (ATLAS / "config" / "persona.md").read_text(encoding="utf-8")
     brain = Brain(
         client,
