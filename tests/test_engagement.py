@@ -68,6 +68,7 @@ def test_resolve_input_device_pins_by_substring():
     assert resolve_input_device("intel", devices) == 2
     assert resolve_input_device("Speakers", devices) is None  # output-only never matches
     assert resolve_input_device(None, devices) is None
+    assert resolve_input_device("follow", devices) is None
     assert resolve_input_device("nope", devices) is None
 
 
@@ -118,6 +119,30 @@ def test_console_output_args_falls_back_loud_when_device_missing():
     assert _console_output_args(["app", "console"], cfg, resolve=lambda s: None) == []
 
 
+def test_console_input_args_pins_named_device_but_not_follow_mode():
+    from worker.app import _console_input_args
+
+    assert _console_input_args(
+        ["app", "console"],
+        {"wake_input_device": "Intel"},
+        resolve=lambda _value: 4,
+    ) == ["--input-device", "4"]
+    assert _console_input_args(
+        ["app", "console"],
+        {"wake_input_device": "follow"},
+        resolve=lambda _value: (_ for _ in ()).throw(AssertionError("unused")),
+    ) == []
+
+
+def test_audio_follow_defaults_are_shipped_in_config():
+    from worker.app import _cfg
+
+    cfg = _cfg()
+
+    assert cfg["wake_input_device"] == "follow"
+    assert cfg["tts_output_device"] == "follow"
+
+
 # --- Agent UI state is observational; it cannot change the explicit lifecycle -------------------
 
 def test_apply_agent_state_updates_ui_without_changing_engagement():
@@ -143,20 +168,22 @@ def test_apply_agent_state_is_noop_while_asleep():
     assert pub.state == state.ASLEEP
 
 
-# --- M4: output-device pin status surfaced in /state --------------------------------------------
+# --- Audio device status surfaced in /state -----------------------------------------------------
 
-def test_output_device_status_reports_configured_and_resolution():
-    from worker.app import _output_device_status
-    # no config -> both null (following:false — output-follow contract, 2026-07-21)
-    assert _output_device_status({}, resolve=lambda s: None) == {
-        "configured": None, "resolved": None, "following": False}
-    # configured but unresolved -> visible bad pin (resolved null)
-    assert _output_device_status({"tts_output_device": "Ghost"},
-                                 resolve=lambda s: None) == {
-        "configured": "Ghost", "resolved": None, "following": False}
-    # configured + resolved -> configured echoed, resolved is a device name (idx 0 here)
-    st = _output_device_status({"tts_output_device": "Speakers"}, resolve=lambda s: 0)
-    assert st["configured"] == "Speakers" and st["resolved"] is not None
+def test_audio_status_reports_unconfigured_and_unresolved_pins():
+    from worker.app import _audio_status
+    status = _audio_status(
+        {"wake_input_device": "Ghost"},
+        resolve_input=lambda _value: None,
+        resolve_output=lambda _value: None,
+        boot_input=lambda: "unused",
+        boot_output=lambda: "unused",
+        query_device=lambda _index: {"name": "unused"},
+    )
+    assert status == {
+        "input": {"name": None, "following": False},
+        "output": {"name": None, "following": False},
+    }
 
 
 def test_resolve_model_custom_path_loads_by_file_and_stem_key():

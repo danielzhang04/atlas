@@ -12,6 +12,7 @@ import secrets
 import subprocess
 import sys
 from threading import Event, Lock, Thread
+import time
 from typing import Callable, TextIO
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -35,6 +36,8 @@ logger = logging.getLogger("atlas.desktop")
 ACTIVE_JOB_STATES = {"queued", "launching", "running"}
 ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = "Local\\AtlasDesktop"
+RESTART_EXIT_CODE = 21
+RESTART_INTERVAL_S = 30.0
 STOPPED_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -50,6 +53,22 @@ STOPPED_HTML = """<!doctype html>
   </style>
 </head>
 <body><main><h1>Atlas stopped</h1><p>Close this window and open Atlas again to restart it.</p></main></body>
+</html>"""
+RECONNECTING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atlas reconnecting audio</title>
+  <style>
+    body { background: #101319; color: #edf2f7; display: grid; font: 18px system-ui;
+      margin: 0; min-height: 100vh; place-items: center; }
+    main { max-width: 36rem; padding: 3rem; text-align: center; }
+    h1 { font-size: 2rem; margin-bottom: .5rem; }
+    p { color: #aeb8c5; line-height: 1.5; }
+  </style>
+</head>
+<body><main><h1>reconnecting audio…</h1><p>Atlas is following your new system audio device.</p></main></body>
 </html>"""
 
 
@@ -266,10 +285,41 @@ def _worker_python() -> str:
     return str(executable)
 
 
-def _watch_child(proc, window, closing: Event) -> None:
-    proc.wait()
-    if not closing.is_set():
-        window.load_html(STOPPED_HTML)
+def _watch_child(
+    proc,
+    window,
+    closing: Event,
+    restart=None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    restart_interval_s: float = RESTART_INTERVAL_S,
+) -> None:
+    """Watch successive children and allow at most one audio restart per interval."""
+    current = proc
+    last_restart_at = None
+    while True:
+        exit_code = current.wait()
+        if closing.is_set():
+            return
+        if exit_code != RESTART_EXIT_CODE or restart is None:
+            window.load_html(STOPPED_HTML)
+            return
+        now = clock()
+        if last_restart_at is not None and now - last_restart_at < restart_interval_s:
+            logger.critical("audio reconnect restart rate limit reached")
+            window.load_html(STOPPED_HTML)
+            return
+        last_restart_at = now
+        window.load_html(RECONNECTING_HTML)
+        try:
+            replacement = restart(current)
+        except Exception:
+            logger.exception("could not restart Atlas after an audio device change")
+            replacement = None
+        if replacement is None:
+            window.load_html(STOPPED_HTML)
+            return
+        current = replacement
 
 
 def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
@@ -299,15 +349,15 @@ def run(
         show_already_running()
         close_handle(mutex_handle)
         return 1
-    proc = None
-    job_handle = None
-    ui_url = None
+    child = {"proc": None, "job_handle": None, "ui_url": None}
+    child_lock = Lock()
     stop_once = None
     shutdown_token = token_factory()
-    try:
-        child_env = os.environ.copy()
-        child_env["PYTHONUTF8"] = "1"
-        child_env["ATLAS_SHUTDOWN_TOKEN"] = shutdown_token
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["ATLAS_SHUTDOWN_TOKEN"] = shutdown_token
+
+    def _spawn_child():
         proc = spawn(
             [_worker_python(), "-m", "worker.app", "console"],
             cwd=str(ATLAS),
@@ -320,7 +370,29 @@ def run(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=child_env,
         )
-        job_handle = assign_job(proc)
+        handle = assign_job(proc)
+        if proc.stdout is None:
+            return proc, handle, None
+        result: Queue[str | None] = Queue(maxsize=1)
+        Thread(
+            target=_capture_ui_url,
+            args=(proc.stdout, result),
+            daemon=True,
+        ).start()
+        return proc, handle, result
+
+    def _wait_for_ui_url(result) -> str | None:
+        if result is None:
+            return None
+        try:
+            return result.get(timeout=wait_url_timeout_s)
+        except Empty:
+            return None
+
+    try:
+        proc, job_handle, url_result = _spawn_child()
+        with child_lock:
+            child.update({"proc": proc, "job_handle": job_handle, "ui_url": None})
         closing = Event()
         stop_lock = Lock()
         stopped = False
@@ -332,20 +404,18 @@ def run(
                     return
                 stopped = True
             closing.set()
-            terminate(proc, ui_url, shutdown_token)
+            with child_lock:
+                current_proc = child["proc"]
+                current_url = child["ui_url"]
+            if current_proc is not None:
+                terminate(current_proc, current_url, shutdown_token)
 
         stop_once = _stop_once
-
-        if proc.stdout is None:
-            return 1
-        result: Queue[str | None] = Queue(maxsize=1)
-        Thread(target=_capture_ui_url, args=(proc.stdout, result), daemon=True).start()
-        try:
-            ui_url = result.get(timeout=wait_url_timeout_s)
-        except Empty:
-            return 1
+        ui_url = _wait_for_ui_url(url_result)
         if ui_url is None:
             return 1
+        with child_lock:
+            child["ui_url"] = ui_url
         window = window_factory(
             "Atlas",
             ui_url,
@@ -355,16 +425,56 @@ def run(
         )
         if window is None:
             return 1
-        window.events.closing += lambda: _confirm_window_close(proc, window, ui_url)
+
+        def _confirm_close_current() -> bool:
+            with child_lock:
+                current_proc = child["proc"]
+                current_url = child["ui_url"]
+            if current_proc is None or current_url is None:
+                return True
+            return _confirm_window_close(current_proc, window, current_url)
+
+        def _restart_child(_exited_proc):
+            replacement, replacement_handle, replacement_result = _spawn_child()
+            with child_lock:
+                old_handle = child["job_handle"]
+                child.update({
+                    "proc": replacement,
+                    "job_handle": replacement_handle,
+                    "ui_url": None,
+                })
+            close_handle(old_handle)
+            if closing.is_set():
+                terminate(replacement, None, shutdown_token)
+                return None
+            replacement_url = _wait_for_ui_url(replacement_result)
+            if replacement_url is None:
+                terminate(replacement, None, shutdown_token)
+                with child_lock:
+                    child["job_handle"] = None
+                close_handle(replacement_handle)
+                return None
+            with child_lock:
+                child["ui_url"] = replacement_url
+            window.load_url(replacement_url)
+            return replacement
+
+        window.events.closing += _confirm_close_current
         window.events.closed += _stop_once
-        start(_watch_child, (proc, window, closing))
+        start(_watch_child, (proc, window, closing, _restart_child))
         return 0
     finally:
         if stop_once is not None:
             stop_once()
-        elif proc is not None:
-            terminate(proc, ui_url, shutdown_token)
-        close_handle(job_handle)
+        else:
+            with child_lock:
+                current_proc = child["proc"]
+                current_url = child["ui_url"]
+            if current_proc is not None:
+                terminate(current_proc, current_url, shutdown_token)
+        with child_lock:
+            current_handle = child["job_handle"]
+        close_handle(current_handle)
         close_handle(mutex_handle)
 
 

@@ -17,7 +17,7 @@ voices:
   mars: {vendor: deepgram, model: aura-2-mars-en}
 
 wake_model: hey_atlas
-wake_input_device: Intel
+wake_input_device: follow
 wake_threshold: 0.5
 wake_patience: 3
 tts_output_device: follow

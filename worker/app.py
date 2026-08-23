@@ -88,35 +88,63 @@ def _apply_agent_state(engagement, publisher, agent_state: str) -> None:
         publisher.set_state(mapped)
 
 
-def _boot_default_output_name() -> str | None:
+def _boot_default_device_name(direction: int) -> str | None:
     try:
         import sounddevice as sd
 
-        return sd.query_devices(sd.default.device[1])["name"]
+        return sd.query_devices(sd.default.device[direction])["name"]
     except Exception:
         return None
 
 
-def _output_device_status(
-    cfg: dict,
-    resolve=wakeword.resolve_output_device,
-    boot_default=_boot_default_output_name,
+def _device_status(
+    configured: str | None,
+    *,
+    resolve,
+    boot_default,
+    query_device=None,
 ) -> dict:
-    configured = cfg.get("tts_output_device")
-    if not configured:
-        return {"configured": None, "resolved": None, "following": False}
     if configured == FOLLOW_SENTINEL:
-        return {"configured": FOLLOW_SENTINEL, "resolved": boot_default(), "following": True}
+        return {"name": boot_default(), "following": True}
+    if not configured:
+        return {"name": None, "following": False}
     index = resolve(configured)
     if index is None:
-        return {"configured": configured, "resolved": None, "following": False}
+        return {"name": None, "following": False}
     try:
-        import sounddevice as sd
+        if query_device is None:
+            import sounddevice as sd
 
-        name = sd.query_devices(index)["name"]
+            query_device = sd.query_devices
+        name = query_device(index)["name"]
     except Exception:
         name = str(index)
-    return {"configured": configured, "resolved": name, "following": False}
+    return {"name": name, "following": False}
+
+
+def _audio_status(
+    cfg: dict,
+    *,
+    resolve_input=wakeword.resolve_input_device,
+    resolve_output=wakeword.resolve_output_device,
+    boot_input=lambda: _boot_default_device_name(0),
+    boot_output=lambda: _boot_default_device_name(1),
+    query_device=None,
+) -> dict:
+    return {
+        "input": _device_status(
+            cfg.get("wake_input_device"),
+            resolve=resolve_input,
+            boot_default=boot_input,
+            query_device=query_device,
+        ),
+        "output": _device_status(
+            cfg.get("tts_output_device"),
+            resolve=resolve_output,
+            boot_default=boot_output,
+            query_device=query_device,
+        ),
+    }
 
 
 def _console_singleton():
@@ -126,76 +154,131 @@ def _console_singleton():
 
 
 def _restart_worker(reason: str) -> None:
-    logger.critical("output-follow requested worker restart: %s", reason)
+    logger.critical("audio-follow requested worker restart: %s", reason)
     os._exit(21)
 
 
-def _start_output_follow(
+def _start_audio_follow(
     cfg: dict,
     publisher,
+    wake_switch,
     *,
     console_factory=_console_singleton,
     watcher_cls=devicewatch.DeviceWatcher,
-    follower_cls=devicewatch.OutputFollower,
-    probe=devicewatch.current_default_output,
+    input_follower_cls=devicewatch.InputFollower,
+    output_follower_cls=devicewatch.OutputFollower,
+    input_probe=devicewatch.current_default_input,
+    output_probe=devicewatch.current_default_output,
+    resolve_input=wakeword.resolve_input_device,
+    resolve_output=wakeword.resolve_output_device,
+    sd_module=None,
+    request_restart=_restart_worker,
 ):
-    if cfg.get("tts_output_device") != FOLLOW_SENTINEL:
+    input_following = cfg.get("wake_input_device") == FOLLOW_SENTINEL
+    output_following = cfg.get("tts_output_device") == FOLLOW_SENTINEL
+    if not input_following and not output_following:
         return None
-    try:
-        probe_ok = probe() is not None
-    except Exception:
-        probe_ok = False
-    if not probe_ok:
-        logger.critical("output-follow probe is unavailable")
-        publisher.set_output_device({
-            "configured": FOLLOW_SENTINEL,
-            "resolved": _boot_default_output_name(),
-            "following": False,
-        })
+
+    initial = {}
+    probes = {}
+    if input_following:
+        probes["input"] = input_probe
+    if output_following:
+        probes["output"] = output_probe
+    for direction, probe in probes.items():
+        try:
+            initial[direction] = probe()
+        except Exception:
+            initial[direction] = None
+        endpoint = initial[direction]
+        if endpoint is None:
+            logger.critical("%s-follow probe is unavailable", direction)
+            previous_name = None
+            try:
+                previous_name = publisher.snapshot()["audio"][direction]["name"]
+            except Exception:
+                pass
+            publisher.set_audio_device(
+                direction,
+                {"name": previous_name, "following": False},
+            )
+        else:
+            publisher.set_audio_device(
+                direction,
+                {"name": endpoint[1], "following": True},
+            )
+    active_directions = [direction for direction in probes if initial[direction] is not None]
+    if not active_directions:
         return None
     try:
         console = console_factory()
     except Exception:
-        logger.critical("output-follow console is unavailable", exc_info=True)
-        publisher.set_output_device({
-            "configured": FOLLOW_SENTINEL,
-            "resolved": _boot_default_output_name(),
-            "following": False,
-        })
+        logger.critical("audio-follow console is unavailable", exc_info=True)
+        for direction in active_directions:
+            publisher.set_audio_device(
+                direction,
+                {"name": initial[direction][1], "following": False},
+            )
         return None
     try:
-        import sounddevice as sd
+        if sd_module is None:
+            import sounddevice as sd
+        else:
+            sd = sd_module
 
         try:
-            boot_index = sd.default.device[1]
+            boot_input_index = sd.default.device[0]
+            boot_output_index = sd.default.device[1]
         except Exception:
-            boot_index = None
-        follower = follower_cls(
-            console,
-            resolve_output=wakeword.resolve_output_device,
-            sd_module=sd,
-            initial_idx=boot_index,
-            request_restart=_restart_worker,
-        )
+            boot_input_index = None
+            boot_output_index = None
+        input_follower = None
+        output_follower = None
+        if "input" in active_directions:
+            input_follower = input_follower_cls(
+                console,
+                resolve_input=resolve_input,
+                sd_module=sd,
+                switch_wake_input=wake_switch.switch_to,
+                initial_idx=boot_input_index,
+                request_restart=request_restart,
+            )
+        if "output" in active_directions:
+            output_follower = output_follower_cls(
+                console,
+                resolve_output=resolve_output,
+                sd_module=sd,
+                initial_idx=boot_output_index,
+                request_restart=request_restart,
+            )
 
-        def _on_change(name: str) -> None:
-            publisher.set_output_device(follower.swap_to(name))
+        def _on_input_change(name: str) -> None:
+            publisher.set_audio_device("input", input_follower.swap_to(name))
+
+        def _on_output_change(name: str) -> None:
+            publisher.set_audio_device("output", output_follower.swap_to(name))
 
         watcher = watcher_cls(
-            probe=probe,
-            on_change=_on_change,
+            input_probe=input_probe if input_follower is not None else None,
+            output_probe=output_probe if output_follower is not None else None,
+            on_input_change=_on_input_change,
+            on_output_change=_on_output_change,
             period_s=1.5,
-            initial_delay_s=10.0,
+            initial_delay_s=2.0,
+            initial_ids={
+                direction: initial[direction][0]
+                for direction in active_directions
+            },
         )
         watcher.start()
         return watcher
     except Exception:
-        logger.critical("output-follow wiring failed", exc_info=True)
-        publisher.set_output_device({
-            "configured": FOLLOW_SENTINEL,
-            "resolved": _boot_default_output_name(),
-            "following": False,
-        })
+        logger.critical("audio-follow wiring failed", exc_info=True)
+        for direction in active_directions:
+            publisher.set_audio_device(
+                direction,
+                {"name": initial[direction][1], "following": False},
+            )
         return None
 
 
@@ -526,7 +609,13 @@ async def entrypoint(ctx: JobContext) -> None:
         addressing_mod.vocabulary(cfg),
     )
     turn_ownership = TurnOwnership()
-    publisher.set_output_device(_output_device_status(cfg))
+    wake_device = cfg.get("wake_input_device")
+    initial_wake_device = None
+    if wake_device and wake_device != FOLLOW_SENTINEL:
+        initial_wake_device = wakeword.resolve_input_device(wake_device)
+    wake_switch = wakeword.InputDeviceSwitch(initial_wake_device)
+    audio_watcher = None
+    publisher.set_audio(_audio_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
     loop = asyncio.get_running_loop()
@@ -612,6 +701,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def _shutdown() -> None:
         wakeword.shutting_down.set()
+        if audio_watcher is not None:
+            audio_watcher.stop()
         session.interrupt()
         turn_ownership.cancel()
         if sleep_task is not None:
@@ -631,7 +722,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if TEXT_MODE:
         return
 
-    _start_output_follow(cfg, publisher)
+    audio_watcher = _start_audio_follow(cfg, publisher, wake_switch)
     session.input.set_audio_enabled(False)
 
     def _sleep(announce: bool = True) -> bool:
@@ -655,8 +746,8 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_wake() -> None:
         loop.call_soon_threadsafe(_engage)
 
-    def _on_audio_energy(value: float) -> None:
-        loop.call_soon_threadsafe(publisher.set_audio_energy, value)
+    def _on_audio_signal(value: float, bands: list[float]) -> None:
+        loop.call_soon_threadsafe(publisher.set_audio_signal, value, bands)
 
     intents = _load_intents()
 
@@ -693,7 +784,8 @@ async def entrypoint(ctx: JobContext) -> None:
             "device": cfg.get("wake_input_device"),
             "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
             "patience": cfg.get("wake_patience", wakeword.PATIENCE),
-            "on_energy": _on_audio_energy,
+            "on_signal": _on_audio_signal,
+            "device_switch": wake_switch,
         },
         daemon=True,
     ).start()
@@ -718,16 +810,33 @@ def _console_output_args(
     return ["--output-device", str(index)]
 
 
+def _console_input_args(
+    argv: list[str],
+    cfg: dict,
+    resolve=wakeword.resolve_input_device,
+) -> list[str]:
+    if "console" not in argv or "--text" in argv or "--list-devices" in argv:
+        return []
+    if any(value == "--input-device" or value.startswith("--input-device=") for value in argv):
+        return []
+    configured = cfg.get("wake_input_device")
+    if not configured or configured == FOLLOW_SENTINEL:
+        return []
+    index = resolve(configured)
+    if index is None:
+        logger.critical("configured wake input device was not found")
+        return []
+    return ["--input-device", str(index)]
+
+
 def main() -> int:
     jobobject.assign_current_process()
     try:
-        sys.argv.extend(_console_output_args(sys.argv, _cfg()))
+        cfg = _cfg()
+        sys.argv.extend(_console_output_args(sys.argv, cfg))
+        sys.argv.extend(_console_input_args(sys.argv, cfg))
     except Exception:
-        logger.exception("could not resolve tts_output_device")
-    if "console" in sys.argv and "--input-device" not in sys.argv:
-        index = wakeword.resolve_input_device(_cfg().get("wake_input_device"))
-        if index is not None:
-            sys.argv += ["--input-device", str(index)]
+        logger.exception("could not resolve configured audio devices")
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
     return 0
 

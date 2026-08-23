@@ -30,6 +30,7 @@ class FakeWindow:
         self.confirmation = confirmation
         self.dialogs = []
         self.loaded_html = []
+        self.loaded_urls = []
 
     def create_confirmation_dialog(self, title, message):
         self.dialogs.append((title, message))
@@ -38,22 +39,26 @@ class FakeWindow:
     def load_html(self, html):
         self.loaded_html.append(html)
 
+    def load_url(self, url):
+        self.loaded_urls.append(url)
+
 
 class FakeProcess:
-    def __init__(self, output="", *, pid=4321, running=True) -> None:
+    def __init__(self, output="", *, pid=4321, running=True, exit_code=0) -> None:
         self.stdout = StringIO(output)
         self.pid = pid
         self._handle = 8765
         self.running = running
+        self.exit_code = exit_code
         self.waits = []
 
     def poll(self):
-        return None if self.running else 0
+        return None if self.running else self.exit_code
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
         self.running = False
-        return 0
+        return self.exit_code
 
 
 def test_read_ui_url_ignores_noise_and_accepts_only_a_loopback_fragment_url():
@@ -158,7 +163,12 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     )]
     assert len(window.events.closing.handlers) == 1
     assert len(window.events.closed.handlers) == 1
-    assert start_calls == [(desktop._watch_child, (process, window, start_calls[0][1][2]))]
+    assert len(start_calls) == 1
+    watch_function, watch_args = start_calls[0]
+    assert watch_function is desktop._watch_child
+    assert watch_args[:2] == (process, window)
+    assert isinstance(watch_args[2], Event)
+    assert callable(watch_args[3])
     assert assigned == [process]
     assert stop_calls == [(
         process,
@@ -167,6 +177,54 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     )]
     assert closed_handles == [222, 111]
     assert result == 0
+
+
+def test_run_replaces_exit_21_child_and_loads_new_worker_url_in_same_window():
+    first = FakeProcess(
+        "ATLAS_UI http://127.0.0.1:4360/#pair=first\n",
+        pid=1001,
+        exit_code=desktop.RESTART_EXIT_CODE,
+    )
+    second = FakeProcess(
+        "ATLAS_UI http://127.0.0.1:4361/#pair=second\n",
+        pid=1002,
+        exit_code=0,
+    )
+    processes = iter([first, second])
+    handles = iter([201, 202])
+    assigned = []
+    closed_handles = []
+    terminated = []
+    window = FakeWindow()
+
+    def spawn(_command, **_kwargs):
+        return next(processes)
+
+    def start(function, args):
+        function(*args)
+
+    result = desktop.run(
+        spawn=spawn,
+        window_factory=lambda _title, _url, **_kwargs: window,
+        start=start,
+        terminate=lambda child, url, token: terminated.append((child, url, token)),
+        create_mutex=lambda: (111, False),
+        assign_job=lambda child: assigned.append(child) or next(handles),
+        close_handle=closed_handles.append,
+        token_factory=lambda: "shutdown-token",
+    )
+
+    assert result == 0
+    assert assigned == [first, second]
+    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "Atlas stopped" in window.loaded_html[1]
+    assert window.loaded_urls == ["http://127.0.0.1:4361/#pair=second"]
+    assert terminated == [(
+        second,
+        "http://127.0.0.1:4361/#pair=second",
+        "shutdown-token",
+    )]
+    assert closed_handles == [201, 202, 111]
 
 
 def test_existing_desktop_mutex_reports_already_running_without_spawning():
@@ -245,6 +303,79 @@ def test_unexpected_child_death_replaces_the_window_with_stopped_page():
 
     assert len(window.loaded_html) == 1
     assert "Atlas stopped" in window.loaded_html[0]
+
+
+def test_audio_restart_exit_restarts_in_place_with_reconnecting_page():
+    process = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    replacement = FakeProcess(exit_code=0)
+    window = FakeWindow()
+    closing = Event()
+    restarts = []
+
+    def restart(exited):
+        restarts.append(exited)
+        return replacement
+
+    desktop._watch_child(process, window, closing, restart)
+
+    assert restarts == [process]
+    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "Atlas stopped" in window.loaded_html[1]
+
+
+def test_audio_restart_is_limited_to_once_per_thirty_seconds():
+    process = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    replacement = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    window = FakeWindow()
+    closing = Event()
+    restarts = []
+    times = iter([100.0, 120.0])
+
+    def restart(exited):
+        restarts.append(exited)
+        return replacement
+
+    desktop._watch_child(
+        process,
+        window,
+        closing,
+        restart,
+        clock=lambda: next(times),
+    )
+
+    assert restarts == [process]
+    assert len(window.loaded_html) == 2
+    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "Atlas stopped" in window.loaded_html[1]
+
+
+def test_audio_restart_is_allowed_again_after_thirty_seconds():
+    first = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    second = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    third = FakeProcess(exit_code=0)
+    window = FakeWindow()
+    closing = Event()
+    replacements = iter([second, third])
+    restarts = []
+    times = iter([100.0, 130.0])
+
+    def restart(exited):
+        restarts.append(exited)
+        return next(replacements)
+
+    desktop._watch_child(
+        first,
+        window,
+        closing,
+        restart,
+        clock=lambda: next(times),
+    )
+
+    assert restarts == [first, second]
+    assert len(window.loaded_html) == 3
+    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "reconnecting audio…" in window.loaded_html[1]
+    assert "Atlas stopped" in window.loaded_html[2]
 
 
 def test_expected_child_stop_does_not_replace_the_window():
