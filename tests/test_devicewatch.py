@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 from worker import devicewatch
 
@@ -110,6 +111,26 @@ def test_one_watcher_polls_input_and_output_and_fires_independently():
     assert output_calls == ["Headphones"]
 
 
+def test_watcher_treats_first_endpoint_after_missing_initial_probe_as_reopen():
+    sequence = [None, ("input-B", "Headset microphone")]
+    calls = []
+    fired = threading.Event()
+
+    def probe():
+        return sequence.pop(0) if sequence else ("input-B", "Headset microphone")
+
+    watcher = devicewatch.DeviceWatcher(
+        input_probe=probe,
+        on_input_change=lambda name: (calls.append(name), fired.set()),
+        initial_ids={"input": None},
+        period_s=0.01,
+    )
+    watcher.start()
+    assert fired.wait(timeout=2.0)
+    watcher.stop()
+    assert calls == ["Headset microphone"]
+
+
 def test_watcher_survives_probe_exception():
     sequence = ["boom", ("id-A", "Realtek"), ("id-B", "Px7")]
     calls = []
@@ -154,14 +175,42 @@ class FakeConsole:
 
 
 class FakeSd:
-    def __init__(self, *, bad=None, default=(1, 2)):
+    def __init__(self, *, bad=None, default=(1, 2), capture_error=None):
         self.bad = bad or set()
         self.default = type("Default", (), {"device": default})()
+        self.capture_error = capture_error
+        self.capture_calls = []
 
     def query_devices(self, index=None, kind=None):
         if index in self.bad:
             raise ValueError(f"no device {index}")
         return {"name": f"device-{index}"}
+
+    def InputStream(self, **options):
+        self.capture_calls.append(options)
+        error = self.capture_error
+
+        class Stream:
+            def __enter__(self):
+                if error is not None:
+                    raise error
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, count):
+                if error is not None:
+                    raise error
+                return bytes(count * 2), False
+
+        return Stream()
+
+
+def test_livekit_capture_rate_is_read_from_installed_console_module():
+    module = SimpleNamespace(SAMPLE_RATE=24_000)
+
+    assert devicewatch.livekit_capture_rate(module=module) == 24_000
 
 
 def test_output_follower_opens_resolved_device():
@@ -221,42 +270,82 @@ def test_output_follower_requests_restart_when_reopen_fails():
 
 def test_input_follower_reopens_livekit_then_switches_wake_stream():
     console = FakeConsole()
+    sd = FakeSd()
     wake_devices = []
-    restarts = []
+    failures = []
     follower = devicewatch.InputFollower(
         console,
         resolve_input=lambda _name: 7,
-        sd_module=FakeSd(),
+        sd_module=sd,
         switch_wake_input=wake_devices.append,
-        request_restart=restarts.append,
+        on_failure=failures.append,
+        capture_rate=24_000,
     )
 
     status = follower.swap_to("Headset microphone")
 
     assert console.calls == [("microphone", True, 7)]
     assert wake_devices == [7]
-    assert restarts == []
+    assert failures == []
+    assert sd.capture_calls == [{
+        "device": 7,
+        "samplerate": 24_000,
+        "channels": 1,
+        "dtype": "int16",
+        "blocksize": 240,
+    }]
     assert status == {"name": "device-7", "following": True}
 
 
-def test_input_follower_restart_path_does_not_move_wake_on_livekit_failure():
+def test_input_follower_reports_livekit_reopen_failure_through_failure_callback():
     console = FakeConsole(fail_microphone_on={7})
     wake_devices = []
-    restarts = []
+    failures = []
     follower = devicewatch.InputFollower(
         console,
         resolve_input=lambda _name: 7,
         sd_module=FakeSd(),
         switch_wake_input=wake_devices.append,
-        request_restart=restarts.append,
+        on_failure=failures.append,
+        capture_rate=24_000,
     )
 
     status = follower.swap_to("Headset microphone")
 
     assert console.calls == [("microphone", True, 7)]
-    assert wake_devices == []
-    assert len(restarts) == 1
-    assert status == {"name": None, "following": True}
+    assert wake_devices == [7]
+    assert failures == ["livekit input reopen failed"]
+    assert status == {
+        "name": "device-7",
+        "following": False,
+        "error": "livekit input reopen failed",
+    }
+
+
+def test_unsupported_livekit_rate_keeps_wake_native_and_leaves_livekit_unchanged():
+    console = FakeConsole()
+    sd = FakeSd(capture_error=RuntimeError("invalid sample rate"))
+    wake_devices = []
+    failures = []
+    follower = devicewatch.InputFollower(
+        console,
+        resolve_input=lambda _name: 7,
+        sd_module=sd,
+        switch_wake_input=wake_devices.append,
+        on_failure=failures.append,
+        capture_rate=24_000,
+    )
+
+    status = follower.swap_to("HFP microphone")
+
+    assert wake_devices == [7]
+    assert console.calls == []
+    assert failures == []
+    assert status == {
+        "name": "device-7",
+        "following": False,
+        "reason": "rate unsupported",
+    }
 
 
 def test_start_audio_follow_wires_both_directions_into_one_watcher():
@@ -326,26 +415,48 @@ def test_start_audio_follow_skips_when_both_devices_are_pinned():
     assert watcher is None
 
 
-def test_start_audio_follow_dead_probe_marks_direction_not_following():
+def test_start_audio_follow_keeps_polling_direction_with_missing_initial_probe():
     from worker import app, wakeword
 
     published = []
+    watcher_instances = []
 
     class Publisher:
         def set_audio_device(self, direction, status):
             published.append((direction, status))
+
+        def snapshot(self):
+            return {"audio": {"input": {"name": "boot microphone"}}}
+
+    class FakeWatcher:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+            watcher_instances.append(self)
+
+        def start(self):
+            self.started = True
 
     watcher = app._start_audio_follow(
         {"wake_input_device": "follow", "tts_output_device": "Speakers"},
         Publisher(),
         wakeword.InputDeviceSwitch(),
         input_probe=lambda: None,
+        console_factory=FakeConsole,
+        watcher_cls=FakeWatcher,
+        resolve_input=lambda _name: 7,
+        sd_module=FakeSd(),
     )
 
-    assert watcher is None
-    assert published == [
-        ("input", {"name": None, "following": False}),
-    ]
+    assert watcher is watcher_instances[0]
+    assert watcher.started
+    assert watcher.kwargs["initial_ids"] == {"input": None}
+    assert published == [("input", {"name": "boot microphone", "following": False})]
+    watcher.kwargs["on_input_change"]("Headset microphone")
+    assert published[-1] == (
+        "input",
+        {"name": "device-7", "following": True},
+    )
 
 
 def test_start_audio_follow_console_failure_marks_active_direction_not_following():
@@ -395,12 +506,85 @@ def test_comtypes_logger_is_silenced():
     assert logging.getLogger("comtypes").level >= logging.WARNING
 
 
-def test_worker_restart_uses_reserved_audio_exit_code(monkeypatch):
+def test_worker_restart_requests_graceful_shutdown_with_reserved_exit_code(monkeypatch):
     from worker import app
 
-    exits = []
-    monkeypatch.setattr(app.os, "_exit", exits.append)
+    shutdowns = []
+    monkeypatch.setattr(app, "_worker_exit_code", 0)
 
-    app._restart_worker("test audio change")
+    app._restart_worker("test audio change", shutdowns.append)
 
-    assert exits == [21]
+    assert app._worker_exit_code == 21
+    assert shutdowns == ["test audio change"]
+
+
+def test_audio_restart_coalescer_collapses_events_within_two_seconds():
+    from worker import app
+
+    callbacks = []
+    restarts = []
+
+    class Handle:
+        def __init__(self, callback):
+            self.callback = callback
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Loop:
+        def call_soon_threadsafe(self, callback, *args):
+            callback(*args)
+
+        def call_later(self, delay, callback):
+            handle = Handle(callback)
+            callbacks.append((delay, handle))
+            return handle
+
+    coalescer = app.AudioRestartCoalescer(
+        restarts.append,
+        loop=Loop(),
+    )
+
+    coalescer.request("input changed")
+    coalescer.request("output changed")
+    assert callbacks[0][1].cancelled
+    assert callbacks[0][0] == 2.0
+    assert callbacks[1][0] == 2.0
+    callbacks[1][1].callback()
+
+    assert restarts == ["input changed; output changed"]
+
+
+def test_audio_failure_publishes_error_before_requesting_restart():
+    from worker import app
+
+    events = []
+
+    class Publisher:
+        def snapshot(self):
+            return {"audio": {"input": {"name": "Headset microphone"}}}
+
+        def set_audio_device(self, direction, status):
+            events.append(("publish", direction, status))
+
+    callback = app._audio_failure_callback(
+        Publisher(),
+        "input",
+        lambda reason: events.append(("restart", reason)),
+    )
+
+    callback("wake input unavailable")
+
+    assert events == [
+        (
+            "publish",
+            "input",
+            {
+                "name": "Headset microphone",
+                "following": False,
+                "error": "wake input unavailable",
+            },
+        ),
+        ("restart", "wake input unavailable"),
+    ]

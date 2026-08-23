@@ -323,17 +323,20 @@ def test_audio_restart_exit_restarts_in_place_with_reconnecting_page():
     assert "Atlas stopped" in window.loaded_html[1]
 
 
-def test_audio_restart_is_limited_to_once_per_thirty_seconds():
+def test_second_audio_restart_inside_thirty_seconds_is_deferred_not_stopped():
     process = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
     replacement = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    final = FakeProcess(exit_code=0)
     window = FakeWindow()
     closing = Event()
     restarts = []
+    waits = []
     times = iter([100.0, 120.0])
+    replacements = iter([replacement, final])
 
     def restart(exited):
         restarts.append(exited)
-        return replacement
+        return next(replacements)
 
     desktop._watch_child(
         process,
@@ -341,12 +344,15 @@ def test_audio_restart_is_limited_to_once_per_thirty_seconds():
         closing,
         restart,
         clock=lambda: next(times),
+        wait=lambda delay: waits.append(delay) or False,
     )
 
-    assert restarts == [process]
-    assert len(window.loaded_html) == 2
+    assert restarts == [process, replacement]
+    assert waits == [10.0]
+    assert len(window.loaded_html) == 3
     assert "reconnecting audio…" in window.loaded_html[0]
-    assert "Atlas stopped" in window.loaded_html[1]
+    assert "reconnecting audio…" in window.loaded_html[1]
+    assert "Atlas stopped" in window.loaded_html[2]
 
 
 def test_audio_restart_is_allowed_again_after_thirty_seconds():
@@ -376,6 +382,59 @@ def test_audio_restart_is_allowed_again_after_thirty_seconds():
     assert "reconnecting audio…" in window.loaded_html[0]
     assert "reconnecting audio…" in window.loaded_html[1]
     assert "Atlas stopped" in window.loaded_html[2]
+
+
+def test_third_audio_restart_inside_ten_minutes_shows_stopped_page():
+    first = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    second = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    third = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    window = FakeWindow()
+    closing = Event()
+    replacements = iter([second, third])
+    restarts = []
+    times = iter([100.0, 140.0, 180.0])
+
+    def restart(exited):
+        restarts.append(exited)
+        return next(replacements)
+
+    desktop._watch_child(
+        first,
+        window,
+        closing,
+        restart,
+        clock=lambda: next(times),
+    )
+
+    assert restarts == [first, second]
+    assert "Atlas stopped" in window.loaded_html[-1]
+
+
+def test_audio_restart_burst_count_expires_after_ten_minutes():
+    first = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    second = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    third = FakeProcess(exit_code=desktop.RESTART_EXIT_CODE)
+    final = FakeProcess(exit_code=0)
+    window = FakeWindow()
+    closing = Event()
+    replacements = iter([second, third, final])
+    restarts = []
+    times = iter([100.0, 140.0, 701.0])
+
+    def restart(exited):
+        restarts.append(exited)
+        return next(replacements)
+
+    desktop._watch_child(
+        first,
+        window,
+        closing,
+        restart,
+        clock=lambda: next(times),
+    )
+
+    assert restarts == [first, second, third]
+    assert "Atlas stopped" in window.loaded_html[-1]
 
 
 def test_expected_child_stop_does_not_replace_the_window():

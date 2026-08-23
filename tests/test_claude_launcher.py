@@ -74,6 +74,11 @@ def test_launch_uses_exact_connected_background_argv(tmp_path):
         "atlas-x",
         "do it",
     )
+    assert runner.calls[0][1]["creationflags"] == getattr(
+        __import__("subprocess"),
+        "CREATE_BREAKAWAY_FROM_JOB",
+        0,
+    )
 
 
 def test_launch_parses_session_id_from_backgrounded_stdout(tmp_path):

@@ -40,7 +40,7 @@ def _fakes(calls):
     }
 
 
-def test_assign_process_creates_a_kill_on_close_job_for_a_borrowed_handle():
+def test_assign_process_job_allows_background_children_to_break_away():
     calls = []
     fakes = _fakes(calls)
 
@@ -57,7 +57,10 @@ def test_assign_process_creates_a_kill_on_close_job_for_a_borrowed_handle():
         "configure",
         555,
         jobobject._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-        jobobject._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        (
+            jobobject._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | jobobject._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        ),
     )
     assert calls[2] == ("assign", 555, 8765)
 
