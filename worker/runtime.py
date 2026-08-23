@@ -63,9 +63,14 @@ def build(
         raise ValueError("invalid Atlas configuration: file_roots")
 
     store = JobStore(store_path if store_path == ":memory:" else _path(store_path))
-    work = WorkManager(store, launcher or ClaudeLauncher(), _path(workspace_path))
     registry = ToolRegistry()
-    files = LocalFiles([_path(root) for root in raw_roots]) if raw_roots else None
+    files = LocalFiles(raw_roots) if raw_roots else None
+    work = WorkManager(
+        store,
+        launcher or ClaudeLauncher(),
+        _path(workspace_path),
+        folders=files.folders if files is not None else {},
+    )
     builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
             paired_url=paired_url, files=files)
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}

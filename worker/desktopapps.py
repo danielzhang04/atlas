@@ -17,6 +17,7 @@ __all__ = [
     "DesktopApps",
     "close_profile",
     "focus_profile",
+    "known_folder_path",
     "native_launcher",
     "open_profile",
 ]
@@ -43,6 +44,24 @@ DEFAULT_PROFILES = {
 # These identifiers are resolved through SHGetKnownFolderPath instead of inherited
 # environment variables. The latter cannot establish a trusted executable root.
 _KNOWN_FOLDER_IDS = {
+    "desktop": (
+        0xB4BFCC3A,
+        0xDB2C,
+        0x424C,
+        (0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41),
+    ),
+    "documents": (
+        0xFDD39AD0,
+        0x238F,
+        0x46AF,
+        (0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7),
+    ),
+    "downloads": (
+        0x374DE290,
+        0x123F,
+        0x4565,
+        (0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
+    ),
     "local_app_data": (
         0xF1B32785,
         0x6FBA,
@@ -242,11 +261,12 @@ def _resolve_executable(executable: str) -> str:
     )
 
 
-def _known_folder_path(name: str) -> Path:
+def known_folder_path(name: str) -> Path:
     """Resolve a Windows known folder without trusting the caller's environment."""
-    if os.name != "nt" or name not in _KNOWN_FOLDER_IDS:
+    normalized_name = name.casefold()
+    if os.name != "nt" or normalized_name not in _KNOWN_FOLDER_IDS:
         raise DesktopAppError("Windows known-folder resolution is unavailable")
-    data1, data2, data3, data4 = _KNOWN_FOLDER_IDS[name]
+    data1, data2, data3, data4 = _KNOWN_FOLDER_IDS[normalized_name]
     folder_id = _Guid(
         data1,
         data2,
@@ -261,10 +281,13 @@ def _known_folder_path(name: str) -> Path:
         ctypes.byref(value),
     )
     if result != 0 or not value.value:
+        legacy_id = _LEGACY_FOLDER_IDS.get(normalized_name)
+        if legacy_id is None:
+            raise DesktopAppError("Windows known-folder resolution failed")
         buffer = ctypes.create_unicode_buffer(32_768)
         legacy = ctypes.windll.shell32.SHGetFolderPathW(
             None,
-            _LEGACY_FOLDER_IDS[name],
+            legacy_id,
             None,
             0,
             buffer,
@@ -276,6 +299,11 @@ def _known_folder_path(name: str) -> Path:
         return Path(value.value)
     finally:
         ctypes.windll.ole32.CoTaskMemFree(value)
+
+
+def _known_folder_path(name: str) -> Path:
+    """Keep the private desktop-app resolver seam used by existing callers."""
+    return known_folder_path(name)
 
 
 def _windows_directory() -> Path:

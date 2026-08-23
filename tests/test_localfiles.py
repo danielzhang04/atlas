@@ -228,3 +228,50 @@ def test_open_and_read_refuse_paths_with_a_link_component(tmp_path):
 def test_constructor_rejects_an_empty_root_list():
     with pytest.raises(ValueError, match="root"):
         LocalFiles([], opener=lambda _path: None)
+
+
+def test_known_roots_use_the_injected_known_folder_resolver(tmp_path):
+    documents = tmp_path / "OneDrive" / "Documents"
+    documents.mkdir(parents=True)
+    sales = documents / "sales.csv"
+    sales.write_text("total\n42\n", encoding="utf-8")
+    resolved_names = []
+
+    def resolver(name):
+        resolved_names.append(name)
+        return documents
+
+    files = LocalFiles(
+        ["known:Documents"],
+        opener=lambda _path: None,
+        known_folder_resolver=resolver,
+    )
+
+    assert resolved_names == ["Documents"]
+    assert files.folders == {"Documents": documents.resolve()}
+    assert files.find("sales") == [{
+        "path": str(sales.resolve()),
+        "size": sales.stat().st_size,
+        "modified": sales.stat().st_mtime,
+    }]
+
+
+def test_unknown_and_missing_roots_are_skipped_with_one_warning_each(tmp_path, caplog):
+    missing = tmp_path / "missing"
+
+    def resolver(_name):
+        raise ValueError("unknown folder")
+
+    with caplog.at_level("WARNING", logger="atlas.localfiles"):
+        files = LocalFiles(
+            ["known:Unknown", missing],
+            opener=lambda _path: None,
+            known_folder_resolver=resolver,
+        )
+
+    assert files.find("sales") == []
+    assert len(caplog.records) == 2
+    assert caplog.messages == [
+        "skipping file root known:Unknown: unknown folder",
+        f"skipping file root {missing}: directory is unavailable",
+    ]

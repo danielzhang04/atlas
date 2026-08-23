@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import codecs
 import heapq
+import logging
 import os
 from pathlib import Path
 import re
 import stat
 import time
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
+
+from .desktopapps import known_folder_path
 
 __all__ = ["LocalFiles"]
+logger = logging.getLogger("atlas.localfiles")
 _SKIPPED_DIRECTORIES = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 _MAX_DEPTH = 6
 _MAX_RESULTS = 20
@@ -81,15 +85,51 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 class LocalFiles:
     def __init__(
-        self, roots: Sequence[Path], *,
+        self, roots: Sequence[Path | str], *,
         clock: Callable[[], float] = time.monotonic,
         opener: Callable[[str], object] = os.startfile,
+        known_folder_resolver: Callable[[str], Path] = known_folder_path,
     ) -> None:
         if not roots:
             raise ValueError("at least one file root is required")
-        self._roots = tuple(Path(root).expanduser().resolve() for root in roots)
+        self._roots, self._folders = self._resolve_roots(
+            roots,
+            known_folder_resolver,
+        )
         self._clock = clock
         self._opener = opener
+
+    @property
+    def folders(self) -> Mapping[str, Path]:
+        return dict(self._folders)
+
+    @staticmethod
+    def _resolve_roots(
+        roots: Sequence[Path | str],
+        known_folder_resolver: Callable[[str], Path],
+    ) -> tuple[tuple[Path, ...], dict[str, Path]]:
+        resolved_roots = []
+        folders = {}
+        for root in roots:
+            configured = str(root)
+            folder_name = None
+            try:
+                if configured.startswith("known:"):
+                    folder_name = configured.removeprefix("known:")
+                    candidate = Path(known_folder_resolver(folder_name))
+                else:
+                    candidate = Path(root).expanduser()
+                resolved = candidate.resolve()
+            except Exception as exc:
+                logger.warning("skipping file root %s: %s", configured, exc)
+                continue
+            if not resolved.is_dir():
+                logger.warning("skipping file root %s: directory is unavailable", configured)
+                continue
+            resolved_roots.append(resolved)
+            if folder_name:
+                folders[folder_name] = resolved
+        return tuple(resolved_roots), folders
 
     def resolve(self, path: str | Path) -> Path:
         expanded = Path(path).expanduser()

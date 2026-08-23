@@ -7,7 +7,7 @@ import logging
 import math
 from pathlib import Path
 import threading
-from typing import Callable
+from typing import Callable, Mapping
 from uuid import uuid4
 
 from .claude_launcher import ClaudeLauncher, parse_result, worker_prompt
@@ -25,11 +25,16 @@ class WorkManager:
         workspace_root: Path,
         *,
         poll_s: float = 2.0,
+        folders: Mapping[str, Path] | None = None,
     ) -> None:
         self.store = store
         self.launcher = launcher
         self.workspace_root = Path(workspace_root)
         self.poll_s = float(poll_s)
+        self.folders = {
+            str(name): Path(path)
+            for name, path in (folders or {}).items()
+        }
         self._seen: dict[str, set[str]] = {}
         self._callbacks: list[Callable[[Job], None]] = []
         self._notified: set[str] = set()
@@ -75,6 +80,7 @@ class WorkManager:
                 job_id,
                 self._nonce(job_id),
                 self.store.brief(job_id),
+                folders=self.folders,
             )
             launched_session_id = self.launcher.launch(
                 session_id=requested_session_id,

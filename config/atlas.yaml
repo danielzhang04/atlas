@@ -22,4 +22,4 @@ wake_threshold: 0.5
 wake_patience: 3
 tts_output_device: follow
 
-file_roots: [~/Desktop, ~/Documents, ~/Downloads, C:/Users/danie/kb]
+file_roots: [known:Desktop, known:Documents, known:Downloads, C:/Users/danie/kb]

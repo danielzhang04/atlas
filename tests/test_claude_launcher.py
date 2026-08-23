@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -301,6 +302,23 @@ def test_worker_prompt_uses_minimal_result_frame_contract():
     assert template.endswith('"summary":"one factual sentence"}')
     assert "artifacts" not in prompt
     assert "}}" not in prompt
+
+
+def test_worker_prompt_includes_resolved_daniel_folders():
+    job_id = str(uuid4())
+    folders = {
+        "Desktop": Path("C:/Users/danie/OneDrive/Desktop"),
+        "Documents": Path("C:/Users/danie/OneDrive/Documents"),
+        "Downloads": Path("C:/Users/danie/Downloads"),
+    }
+
+    prompt = worker_prompt(job_id, "nonce", "Do it", folders=folders)
+
+    assert (
+        "Daniel's folders: Documents=C:\\Users\\danie\\OneDrive\\Documents; "
+        "Desktop=C:\\Users\\danie\\OneDrive\\Desktop; "
+        "Downloads=C:\\Users\\danie\\Downloads\n"
+    ) in prompt
 
 
 def test_parse_result_rejects_two_conflicting_frames():

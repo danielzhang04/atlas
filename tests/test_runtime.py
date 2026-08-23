@@ -92,6 +92,33 @@ def test_build_requires_the_small_trusted_configuration(monkeypatch, tmp_path):
         raise AssertionError("missing composition settings must fail at the config boundary")
 
 
+def test_build_passes_resolved_known_folders_to_work_manager(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    documents = tmp_path / "OneDrive" / "Documents"
+    documents.mkdir(parents=True)
+    monkeypatch.setattr(runtime, "ATLAS", root)
+    original_local_files = runtime.LocalFiles
+
+    def local_files(roots):
+        return original_local_files(
+            roots,
+            known_folder_resolver=lambda name: documents if name == "Documents" else None,
+        )
+
+    monkeypatch.setattr(runtime, "LocalFiles", local_files)
+    built = runtime.build({
+        "fast_model": "claude-test",
+        "google_account": "owner@example.test",
+        "job_store_path": ":memory:",
+        "work_workspace_path": str(tmp_path / "jobs"),
+        "file_roots": ["known:Documents"],
+    }, client=FakeClient(), launcher=FakeLauncher())
+    try:
+        assert built.work.folders == {"Documents": documents.resolve()}
+    finally:
+        built.store.close()
+
+
 def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_search(
     monkeypatch,
     tmp_path,
