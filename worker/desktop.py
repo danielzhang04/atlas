@@ -74,6 +74,78 @@ RECONNECTING_HTML = """<!doctype html>
 </html>"""
 
 
+class WindowApi:
+    """Expose native window controls to the frameless Atlas page."""
+
+    def __init__(self) -> None:
+        self.window = None
+        self._maximized = False
+        self._restore_bounds = None
+        self._lock = Lock()
+
+    @staticmethod
+    def _number(value, lower_name: str, upper_name: str):
+        number = getattr(value, lower_name, None)
+        if number is None:
+            number = getattr(value, upper_name, None)
+        return number
+
+    @classmethod
+    def _screen_bounds(cls, screen):
+        if screen is None:
+            return None
+        frame = getattr(screen, "frame", None)
+        source = frame if frame is not None else screen
+        x = cls._number(source, "x", "X")
+        y = cls._number(source, "y", "Y")
+        width = cls._number(source, "width", "Width")
+        height = cls._number(source, "height", "Height")
+        if None in (x, y, width, height):
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return int(x), int(y), int(width), int(height)
+
+    def minimize(self) -> None:
+        if self.window is not None:
+            self.window.minimize()
+
+    def toggle_maximize(self) -> None:
+        window = self.window
+        if window is None:
+            return
+        with self._lock:
+            if self._maximized:
+                if self._restore_bounds is None:
+                    return
+                x, y, width, height = self._restore_bounds
+                window.resize(width, height)
+                window.move(x, y)
+                self._restore_bounds = None
+                self._maximized = False
+                return
+            try:
+                screens = webview.screens
+            except Exception:
+                screens = []
+            screen = screens[0] if screens else getattr(window, "screen", None)
+            bounds = self._screen_bounds(screen)
+            if bounds is None:
+                return
+            current = (window.x, window.y, window.width, window.height)
+            if None in current:
+                return
+            self._restore_bounds = tuple(int(value) for value in current)
+            x, y, width, height = bounds
+            window.resize(width, height)
+            window.move(x, y)
+            self._maximized = True
+
+    def request_close(self) -> None:
+        if self.window is not None:
+            self.window.destroy()
+
+
 def _kernel32_functions():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -434,15 +506,21 @@ def run(
             return 1
         with child_lock:
             child["ui_url"] = ui_url
+        window_api = WindowApi()
         window = window_factory(
             "Atlas",
             ui_url,
             width=1100,
             height=760,
             min_size=(800, 600),
+            frameless=True,
+            easy_drag=False,
+            js_api=window_api,
+            resizable=True,
         )
         if window is None:
             return 1
+        window_api.window = window
 
         def _confirm_close_current() -> bool:
             with child_lock:

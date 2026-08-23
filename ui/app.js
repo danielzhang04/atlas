@@ -18,6 +18,11 @@
 
   const refs = {
     connection: document.querySelector("#connection"),
+    topbar: document.querySelector(".topbar"),
+    windowControls: document.querySelector("#window-controls"),
+    windowMinimize: document.querySelector("#window-minimize"),
+    windowMaximize: document.querySelector("#window-maximize"),
+    windowClose: document.querySelector("#window-close"),
     canvas: document.querySelector("#engine-canvas"),
     stateLabel: document.querySelector("#state-label"),
     audioLine: document.querySelector("#audio-line"),
@@ -58,6 +63,45 @@
   let settingsRequestPending = false;
   const eventsByJob = new Map();
   const resultsByJob = new Map();
+
+  function nativeWindowApi() {
+    return window.pywebview?.api || null;
+  }
+
+  function syncNativeWindowControls() {
+    refs.windowControls.classList.toggle("no-native", nativeWindowApi() === null);
+  }
+
+  function callNativeWindow(method) {
+    const api = nativeWindowApi();
+    if (api === null || typeof api[method] !== "function") {
+      return;
+    }
+    Promise.resolve(api[method]()).catch(() => {});
+  }
+
+  document.querySelectorAll(".no-drag").forEach((element) => {
+    element.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+    });
+  });
+  refs.windowMinimize.addEventListener("click", () => {
+    callNativeWindow("minimize");
+  });
+  refs.windowMaximize.addEventListener("click", () => {
+    callNativeWindow("toggle_maximize");
+  });
+  refs.windowClose.addEventListener("click", () => {
+    callNativeWindow("request_close");
+  });
+  refs.topbar.addEventListener("dblclick", (event) => {
+    if (event.target.closest(".no-drag")) {
+      return;
+    }
+    callNativeWindow("toggle_maximize");
+  });
+  window.addEventListener("pywebviewready", syncNativeWindowControls);
+  syncNativeWindowControls();
 
   function node(tag, className, text) {
     const element = document.createElement(tag);

@@ -31,6 +31,15 @@ class FakeWindow:
         self.dialogs = []
         self.loaded_html = []
         self.loaded_urls = []
+        self.minimize_calls = 0
+        self.destroy_calls = 0
+        self.resize_calls = []
+        self.move_calls = []
+        self.x = 100
+        self.y = 120
+        self.width = 1100
+        self.height = 760
+        self.screen = None
 
     def create_confirmation_dialog(self, title, message):
         self.dialogs.append((title, message))
@@ -41,6 +50,24 @@ class FakeWindow:
 
     def load_url(self, url):
         self.loaded_urls.append(url)
+
+    def minimize(self):
+        self.minimize_calls += 1
+
+    def destroy(self):
+        self.destroy_calls += 1
+        if all(result is not False for result in self.events.closing.fire()):
+            self.events.closed.fire()
+
+    def resize(self, width, height):
+        self.resize_calls.append((width, height))
+        self.width = width
+        self.height = height
+
+    def move(self, x, y):
+        self.move_calls.append((x, y))
+        self.x = x
+        self.y = y
 
 
 class FakeProcess:
@@ -156,11 +183,17 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     assert options["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
     assert options["env"]["PYTHONUTF8"] == "1"
     assert options["env"]["ATLAS_SHUTDOWN_TOKEN"] == "shutdown-token"
-    assert window_calls == [(
-        "Atlas",
-        "http://127.0.0.1:4360/#pair=one-use",
-        {"width": 1100, "height": 760, "min_size": (800, 600)},
-    )]
+    assert len(window_calls) == 1
+    title, url, window_options = window_calls[0]
+    assert title == "Atlas"
+    assert url == "http://127.0.0.1:4360/#pair=one-use"
+    assert window_options["width"] == 1100
+    assert window_options["height"] == 760
+    assert window_options["min_size"] == (800, 600)
+    assert window_options["frameless"] is True
+    assert window_options["easy_drag"] is False
+    assert window_options["resizable"] is True
+    assert isinstance(window_options["js_api"], desktop.WindowApi)
     assert len(window.events.closing.handlers) == 1
     assert len(window.events.closed.handlers) == 1
     assert len(start_calls) == 1
@@ -177,6 +210,71 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     )]
     assert closed_handles == [222, 111]
     assert result == 0
+
+
+def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch):
+    process = FakeProcess("ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n")
+    window = FakeWindow()
+    api_calls = []
+    stop_calls = []
+
+    def confirm(process_arg, window_arg, url_arg):
+        api_calls.append((process_arg, window_arg, url_arg))
+        return True
+
+    def window_factory(_title, _url, **kwargs):
+        api = kwargs["js_api"]
+        assert kwargs["frameless"] is True
+        assert api.window is None
+        window.api = api
+        return window
+
+    def start(_function, _args):
+        assert window.api.window is window
+        window.api.minimize()
+        window.api.request_close()
+
+    monkeypatch.setattr(desktop, "_confirm_window_close", confirm)
+
+    result = desktop.run(
+        spawn=lambda _command, **_kwargs: process,
+        window_factory=window_factory,
+        start=start,
+        terminate=lambda child, url, token: stop_calls.append((child, url, token)),
+        create_mutex=lambda: (111, False),
+        assign_job=lambda _child: 222,
+        close_handle=lambda _handle: None,
+        token_factory=lambda: "shutdown-token",
+    )
+
+    assert result == 0
+    assert window.minimize_calls == 1
+    assert window.destroy_calls == 1
+    assert api_calls == [(
+        process,
+        window,
+        "http://127.0.0.1:4360/#pair=one-use",
+    )]
+    assert stop_calls == [(
+        process,
+        "http://127.0.0.1:4360/#pair=one-use",
+        "shutdown-token",
+    )]
+
+
+def test_native_window_api_toggles_work_area_and_restores_saved_bounds(monkeypatch):
+    work_area = SimpleNamespace(X=0, Y=0, Width=1920, Height=1040)
+    screen = SimpleNamespace(frame=work_area)
+    window = FakeWindow()
+    api = desktop.WindowApi()
+    api.window = window
+    monkeypatch.setattr(desktop, "webview", SimpleNamespace(screens=[screen]))
+
+    api.toggle_maximize()
+    api.toggle_maximize()
+
+    assert window.resize_calls == [(1920, 1040), (1100, 760)]
+    assert window.move_calls == [(0, 0), (100, 120)]
 
 
 def test_run_replaces_exit_21_child_and_loads_new_worker_url_in_same_window():
