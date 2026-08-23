@@ -113,6 +113,25 @@ def _memory_factory(server: FastMCP, exits: list[str] | None = None):
     return factory
 
 
+def _account_server() -> FastMCP:
+    server = FastMCP("test-account")
+
+    @server.tool(description="Search Gmail messages.")
+    def search_gmail_messages(
+        query: str,
+        user_google_email: str,
+    ) -> list[TextContent]:
+        return [
+            TextContent(
+                type="text",
+                text=f"account={user_google_email};query={query};" + "x" * 5_000,
+            ),
+            TextContent(type="text", text="\nNext page token: complete-token"),
+        ]
+
+    return server
+
+
 def test_connect_registers_schema_policy_and_bounded_concatenated_text():
     async def scenario():
         registry = FakeRegistry()
@@ -152,6 +171,54 @@ def test_connect_registers_schema_policy_and_bounded_concatenated_text():
     assert content.endswith("…[truncated]")
     assert "\x00" not in content and "\x1f" not in content
     assert status == [{"name": "google", "connected": True, "tools": 3, "error": None}]
+
+
+def test_account_parameter_is_hidden_and_host_injected_for_mirrored_and_raw_calls():
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "command": "unused",
+                        "account_param": "user_google_email",
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_account_server()),
+            account_values={"user_google_email": "owner@example.test"},
+        )
+        await servers.connect(registry)
+        tool = registry.tools[0]
+        mirrored = await tool.run({
+            "query": "in:inbox",
+            "user_google_email": "attacker@example.test",
+        })
+        raw = await servers.call_raw(
+            "google",
+            "search_gmail_messages",
+            {
+                "query": "in:inbox",
+                "user_google_email": "attacker@example.test",
+            },
+        )
+        await servers.close()
+        return tool, mirrored, raw
+
+    tool, mirrored, raw = asyncio.run(scenario())
+
+    properties = tool.input_schema["properties"]
+    required = tool.input_schema.get("required", [])
+    assert "user_google_email" not in properties
+    assert "user_google_email" not in required
+    assert mirrored.startswith("account=owner@example.test;query=in:inbox;")
+    assert len(mirrored) == 4_096
+    assert "attacker@example.test" not in mirrored
+    assert raw.startswith("account=owner@example.test;query=in:inbox;")
+    assert len(raw) > 5_000
+    assert raw.endswith("Next page token: complete-token")
+    assert "attacker@example.test" not in raw
 
 
 def test_connect_runs_the_server_hook_after_successful_tool_registration():

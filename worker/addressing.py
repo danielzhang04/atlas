@@ -11,7 +11,13 @@ __all__ = ["Addressing", "vocabulary"]
 
 
 def vocabulary(cfg: dict) -> list[str]:
-    return cfg["address_vocab"]
+    """Return only the explicit, reviewed addressed-speech vocabulary."""
+    configured = cfg.get("address_vocab")
+    if not isinstance(configured, list):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    if not all(isinstance(word, str) and word.strip() for word in configured):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    return list(configured)
 
 
 def _vocab_forms(raw: str) -> set[str]:

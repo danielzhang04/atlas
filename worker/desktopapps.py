@@ -30,12 +30,14 @@ class DesktopAppError(RuntimeError):
 class AppProfile:
     id: str
     executable: str
+    close_executable: str | None = None
 
 
 DEFAULT_PROFILES = {
     "vscode": AppProfile("vscode", "Code.exe"),
-    "wt": AppProfile("wt", "wt.exe"),
+    "wt": AppProfile("wt", "wt.exe", "WindowsTerminal.exe"),
     "chrome": AppProfile("chrome", "chrome.exe"),
+    "notepad": AppProfile("notepad", "notepad.exe"),
 }
 
 # These identifiers are resolved through SHGetKnownFolderPath instead of inherited
@@ -68,7 +70,9 @@ _LEGACY_FOLDER_IDS = {
 _EXPECTED_PUBLISHERS = {
     "Code.exe": "Microsoft Corporation",
     "wt.exe": "Microsoft Corporation",
+    "WindowsTerminal.exe": "Microsoft Corporation",
     "chrome.exe": "Google LLC",
+    "notepad.exe": "Microsoft Windows",
 }
 
 
@@ -135,14 +139,18 @@ def focus_profile(app_id: str) -> object:
 
 def close_profile(app_id: str, *, killer: Callable[..., object] = subprocess.run
                   ) -> dict[str, object]:
-    """Request a graceful close for one allowlisted application image."""
+    """Request a graceful close for every window of an allowlisted app."""
     try:
         profile = DEFAULT_PROFILES[app_id]
     except KeyError as exc:
         raise DesktopAppError("app is not allowlisted") from exc
     try:
         result = killer(
-            [_taskkill_executable(), "/IM", profile.executable],
+            [
+                _taskkill_executable(),
+                "/IM",
+                profile.close_executable or profile.executable,
+            ],
             check=False,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, shell=False, timeout=10,
@@ -152,6 +160,8 @@ def close_profile(app_id: str, *, killer: Callable[..., object] = subprocess.run
     if getattr(result, "returncode", 1) != 0:
         raise DesktopAppError("desktop application could not be closed")
     return {"application": app_id, "closed": True}
+
+
 def _taskkill_executable() -> str:
     taskkill = _windows_directory() / "System32/taskkill.exe"
     if not taskkill.is_file():
@@ -204,6 +214,7 @@ def _resolve_executable(executable: str) -> str:
             ("program_files", "Microsoft VS Code/Code.exe"),
         ],
         "wt.exe": [("local_app_data", "Microsoft/WindowsApps/wt.exe")],
+        "notepad.exe": [("windows", "System32/notepad.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
             ("program_files_x86", "Google/Chrome/Application/chrome.exe"),
@@ -213,7 +224,11 @@ def _resolve_executable(executable: str) -> str:
     expected_publisher = _EXPECTED_PUBLISHERS[executable]
     for root_name, relative in candidate_specs:
         try:
-            root = _known_folder_path(root_name)
+            root = (
+                _windows_directory()
+                if root_name == "windows"
+                else _known_folder_path(root_name)
+            )
         except DesktopAppError:
             continue
         item = root / relative

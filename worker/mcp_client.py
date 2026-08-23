@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from copy import deepcopy
 from datetime import timedelta
 import json
 import logging
@@ -68,12 +69,16 @@ class McpServers:
         claude_config_path: Path = Path.home() / ".claude.json",
         session_factory: SessionFactory | None = None,
         on_server: ServerHook | None = None,
+        account_values: Mapping[str, str] | None = None,
     ):
         self._config = config
         self._claude_config_path = Path(claude_config_path)
         self._session_factory = session_factory or _stdio_session
         self._on_server = on_server
+        self._account_values = dict(account_values or {})
         self._stacks: dict[str, AsyncExitStack] = {}
+        self._sessions: dict[str, ClientSession] = {}
+        self._call_settings: dict[str, tuple[Mapping, float]] = {}
         self._closed = False
         servers = config.get("servers", {})
         self._status = {
@@ -120,6 +125,11 @@ class McpServers:
                 for tool in mirrored:
                     registry.register(tool)
             self._stacks[name] = stack
+            self._sessions[name] = session
+            self._call_settings[name] = (
+                server_cfg,
+                float(defaults.get("call_timeout_s", 8)),
+            )
             self._status[name].update(connected=True, tools=len(mirrored), error=None)
             if on_server is not None:
                 try:
@@ -148,26 +158,78 @@ class McpServers:
 
     def _mirror_tool(self, server_name, server_cfg, defaults, session, remote_tool) -> Tool:
         timeout_s = float(defaults.get("call_timeout_s", 8))
+        schema = _without_account_parameter(
+            remote_tool.inputSchema,
+            server_cfg.get("account_param"),
+        )
 
         async def run(arguments: dict) -> str:
-            result = await session.call_tool(
+            text = await self._call_session(
+                session,
+                server_cfg,
+                timeout_s,
                 remote_tool.name,
-                arguments=arguments,
-                read_timeout_seconds=timedelta(seconds=timeout_s),
-            )
-            text = "".join(
-                block.text for block in result.content
-                if getattr(block, "type", None) == "text"
+                arguments,
             )
             return _bounded_text(text)
 
         return Tool(
             name=f"{server_name}__{remote_tool.name}",
             description=(remote_tool.description or "")[:512],
-            input_schema=remote_tool.inputSchema,
+            input_schema=schema,
             policy=policy_for(server_cfg, defaults, remote_tool.name),
             run=run,
         )
+
+    async def call_raw(
+        self,
+        server: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> str:
+        """Call one connected server tool without the mirrored content bound."""
+        session = self._sessions.get(server)
+        settings = self._call_settings.get(server)
+        if session is None or settings is None:
+            raise RuntimeError(f"{server} not connected")
+        server_cfg, timeout_s = settings
+        return await self._call_session(
+            session,
+            server_cfg,
+            timeout_s,
+            tool,
+            arguments,
+        )
+
+    async def _call_session(
+        self,
+        session: ClientSession,
+        server_cfg: Mapping,
+        timeout_s: float,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> str:
+        call_arguments = dict(arguments)
+        account_param = server_cfg.get("account_param")
+        if account_param is not None:
+            if not isinstance(account_param, str) or not account_param:
+                raise RuntimeError("invalid MCP account parameter")
+            account_value = self._account_values.get(account_param)
+            if not isinstance(account_value, str) or not account_value:
+                raise RuntimeError("MCP account is not configured")
+            call_arguments.pop(account_param, None)
+            call_arguments[account_param] = account_value
+        result = await session.call_tool(
+            tool,
+            arguments=call_arguments,
+            read_timeout_seconds=timedelta(seconds=timeout_s),
+        )
+        text = "".join(
+            block.text
+            for block in result.content
+            if getattr(block, "type", None) == "text"
+        )
+        return _clean_text(text)
 
     def status(self) -> list[dict]:
         return [dict(value) for value in self._status.values()]
@@ -176,6 +238,8 @@ class McpServers:
         if self._closed:
             return
         self._closed = True
+        self._sessions.clear()
+        self._call_settings.clear()
         stacks = list(reversed(self._stacks.values()))
         self._stacks.clear()
         for stack in stacks:
@@ -184,7 +248,28 @@ class McpServers:
 
 
 def _bounded_text(value: str) -> str:
-    clean = "".join(char for char in value if char in "\n\t" or unicodedata.category(char) != "Cc")
+    clean = _clean_text(value)
     if len(clean) <= _MAX_CONTENT:
         return clean
     return clean[:_MAX_CONTENT - len(_TRUNCATED)] + _TRUNCATED
+
+
+def _clean_text(value: str) -> str:
+    return "".join(
+        char
+        for char in value
+        if char in "\n\t" or unicodedata.category(char) != "Cc"
+    )
+
+
+def _without_account_parameter(schema: dict, account_param: Any) -> dict:
+    mirrored = deepcopy(schema)
+    if not isinstance(account_param, str) or not account_param:
+        return mirrored
+    properties = mirrored.get("properties")
+    if isinstance(properties, dict):
+        properties.pop(account_param, None)
+    required = mirrored.get("required")
+    if isinstance(required, list):
+        mirrored["required"] = [name for name in required if name != account_param]
+    return mirrored

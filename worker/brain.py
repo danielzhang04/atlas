@@ -29,8 +29,11 @@ multiple steps, writing files, browsing, or more than a few seconds. Say you are
 it will show in Workers; never pretend it is done.
 Use find_file and read_file for quick questions about a file. Use launch_work for
 analysis that needs code or produces artifacts.
+Do not summarize, sum, or analyze a truncated read_file result; use launch_work instead.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
 in:inbox for all; never count from a search page.
+Close closes every window of the requested app. If Daniel asks to close one of several windows, say
+that close will close every window of that app.
 A tool result of needs_confirmation means to read the summary back in one sentence and ask Daniel.
 Call confirm only after Daniel clearly says yes on a later turn, and call cancel_pending if he declines.
 Use confirmation identifiers only as confirm tool input and never say them aloud.
@@ -123,7 +126,6 @@ class Brain:
         *,
         model: str,
         persona: str,
-        google_account: str = "",
         max_tokens: int = 400,
         turn_timeout_s: float = 12.0,
         history_exchanges: int = 8,
@@ -140,8 +142,6 @@ class Brain:
         self._clock = clock
         self._pending_confirm_id: str | None = None
         rules = BASE_SYSTEM
-        if google_account:
-            rules += f"\nGoogle tools need user_google_email = {google_account}."
         if persona.strip():
             rules += "\n\nVoice and personality:\n" + persona.strip()
         self._system_text = rules
@@ -213,7 +213,6 @@ class Brain:
                     if not tool_blocks:
                         raise ValueError("tool_use response did not contain a tool call")
                     results = []
-                    external_result = False
                     for block in tool_blocks:
                         name = _field(block, "name")
                         call_id = _field(block, "id")
@@ -240,8 +239,6 @@ class Brain:
                                 arguments,
                                 tainted=tainted,
                             )
-                        if "__" in name:
-                            external_result = True
                         result_content = result.content
                         if result.status == "needs_confirmation" and result.confirm_id:
                             self._pending_confirm_id = result.confirm_id
@@ -263,11 +260,12 @@ class Brain:
                         })
                         if self.on_tool is not None:
                             self.on_tool(name, result)
+                        if _content_bearing_tool(name):
+                            tainted = True
                     messages.extend((
                         {"role": "assistant", "content": [_block_dict(block) for block in content]},
                         {"role": "user", "content": results},
                     ))
-                    tainted = tainted or external_result
                     tool_rounds += 1
 
                 if buffer:
@@ -297,3 +295,7 @@ class Brain:
     def _now_system_text(self) -> str:
         now = self._clock().astimezone()
         return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
+
+
+def _content_bearing_tool(name: str) -> bool:
+    return "__" in name or name in {"read_file", "find_file", "count_mail"}

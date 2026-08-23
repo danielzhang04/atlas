@@ -59,6 +59,20 @@ def test_find_stops_when_the_injected_clock_exhausts_the_budget(tmp_path):
     assert files.find("match", budget_s=2.0) == []
 
 
+def test_find_keeps_only_the_twenty_newest_matches_while_scanning(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(25):
+        match = root / f"match-{index:02}.txt"
+        match.write_text(str(index), encoding="utf-8")
+        os.utime(match, (index, index))
+
+    results = LocalFiles([root], opener=lambda _path: None).find("match", limit=25)
+
+    assert len(results) == 20
+    assert [item["modified"] for item in results] == list(range(24, 4, -1))
+
+
 def test_find_does_not_follow_a_directory_link_outside_the_roots(tmp_path):
     root = tmp_path / "root"
     outside = tmp_path / "outside"
@@ -73,11 +87,11 @@ def test_find_does_not_follow_a_directory_link_outside_the_roots(tmp_path):
     assert LocalFiles([root], opener=lambda _path: None).find("haiku") == []
 
 
-def test_open_uses_the_resolved_path_and_read_returns_bounded_clean_text(tmp_path):
+def test_open_uses_the_resolved_path_and_read_reports_truncation(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    note = root / "notes.custom"
-    note.write_bytes("first\nsecond\tline\x01tail".encode("utf-8"))
+    note = root / "notes.txt"
+    note.write_bytes(b"first\nsecond line tail")
     opened = []
     files = LocalFiles([root], opener=opened.append)
 
@@ -88,17 +102,84 @@ def test_open_uses_the_resolved_path_and_read_returns_bounded_clean_text(tmp_pat
         "path": str(note.resolve()),
         "bytes": note.stat().st_size,
         "text": "first\nsecond",
+        "truncated": True,
     }
 
 
-def test_read_rejects_binary_files(tmp_path):
+@pytest.mark.parametrize(
+    "name",
+    ["program.exe", "script.bat", "shortcut.lnk", "site.url", "source.js"],
+)
+def test_open_rejects_executable_shortcut_and_javascript_extensions(tmp_path, name):
+    root = tmp_path / "root"
+    root.mkdir()
+    unsafe = root / name
+    unsafe.write_text("content", encoding="utf-8")
+    opened = []
+
+    with pytest.raises(ValueError, match="not an openable document"):
+        LocalFiles([root], opener=opened.append).open(unsafe)
+
+    assert opened == []
+
+
+def test_javascript_can_be_read_but_never_opened(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    source = root / "app.js"
+    source.write_text("const answer = 42;", encoding="utf-8")
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    assert files.read(source)["text"] == "const answer = 42;"
+    with pytest.raises(ValueError, match="not an openable document"):
+        files.open(source)
+
+
+def test_read_accepts_utf16_with_bom_and_rejects_invalid_text(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    utf16 = root / "utf16.txt"
+    invalid = root / "invalid.txt"
+    utf16.write_text("hello", encoding="utf-16")
+    invalid.write_bytes(b"\x80not utf-8")
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    result = files.read(utf16)
+
+    assert result["text"] == "hello"
+    assert result["truncated"] is False
+    with pytest.raises(ValueError, match="not a text file"):
+        files.read(invalid)
+
+
+def test_read_rejects_extensions_outside_the_text_allowlist(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     binary = root / "image.bin"
-    binary.write_bytes(b"prefix\x00suffix")
+    binary.write_bytes(b"ordinary utf-8 bytes")
 
-    with pytest.raises(ValueError, match="text file"):
+    with pytest.raises(ValueError, match="not a text file"):
         LocalFiles([root], opener=lambda _path: None).read(binary)
+
+
+def test_open_and_read_refuse_paths_with_a_link_component(tmp_path):
+    root = tmp_path / "root"
+    target = root / "target"
+    root.mkdir()
+    target.mkdir()
+    note = target / "notes.txt"
+    note.write_text("private", encoding="utf-8")
+    link = root / "linked"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory links are unavailable")
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    with pytest.raises(ValueError, match="reparse"):
+        files.open(link / "notes.txt")
+    with pytest.raises(ValueError, match="reparse"):
+        files.read(link / "notes.txt")
 
 
 def test_constructor_rejects_an_empty_root_list():

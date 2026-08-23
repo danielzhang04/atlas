@@ -4,8 +4,7 @@ turn_timeout_s: 12.0
 max_tokens: 400
 engagement_timeout_s: 120
 address_window_s: 30
-address_vocab: [email, emails, inbox, mail, calendar, file, files, folder, open, close, launch,
-  cancel, status, workers, job, jobs, research, summary, write, draft, remind, timer]
+address_vocab: [gmail, inbox, unread, calendar, youtube, notion, github, spotify, workers]
 
 job_store_path: "%LOCALAPPDATA%/Atlas/jobs.sqlite3"
 work_workspace_path: "%LOCALAPPDATA%/Atlas/jobs"

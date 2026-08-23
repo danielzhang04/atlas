@@ -19,6 +19,7 @@ def intents():
     "utterance,expected",
     [
         ("That's all.", "dismiss"),
+        ("Thats all", "dismiss"),
         ("Go to sleep", "dismiss"),
         ("Cancel.", "cancel"),
         ("Never mind", "cancel"),
@@ -59,6 +60,11 @@ def test_custom_intents_and_patterns_drive_matching():
     assert router.route("Hello, there!", custom) == ("reflex", "greet")
     assert router.route("How much credit is left?", custom) == ("reflex", "credit")
     assert router.route("so how much credit is left again", custom) == ("fast", None)
+
+
+def test_normalize_separates_words_at_every_non_alphanumeric_character():
+    assert router.normalize("Atlas—what time is it?") == "atlas what time is it"
+    assert router.normalize("faceless/youtube_and.more") == "faceless youtube and more"
 
 
 def test_config_and_empty_input_boundary(intents):

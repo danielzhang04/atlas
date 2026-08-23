@@ -703,30 +703,7 @@ def test_production_listening_config_matches_wave_two_defaults():
 
     assert cfg["engagement_timeout_s"] == 120
     assert cfg["address_window_s"] == 30
-    assert cfg["address_vocab"] == [
-        "email",
-        "emails",
-        "inbox",
-        "mail",
-        "calendar",
-        "file",
-        "files",
-        "folder",
-        "open",
-        "close",
-        "launch",
-        "cancel",
-        "status",
-        "workers",
-        "job",
-        "jobs",
-        "research",
-        "summary",
-        "write",
-        "draft",
-        "remind",
-        "timer",
-    ]
+    assert cfg["address_vocab"] == ["gmail", "inbox", "unread", "calendar", "youtube", "notion", "github", "spotify", "workers"]
 
 
 def test_cancelled_completion_is_bounded():
