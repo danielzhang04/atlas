@@ -15,7 +15,7 @@ import threading
 logger = logging.getLogger("atlas.devicewatch")
 
 # pycaw drags comtypes in, and comtypes logs every COM Release at DEBUG — at our 1.5s poll
-# cadence that floods pm2 logs (live finding 2026-07-22, it drowned the wake/swap lines).
+# cadence that floods worker logs (live finding 2026-07-22, it drowned the wake/swap lines).
 logging.getLogger("comtypes").setLevel(logging.WARNING)
 
 
@@ -130,9 +130,9 @@ class OutputFollower:
 
     The only in-process cure (Pa_Terminate/Pa_Reinitialize) kills the wake listener's InputStream,
     and wakeword.listen has NO retry — Atlas would be deaf until restart anyway. So the policy is:
-    a swap that cannot cleanly open its resolved device requests a WORKER SELF-RESTART via the
-    injected `request_restart` callback (pm2 revives us in seconds with a fresh, correct PortAudio
-    snapshot; every pin re-resolves). Restart is honest and total; half-alive audio is neither."""
+    a swap that cannot cleanly open its resolved device requests a WORKER EXIT via the injected
+    `request_restart` callback. The desktop shows that Atlas stopped; reopening starts a fresh
+    process where every pin re-resolves. A total stop is honest; half-alive audio is neither."""
 
     def __init__(self, console, *, resolve_output, sd_module, lock=None,
                  initial_idx: int | None = None, request_restart=None):

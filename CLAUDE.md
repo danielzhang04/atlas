@@ -1,8 +1,8 @@
 # Atlas agent constitution
 
-Atlas is an independent local application. It must not import kb modules, assume a kb checkout, or
-write to kb/ops. Any optional bridge requires a separately reviewed package and remains dormant by
-default.
+Atlas is an independent local application. Open the app to turn Atlas on; close its window to turn
+Atlas off. It must not import kb modules, assume a kb checkout, or write to kb/ops. Any optional
+bridge requires a separately reviewed package and remains dormant by default.
 
 Non-negotiable rules:
 

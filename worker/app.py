@@ -428,6 +428,14 @@ def _health(mcp: mcp_client_mod.McpServers, launcher) -> dict:
     return {"claude": launcher.available, "mcp": mcp.status()}
 
 
+def _emit_ui_url(authorizer: stateserver.PairingAuthorizer, port: int) -> str:
+    url = stateserver.pairing_url(authorizer, port)
+    if url is None:
+        raise RuntimeError("Atlas UI pairing is unavailable")
+    print(f"ATLAS_UI {url}", flush=True)
+    return url
+
+
 async def entrypoint(ctx: JobContext) -> None:
     envload.load_private_environment()
     cfg = _cfg()
@@ -516,6 +524,7 @@ async def entrypoint(ctx: JobContext) -> None:
         health_provider=lambda: _health(services.mcp, services.work.launcher),
     )
     server_box["server"] = server
+    _emit_ui_url(authorizer, server.port)
 
     async def _shutdown() -> None:
         if sleep_task is not None:

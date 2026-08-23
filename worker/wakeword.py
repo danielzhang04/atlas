@@ -117,7 +117,7 @@ class WakeGate:
     Pure state machine, no audio imports: feed one score per frame to update() and it returns
     "wake"  — patience reached outside the refractory window; fire on_wake now
     "spike" — a run above threshold ended BEFORE reaching patience (the ghost-wake signature;
-              logged so false-trigger pressure stays visible in the pm2 log)
+              logged so false-trigger pressure stays visible in worker diagnostics)
     None    — nothing to act on this frame
     `peak` and `run` expose the just-ended/just-fired run's max score and length for logging."""
 
@@ -228,7 +228,7 @@ def listen(on_wake: Callable[[], None], model_name: str = "hey_jarvis",
                     on_wake()
                 elif event == "spike":
                     # The ghost-wake signature: threshold crossed but not sustained. Keep these
-                    # visible so false-trigger pressure can be tuned from the pm2 log.
+                    # visible so false-trigger pressure can be tuned from worker diagnostics.
                     logger.info("wake spike suppressed (peak score %.2f, %d frame(s) < patience %d)",
                                 gate.peak, gate.spike_frames, gate.patience)
     except Exception:

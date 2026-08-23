@@ -5,6 +5,7 @@
 - App opens and MCP reads run in the conversational turn.
 - Mutations require a later spoken confirmation; longer work launches through `claude --bg`.
 - Background output appears in Workers, and completed results remain protected at rest.
+- Open the Atlas app to turn Atlas on; close its window to turn Atlas off.
 
 ## Setup
 
@@ -17,10 +18,20 @@ Put voice-provider values in `%USERPROFILE%\.atlas\env`. MCP server commands, ar
 environment values remain in the user's existing `~/.claude.json`; neither file belongs in this
 repository.
 
-Run the voice worker:
+Run the Atlas app:
 
 ```powershell
-.venv\Scripts\python -m worker.app console
+.venv\Scripts\pythonw.exe -m worker.desktop
+```
+
+The native window starts the voice worker and opens its paired command center. Closing the window
+stops Atlas. If background jobs are active, Atlas shows their titles and confirms that closing will
+stop them before it exits.
+
+To add Atlas to the Start menu for the current user:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_shortcut.ps1
 ```
 
 Run a single streaming text turn, with or without MCP connections:
@@ -61,5 +72,5 @@ node --check ui/app.js
 git diff --check
 ```
 
-Live voice, account-backed MCP, desktop opening, paid work, and PM2 cutover remain explicit human
-verification steps.
+Live voice, account-backed MCP, desktop opening, and paid work remain explicit human verification
+steps.

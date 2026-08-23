@@ -116,8 +116,7 @@ def test_swap_common_path_opens_new_device():
 
 def test_swap_unresolved_name_requests_restart_not_reinit():
     """Live finding 2026-07-22: in-process PortAudio reinit kills the retry-less wake
-    listener, so an unresolvable device now requests a worker self-restart (fresh snapshot
-    via pm2 revive) and touches NO stream."""
+    listener, so an unresolvable device requests a fresh worker process and touches NO stream."""
     console, sd, restarts = FakeConsole(), FakeSd(), []
     f = _follower(console, sd, resolve_out=lambda s, devices=None: None, restarts=restarts)
     f._last_idx = 5
@@ -144,7 +143,7 @@ def test_swap_open_failure_requests_restart():
 
 
 def test_comtypes_logger_is_silenced():
-    """The 1.5s COM poll floods pm2 logs with comtypes DEBUG Release lines (live finding
+    """The 1.5s COM poll floods worker logs with comtypes DEBUG Release lines (live finding
     2026-07-22 — it drowned the wake/swap lines). Importing devicewatch must cap it."""
     import logging
     assert logging.getLogger("comtypes").level >= logging.WARNING

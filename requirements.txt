@@ -10,3 +10,4 @@ livekit-plugins-silero
 openwakeword==0.6.0
 comtypes>=1.4
 pycaw>=20240210
+pywebview>=6.2
