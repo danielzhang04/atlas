@@ -106,6 +106,14 @@ class ToolRegistry:
         self._pending: PendingAction | None = None
         self._open_aliases: frozenset[str] = frozenset()
 
+    @property
+    def pending(self) -> PendingAction | None:
+        pending = self._pending
+        if pending is not None and pending.expires <= self._clock():
+            self._pending = None
+            return None
+        return pending
+
     def register(self, tool: Tool) -> None:
         if not _TOOL_NAME.fullmatch(tool.name):
             raise ValueError("invalid tool name")
@@ -150,16 +158,12 @@ class ToolRegistry:
                     return ToolResult("error", "missing turn transcript")
                 copied["brief"] = f"{transcript}{_TAINTED_BRIEF_SUFFIX}"
             if tool.policy == "confirm":
-                pending = self._pending
-                if pending is not None and pending.expires <= self._clock():
-                    self._pending = None
-                    pending = None
-                if (
-                    pending is not None
-                    and pending.name == name
-                    and pending.arguments == copied
-                ):
-                    return ToolResult("error", "already pending; call confirm")
+                pending = self.pending
+                if pending is not None and pending.name == name:
+                    return ToolResult(
+                        "error",
+                        "already pending; Daniel must confirm or cancel first",
+                    )
                 serialized = json.dumps(copied)
                 pending = PendingAction(
                     confirm_id=secrets.token_urlsafe(8),
@@ -209,11 +213,8 @@ class ToolRegistry:
         return _direct_https(target.strip())
 
     async def confirm(self, confirm_id: str) -> ToolResult:
-        pending = self._pending
+        pending = self.pending
         if pending is None:
-            return ToolResult("error", "nothing to confirm")
-        if pending.expires <= self._clock():
-            self._pending = None
             return ToolResult("error", "nothing to confirm")
         if pending.confirm_id != confirm_id:
             return ToolResult("error", "nothing to confirm")

@@ -88,8 +88,14 @@ def test_confirm_is_single_use_and_executes_the_pending_tool():
     )
     assert calls == []
 
-    repeated = _call(registry, "send", {"to": "Daniel"})
-    assert repeated == ToolResult("error", "already pending; call confirm")
+    repeated = _call(registry, "send", {"to": "someone else"})
+    assert repeated == ToolResult(
+        "error",
+        "already pending; Daniel must confirm or cancel first",
+    )
+    assert registry.pending is not None
+    assert registry.pending.confirm_id == pending.confirm_id
+    assert registry.pending.arguments == {"to": "Daniel"}
     confirmed = _call(registry, "confirm", {"confirm_id": pending.confirm_id})
     assert confirmed.status == "ok"
     assert confirmed.content == "sent"

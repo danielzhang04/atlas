@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from worker.brain import BASE_SYSTEM, Brain, split_spoken
-from worker.tools import AppEntry, Tool, ToolRegistry, builtin
+from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +27,11 @@ class FakeRegistry:
         self.taints: list[bool] = []
         self.transcripts: list[str | None] = []
         self.when_called = None
+        self._pending: PendingAction | None = None
+
+    @property
+    def pending(self) -> PendingAction | None:
+        return self._pending
 
     def schemas(self) -> list[dict[str, Any]]:
         return [
@@ -55,7 +60,26 @@ class FakeRegistry:
         self.calls.append((name, dict(arguments)))
         self.taints.append(tainted)
         self.transcripts.append(transcript)
-        return self.results.pop(0) if self.results else ToolResult("ok", "done")
+        result = self.results.pop(0) if self.results else ToolResult("ok", "done")
+        if result.status == "needs_confirmation" and result.confirm_id is not None:
+            self._pending = PendingAction(
+                confirm_id=result.confirm_id,
+                name=name,
+                arguments=dict(arguments),
+                summary=name,
+                expires=float("inf"),
+            )
+        elif name in {"confirm", "cancel_pending"}:
+            self._pending = None
+        return result
+
+    async def confirm(self, confirm_id: str) -> ToolResult:
+        return await self.call("confirm", {"confirm_id": confirm_id})
+
+    def cancel_pending(self) -> ToolResult:
+        self.calls.append(("cancel_pending", {}))
+        self._pending = None
+        return self.results.pop(0) if self.results else ToolResult("ok", "cancelled")
 
 
 class FakeStream:
@@ -226,41 +250,155 @@ def test_tool_use_continues_with_result_and_invokes_callback():
     }]}
 
 
-def test_confirmation_status_and_id_survive_for_the_later_confirm_turn():
-    pending_content = (
-        'NOT EXECUTED. Pending: mutate {"message": "hello"}. Read this back and ask Daniel. '
-        'When he agrees on a later turn, call confirm with confirm_id="confirm-123" — do not call '
-        "mutate again."
+def test_affirmative_turn_executes_pending_once_and_has_synthetic_result(monkeypatch):
+    mutation_calls = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "mutate",
+        lambda arguments: return_value(mutation_calls.append(arguments) or "sent"),
+        policy="confirm",
+    ))
+    builtin(registry, {}, BrainWork())
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe",
+        lambda _length: "confirm-123",
     )
-    registry = FakeRegistry(
-        ToolResult("needs_confirmation", pending_content, "confirm-123"),
-        ToolResult("ok", "sent"),
-    )
+    events = []
     client = FakeClient(
-        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
-        FakeStream(["Should I send it?"], content=[text_block("Should I send it?")]),
         FakeStream(
-            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
+            content=[tool_block(name="mutate", arguments={"message": "hello"})],
             stop_reason="tool_use",
         ),
+        FakeStream(["Should I send it?"], content=[text_block("Should I send it?")]),
         FakeStream(["Sent."], content=[text_block("Sent.")]),
     )
-    brain = Brain(client, registry, model="fast", persona="")
+    brain = Brain(
+        client,
+        registry,
+        model="fast",
+        persona="",
+        on_tool=lambda name, result: events.append((name, result)),
+    )
 
     async def scenario():
         first = await collect(brain, "Send the message")
-        second = await collect(brain, "Yes")
+        second = await collect(brain, "Uh, yes, go ahead and create the draft")
         return first, second
 
     first, second = asyncio.run(scenario())
 
     assert first == ["Should I send it?"]
     assert second == ["Sent."]
-    tool_result = client.messages.calls[1]["messages"][-1]["content"][0]
-    assert tool_result["content"] == pending_content
-    assert "Host pending confirmation id: confirm-123." in client.messages.calls[2]["system"][0]["text"]
-    assert registry.calls[-1] == ("confirm", {"confirm_id": "confirm-123"})
+    assert mutation_calls == [{"message": "hello"}]
+    assert registry.pending is None
+    assert [name for name, _result in events] == ["mutate", "confirm"]
+    request = client.messages.calls[2]
+    assert request["tool_choice"] == {"type": "none"}
+    assert request["messages"] == [
+        {"role": "user", "content": "Send the message"},
+        {"role": "assistant", "content": "Should I send it?"},
+        {"role": "user", "content": "Uh, yes, go ahead and create the draft"},
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_host_confirm",
+                "name": "confirm",
+                "input": {"confirm_id": "confirm-123"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_host_confirm",
+                "content": "sent",
+                "is_error": False,
+            }],
+        },
+    ]
     assert brain._pending_confirm_id is None
+
+
+def test_negative_turn_cancels_pending_without_executing():
+    mutation_calls = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "mutate",
+        lambda arguments: return_value(mutation_calls.append(arguments) or "sent"),
+        policy="confirm",
+    ))
+    builtin(registry, {}, BrainWork())
+    asyncio.run(registry.call("mutate", {"message": "hello"}))
+    client = FakeClient(FakeStream(["Cancelled."], content=[text_block("Cancelled.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Okay, no")) == ["Cancelled."]
+
+    assert mutation_calls == []
+    assert registry.pending is None
+    request = client.messages.calls[0]
+    assert request["tool_choice"] == {"type": "none"}
+    assert request["messages"][-2]["content"][0] == {
+        "type": "tool_use",
+        "id": "toolu_host_cancel",
+        "name": "cancel_pending",
+        "input": {},
+    }
+    assert request["messages"][-1]["content"][0]["content"] == "cancelled"
+
+
+def test_non_confirmation_utterance_leaves_pending_for_normal_turn():
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "mutate",
+        lambda _arguments: return_value("sent"),
+        policy="confirm",
+    ))
+    builtin(registry, {}, BrainWork())
+    pending = asyncio.run(registry.call("mutate", {"message": "hello"}))
+    client = FakeClient(FakeStream(
+        ["What would you like changed?"],
+        content=[text_block("What would you like changed?")],
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Change the wording first")) == [
+        "What would you like changed?"
+    ]
+
+    assert registry.pending is not None
+    assert registry.pending.confirm_id == pending.confirm_id
+    assert client.messages.calls[0]["tool_choice"] == {"type": "auto"}
+    assert client.messages.calls[0]["messages"] == [{
+        "role": "user",
+        "content": "Change the wording first",
+    }]
+
+
+def test_expired_pending_is_ignored_by_affirmative_turn():
+    now = [10.0]
+    mutation_calls = []
+    registry = ToolRegistry(clock=lambda: now[0])
+    registry.register(registry_tool(
+        "mutate",
+        lambda arguments: return_value(mutation_calls.append(arguments) or "sent"),
+        policy="confirm",
+    ))
+    builtin(registry, {}, BrainWork())
+    asyncio.run(registry.call("mutate", {"message": "hello"}))
+    now[0] += 121.0
+    client = FakeClient(FakeStream(
+        ["There is nothing pending."],
+        content=[text_block("There is nothing pending.")],
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Yes")) == ["There is nothing pending."]
+
+    assert mutation_calls == []
+    assert registry.pending is None
+    assert client.messages.calls[0]["tool_choice"] == {"type": "auto"}
 
 
 def test_confirmation_cannot_execute_in_the_turn_that_created_it():
@@ -318,10 +456,6 @@ def test_mcp_result_refuses_later_confirm_without_consuming_pending_and_next_tur
             stop_reason="tool_use",
         ),
         FakeStream(["Ask again next turn."], content=[text_block("Ask again next turn.")]),
-        FakeStream(
-            content=[tool_block(name="confirm", arguments={"confirm_id": "confirm-123"})],
-            stop_reason="tool_use",
-        ),
         FakeStream(["Sent."], content=[text_block("Sent.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")

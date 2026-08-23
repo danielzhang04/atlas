@@ -7,7 +7,8 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
 
-from .tools import ToolRegistry, ToolResult
+from .router import normalize
+from .tools import PendingAction, ToolRegistry, ToolResult
 
 
 
@@ -20,6 +21,50 @@ MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
+
+_AFFIRMATIVE = frozenset({
+    "confirm",
+    "confirmed",
+    "create it",
+    "do it",
+    "go ahead",
+    "go for it",
+    "ok",
+    "okay",
+    "please do",
+    "send it",
+    "sure",
+    "yeah",
+    "yep",
+    "yes",
+    "yup",
+})
+_NEGATIVE = frozenset({
+    "cancel",
+    "don t",
+    "never mind",
+    "no",
+    "nope",
+    "not now",
+    "stop",
+})
+_LEADING_FILLER = frozenset({
+    "all",
+    "alright",
+    "atlas",
+    "hey",
+    "just",
+    "now",
+    "ok",
+    "okay",
+    "please",
+    "right",
+    "so",
+    "uh",
+    "um",
+    "yeah",
+    "yes",
+})
 
 BASE_SYSTEM = """You are heard, not read: use short sentences, no markdown, and lead with the point.
 For ordinary conversation, just answer. Give short social turns only a few words.
@@ -46,6 +91,10 @@ At most one short filler sentence before tools ('Let me check.'); do not narrate
 
 
 class _Registry(Protocol):
+    @property
+    def pending(self) -> PendingAction | None:
+        ...
+
     def schemas(self) -> list[dict[str, Any]]:
         ...
 
@@ -57,6 +106,12 @@ class _Registry(Protocol):
         tainted: bool = False,
         transcript: str | None = None,
     ) -> Any:
+        ...
+
+    async def confirm(self, confirm_id: str) -> ToolResult:
+        ...
+
+    def cancel_pending(self) -> ToolResult:
         ...
 
 
@@ -173,7 +228,10 @@ class Brain:
         if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > MAX_TRANSCRIPT:
             raise ValueError("transcript must contain 1 to 4096 characters")
         prompt = transcript
-        allowed_confirm_id = self._pending_confirm_id
+        pending = self.registry.pending
+        self._pending_confirm_id = pending.confirm_id if pending is not None else None
+        confirmation_intent = _confirmation_intent(prompt) if pending is not None else None
+        allowed_confirm_id = pending.confirm_id if pending is not None else None
         messages: list[dict[str, Any]] = [dict(message) for message in self._history]
         messages.append({"role": "user", "content": prompt})
         system = [{
@@ -191,6 +249,60 @@ class Brain:
         tainted = False
         try:
             async with asyncio.timeout(self.turn_timeout_s):
+                if pending is not None and confirmation_intent is not None:
+                    if confirmation_intent == "confirm":
+                        name = "confirm"
+                        call_id = "toolu_host_confirm"
+                        arguments = {"confirm_id": pending.confirm_id}
+                        result = await self.registry.confirm(pending.confirm_id)
+                    else:
+                        name = "cancel_pending"
+                        call_id = "toolu_host_cancel"
+                        arguments = {}
+                        result = self.registry.cancel_pending()
+                    self._pending_confirm_id = None
+                    if self.on_tool is not None:
+                        self.on_tool(name, result)
+                    messages.extend((
+                        {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": arguments,
+                            }],
+                        },
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": result.content,
+                                "is_error": result.status == "error",
+                            }],
+                        },
+                    ))
+                    async with self.client.messages.stream(
+                        model=self.model,
+                        max_tokens=self.max_tokens,
+                        system=system,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice={"type": "none"},
+                    ) as stream:
+                        async for delta in stream.text_stream:
+                            buffer += delta
+                            chunks, buffer = split_spoken(buffer)
+                            for chunk in chunks:
+                                spoken.append(chunk)
+                                yield chunk
+                        await stream.get_final_message()
+                    if buffer:
+                        spoken.append(buffer)
+                        yield buffer
+                    self._remember(prompt, "".join(spoken))
+                    return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
                     async with self.client.messages.stream(
@@ -301,3 +413,26 @@ class Brain:
 
 def _content_bearing_tool(name: str) -> bool:
     return "__" in name or name == "read_file"
+
+
+def _confirmation_intent(transcript: str) -> str | None:
+    tokens = normalize(transcript).split()
+    variants = [" ".join(tokens)]
+    while len(tokens) > 1 and tokens[0] in _LEADING_FILLER:
+        tokens.pop(0)
+        variants.append(" ".join(tokens))
+    for variant in variants:
+        if variant in _NEGATIVE:
+            return "cancel"
+        if _is_affirmative(variant):
+            return "confirm"
+    return None
+
+
+def _is_affirmative(value: str) -> bool:
+    return (
+        value in _AFFIRMATIVE
+        or value.startswith("yes ")
+        or value.startswith("confirm ")
+        or value.startswith("go ahead ")
+    )
