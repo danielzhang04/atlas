@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import threading
 
 from worker import runtime
 from worker.brain import Brain
@@ -69,8 +70,7 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         assert built.brain.max_tokens == 123
         assert built.brain.turn_timeout_s == 3
         assert built.registry.names() == [
-            "open", "focus", "confirm", "cancel_pending",
-            "launch_work", "work_status", "cancel_work", "close",
+            "open", "focus", "launch_work", "work_status", "cancel_work", "close",
             "find_file", "open_file", "read_file",
             "count_mail",
         ]
@@ -82,33 +82,34 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         built.store.close()
 
 
-def test_default_anthropic_client_is_built_on_first_turn_access(monkeypatch, tmp_path):
-    root = _root(tmp_path)
-    monkeypatch.setattr(runtime, "ATLAS", root)
+def test_lazy_anthropic_client_warms_constructor_on_background_thread():
     created = []
+    factory_threads = []
+    warmed = threading.Event()
     messages = object()
 
     class Client:
         def __init__(self):
             self.messages = messages
 
+    def factory():
+        factory_threads.append(threading.get_ident())
+        created.append(Client())
+        warmed.set()
+        return created[-1]
+
+    caller_thread = threading.get_ident()
     lazy_client = runtime._LazyAnthropicClient(
-        factory=lambda: created.append(Client()) or created[-1],
+        factory=factory,
     )
-    built = runtime.build({
-        "fast_model": "claude-test",
-        "google_account": "owner@example.test",
-        "job_store_path": ":memory:",
-        "work_workspace_path": str(tmp_path / "jobs"),
-    }, client=lazy_client, launcher=FakeLauncher())
-    try:
-        assert created == []
-        assert built.brain.client.messages is messages
-        assert len(created) == 1
-        assert built.brain.client.messages is messages
-        assert len(created) == 1
-    finally:
-        built.store.close()
+
+    assert warmed.wait(timeout=1.0)
+    lazy_client._warm_thread.join(timeout=1.0)
+    assert len(created) == 1
+    assert factory_threads == [lazy_client._warm_thread.ident]
+    assert factory_threads != [caller_thread]
+    assert lazy_client.messages is messages
+    assert len(created) == 1
 
 
 def test_build_requires_the_small_trusted_configuration(monkeypatch, tmp_path):

@@ -572,7 +572,7 @@
   function pairedUntilText() {
     const expiry = new Date(actionExpiresAt * 1000);
     const time = expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
-    return `Paired until ${time}`;
+    return `paired until ${time}`;
   }
 
   function renderPairingStatus() {
@@ -879,6 +879,7 @@
       headers: {"content-type": "application/json"},
       body: JSON.stringify({token}),
     });
+    if (response.status === 401) clearPairing();
     if (!response.ok) throw new Error("pairing failed");
     const payload = await response.json();
     if (!setPairing(payload.action_token, payload.expires_at)) throw new Error("invalid pairing");

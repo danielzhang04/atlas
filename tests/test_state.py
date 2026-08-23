@@ -10,7 +10,7 @@ def _dt(second: int) -> datetime:
     return datetime(2026, 8, 22, 12, 0, second, tzinfo=timezone.utc)
 
 
-def test_initial_snapshot_has_only_live_voice_fields():
+def test_initial_snapshot_publishes_live_voice_and_wake_configuration():
     publisher = StatePublisher(clock=lambda: _dt(0), voice="mars")
     assert publisher.state == ASLEEP
     assert publisher.snapshot() == {
@@ -19,6 +19,7 @@ def test_initial_snapshot_has_only_live_voice_fields():
         "since": _dt(0).isoformat(),
         "session_id": None,
         "voice": "mars",
+        "wake_model": None,
         "transcript": [],
         "audio": {
             "input": {"name": None, "following": False},
@@ -26,6 +27,15 @@ def test_initial_snapshot_has_only_live_voice_fields():
         },
         "audio_energy": 0.0,
     }
+
+
+def test_wake_model_is_trimmed_and_bounded_in_the_public_snapshot():
+    publisher = StatePublisher(
+        clock=lambda: _dt(0),
+        wake_model=f"  {'wake' * 40}  ",
+    )
+
+    assert publisher.snapshot()["wake_model"] == ("wake" * 40)[:128]
 
 
 def test_state_transitions_stamp_changes_and_ignore_noops():

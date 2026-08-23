@@ -71,41 +71,39 @@ def test_instant_call_reports_success_exception_and_timeout():
     assert _call(registry, "missing", {}).content == "unknown tool"
 
 
-def test_confirm_is_single_use_and_executes_the_pending_tool():
+def test_host_confirmation_is_single_use_and_model_calls_are_host_only():
     calls = []
     registry = ToolRegistry()
     registry.register(_tool("send", run=lambda args: _return(calls.append(args) or "sent"),
                             policy="confirm"))
-    builtin(registry, {}, _FakeWork())
+    registry.register(_tool("confirm"))
+    registry.register(_tool("cancel_pending"))
 
     pending = _call(registry, "send", {"to": "Daniel"})
     assert pending.status == "needs_confirmation"
     assert pending.confirm_id
     assert pending.content == (
-        'NOT EXECUTED. Pending: send {"to": "Daniel"}. Read this back and ask Daniel. '
-        "When he agrees on a later turn, call confirm with "
-        f'confirm_id="{pending.confirm_id}" — do not call send again.'
+        "NOT EXECUTED. Read this summary back to Daniel and wait for his yes or no: "
+        "send — to: Daniel."
     )
     assert calls == []
-
-    repeated = _call(registry, "send", {"to": "someone else"})
-    assert repeated == ToolResult(
-        "error",
-        "already pending; Daniel must confirm or cancel first",
+    assert _call(registry, "confirm", {"confirm_id": pending.confirm_id}) == ToolResult(
+        "error", "host-only",
     )
+    assert _call(registry, "cancel_pending", {}) == ToolResult("error", "host-only")
     assert registry.pending is not None
     assert registry.pending.confirm_id == pending.confirm_id
     assert registry.pending.arguments == {"to": "Daniel"}
-    confirmed = _call(registry, "confirm", {"confirm_id": pending.confirm_id})
+    confirmed = asyncio.run(registry.confirm(pending.confirm_id))
     assert confirmed.status == "ok"
     assert confirmed.content == "sent"
     assert calls == [{"to": "Daniel"}]
-    second = _call(registry, "confirm", {"confirm_id": pending.confirm_id})
+    second = asyncio.run(registry.confirm(pending.confirm_id))
     assert second.status == "error"
     assert second.content == "nothing to confirm"
-    confirm_schema = next(schema for schema in registry.schemas() if schema["name"] == "confirm")
-    assert "later turn" in confirm_schema["description"]
-    assert "do not call the original tool again" in confirm_schema["description"]
+    schema_names = {schema["name"] for schema in registry.schemas()}
+    assert "confirm" not in schema_names
+    assert "cancel_pending" not in schema_names
 
 
 def test_confirm_executes_the_arguments_that_were_summarized():
@@ -117,12 +115,12 @@ def test_confirm_executes_the_arguments_that_were_summarized():
 
     pending = _call(registry, "send", arguments)
     arguments["message"]["body"] = "changed"
-    assert _call(registry, "confirm", {"confirm_id": pending.confirm_id}).status == "ok"
+    assert asyncio.run(registry.confirm(pending.confirm_id)).status == "ok"
 
     assert calls == [{"message": {"body": "approved"}}]
 
 
-def test_confirm_expiry_replacement_and_cancel_pending():
+def test_pending_action_blocks_every_new_confirm_policy_proposal_until_consumed():
     now = [10.0]
     calls = []
     registry = ToolRegistry(clock=lambda: now[0])
@@ -133,17 +131,66 @@ def test_confirm_expiry_replacement_and_cancel_pending():
     builtin(registry, {}, _FakeWork())
 
     old = _call(registry, "first", {"n": 1})
-    new = _call(registry, "second", {"n": 2})
-    assert _call(registry, "confirm", {"confirm_id": old.confirm_id}).status == "error"
-    assert _call(registry, "confirm", {"confirm_id": new.confirm_id}).status == "ok"
-    assert calls == [("second", {"n": 2})]
+    blocked = _call(registry, "second", {"n": 2})
+    assert blocked == ToolResult(
+        "error",
+        "a previous action is still awaiting Daniel's yes or no",
+    )
+    assert registry.pending is not None
+    assert registry.pending.confirm_id == old.confirm_id
+    assert asyncio.run(registry.confirm(old.confirm_id)).status == "ok"
+    assert calls == [("first", {"n": 1})]
 
-    expired = _call(registry, "first", {"n": 3})
+    expired = _call(registry, "second", {"n": 3})
     now[0] += 121
-    assert _call(registry, "confirm", {"confirm_id": expired.confirm_id}).content == "nothing to confirm"
-    cancelled = _call(registry, "second", {"n": 4})
-    assert _call(registry, "cancel_pending", {}).status == "ok"
-    assert _call(registry, "confirm", {"confirm_id": cancelled.confirm_id}).content == "nothing to confirm"
+    assert asyncio.run(registry.confirm(expired.confirm_id)).content == "nothing to confirm"
+    cancelled = _call(registry, "first", {"n": 4})
+    assert registry.cancel_pending().status == "ok"
+    assert asyncio.run(registry.confirm(cancelled.confirm_id)).content == "nothing to confirm"
+
+
+def test_pending_action_refusal_precedes_tainted_confirm_policy_refusal():
+    registry = ToolRegistry()
+    registry.register(_tool("first", policy="confirm"))
+    registry.register(_tool("close", policy="confirm"))
+    _call(registry, "first", {})
+
+    result = _call(registry, "close", {}, tainted=True)
+
+    assert result == ToolResult(
+        "error",
+        "a previous action is still awaiting Daniel's yes or no",
+    )
+
+
+def test_confirmation_readback_lists_all_arguments_and_truncates_each_value():
+    registry = ToolRegistry()
+    registry.register(_tool("send", policy="confirm"))
+
+    result = _call(registry, "send", {
+        "to": "Daniel",
+        "subject": "x" * 170,
+        "metadata": {"draft": True},
+    })
+
+    assert result.status == "needs_confirmation"
+    assert registry.pending is not None
+    assert registry.pending.summary == (
+        "send — to: Daniel; "
+        f"subject: {'x' * 160} …(+10 chars); "
+        'metadata: {"draft": true}'
+    )
+    assert registry.pending.summary in result.content
+
+
+def test_confirmation_refuses_serialized_arguments_over_readback_limit():
+    registry = ToolRegistry()
+    registry.register(_tool("send", policy="confirm"))
+
+    result = _call(registry, "send", {"body": "x" * 1_201})
+
+    assert result == ToolResult("error", "too large to read back; split it")
+    assert registry.pending is None
 
 
 def test_open_resolves_aliases_https_and_rejects_other_targets():
@@ -329,7 +376,6 @@ def test_open_atlas_uses_the_static_alias_without_a_paired_url():
 @pytest.mark.parametrize(
     "name,arguments",
     [
-        ("confirm", {"confirm_id": "pending"}),
         ("close", {"app": "editor"}),
         ("focus", {"app": "editor"}),
         ("open_file", {"path": "C:/Desk/report.txt"}),

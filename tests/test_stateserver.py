@@ -26,7 +26,11 @@ async def _request(server, method="GET", path="/state", *, body=None, headers=No
 
 def test_state_signal_assets_and_security_headers():
     async def scenario():
-        publisher = StatePublisher(clock=lambda: _dt(0), voice="mars")
+        publisher = StatePublisher(
+            clock=lambda: _dt(0),
+            voice="mars",
+            wake_model="hey_atlas",
+        )
         publisher.start_session()
         publisher.set_state("LISTENING")
         publisher.set_audio({
@@ -52,6 +56,7 @@ def test_state_signal_assets_and_security_headers():
     assert state_response[0] == 200
     assert payload["heartbeat"] == _dt(1).isoformat()
     assert payload["state"] == "LISTENING"
+    assert payload["wake_model"] == "hey_atlas"
     assert payload["audio"] == {
         "input": {"name": "Headset microphone", "following": True},
         "output": {"name": "Headphones", "following": True},
@@ -92,6 +97,54 @@ def test_state_signal_assets_and_security_headers():
     assert state_response[1]["cache-control"] == "no-store"
     assert state_response[1]["x-frame-options"] == "DENY"
     assert all(address[0] == "127.0.0.1" for address in addresses)
+
+
+def test_state_endpoint_bounds_an_untrusted_wake_model_value():
+    class Publisher:
+        audio_energy = 0.0
+        audio_bands = [0.0] * 24
+
+        @staticmethod
+        def snapshot():
+            return {"wake_model": "wake" * 100}
+
+    async def scenario():
+        server = await stateserver.start(Publisher(), 0, clock=lambda: _dt(1))
+        try:
+            return await _request(server)
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert response[0] == 200
+    assert json.loads(response[2])["wake_model"] == ("wake" * 100)[:128]
+
+
+def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
+    async def scenario():
+        server = await stateserver.start(StatePublisher(clock=lambda: _dt(0)), 0)
+        try:
+            return (
+                await _request(server, path="/"),
+                await _request(server, path="/ui/app.js"),
+            )
+        finally:
+            await server.stop()
+
+    page, script = asyncio.run(scenario())
+
+    assert 'id="repair-button"' in page[2]
+    assert "Re-pair" in page[2]
+    assert "sessionStorage.setItem" in script[2]
+    assert "sessionStorage.getItem" in script[2]
+    assert "sessionStorage.removeItem" in script[2]
+    assert "localStorage" not in script[2]
+    assert 'fetch("/pair/bootstrap"' in script[2]
+    assert "window.setTimeout(clearPairing" in script[2]
+    assert "if (response.status === 401)" in script[2]
+    assert "restorePairing();" in script[2]
+    assert "paired until ${time}" in script[2]
 
 
 def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
@@ -247,6 +300,104 @@ def test_pairing_protects_job_events_private_results_and_cancellation():
     assert json.loads(result[2]) == {"job_id": job_id, "result": "Private result"}
     assert json.loads(cancel[2])["job"]["status"] == "cancelled"
     assert cancelled == [job_id]
+
+
+def test_pairing_returns_expiry_and_renewal_requires_live_bearer_and_loopback_host():
+    now = [10.0]
+    wall_now = 2_000_000_000.0
+    job_id = str(uuid4())
+
+    async def scenario():
+        authorizer = stateserver.PairingAuthorizer(
+            clock=lambda: now[0],
+            wall_clock=lambda: wall_now,
+            token="pair-token",
+            ttl_s=60.0,
+        )
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            authorizer=authorizer,
+        )
+        origin = f"http://127.0.0.1:{server.port}"
+        pair_headers = {"content-type": "application/json", "origin": origin}
+        try:
+            paired = await _request(
+                server,
+                "POST",
+                "/pair",
+                body=json.dumps({"token": "pair-token"}),
+                headers=pair_headers,
+            )
+            bearer = json.loads(paired[2])["action_token"]
+            missing = await _request(server, path="/pair/bootstrap")
+            wrong = await _request(
+                server,
+                path="/pair/bootstrap",
+                headers={stateserver.HEADER: "wrong"},
+            )
+            bad_host = await _request(
+                server,
+                path="/pair/bootstrap",
+                headers={
+                    "Host": f"evil.test:{server.port}",
+                    stateserver.HEADER: bearer,
+                },
+            )
+            bootstrap = await _request(
+                server,
+                path="/pair/bootstrap",
+                headers={stateserver.HEADER: bearer},
+            )
+            bootstrap_token = json.loads(bootstrap[2])["token"]
+            repaired = await _request(
+                server,
+                "POST",
+                "/pair",
+                body=json.dumps({"token": bootstrap_token}),
+                headers=pair_headers,
+            )
+            fresh_bearer = json.loads(repaired[2])["action_token"]
+            reused = await _request(
+                server,
+                "POST",
+                "/pair",
+                body=json.dumps({"token": bootstrap_token}),
+                headers=pair_headers,
+            )
+            old_bearer = await _request(
+                server,
+                path=f"/jobs/{job_id}/events",
+                headers={stateserver.HEADER: bearer},
+            )
+            fresh = await _request(
+                server,
+                path=f"/jobs/{job_id}/events",
+                headers={stateserver.HEADER: fresh_bearer},
+            )
+            now[0] += 61.0
+            expired = await _request(
+                server,
+                path="/pair/bootstrap",
+                headers={stateserver.HEADER: fresh_bearer},
+            )
+            return paired, missing, wrong, bad_host, bootstrap, repaired, reused, old_bearer, fresh, expired
+        finally:
+            await server.stop()
+
+    responses = asyncio.run(scenario())
+    paired, missing, wrong, bad_host, bootstrap, repaired, reused, old_bearer, fresh, expired = responses
+
+    assert paired[0] == 200
+    assert json.loads(paired[2])["expires_at"] == wall_now + 60.0
+    assert [missing[0], wrong[0], bad_host[0]] == [403, 403, 403]
+    assert bootstrap[0] == 200
+    assert repaired[0] == 200
+    assert json.loads(repaired[2])["expires_at"] == wall_now + 60.0
+    assert reused[0] == 401
+    assert old_bearer[0] == 401
+    assert fresh[0] == 404
+    assert expired[0] == 403
 
 
 def test_host_allowlist_rejects_every_method_and_route_before_dispatch():

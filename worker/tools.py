@@ -156,6 +156,11 @@ class ToolRegistry:
         if tool is None:
             return ToolResult("error", "unknown tool")
         try:
+            if tool.policy == "confirm" and self.pending is not None:
+                return ToolResult(
+                    "error",
+                    "a previous action is still awaiting Daniel's yes or no",
+                )
             copied = deepcopy(dict(arguments))
             if tainted and self._refused_after_external_content(name, copied):
                 return ToolResult("error", _TAINT_REFUSAL)
@@ -164,12 +169,6 @@ class ToolRegistry:
                     return ToolResult("error", "missing turn transcript")
                 copied["brief"] = f"{transcript}{_TAINTED_BRIEF_SUFFIX}"
             if tool.policy == "confirm":
-                pending = self.pending
-                if pending is not None:
-                    return ToolResult(
-                        "error",
-                        "a previous action is still awaiting Daniel's yes or no",
-                    )
                 serialized = json.dumps(copied, ensure_ascii=False)
                 if len(serialized) > _READBACK_ARGUMENT_LIMIT:
                     return ToolResult("error", "too large to read back; split it")
