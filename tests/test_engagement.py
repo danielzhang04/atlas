@@ -1,19 +1,51 @@
 from worker.engagement import Engagement
 
 
-def test_wake_stays_engaged_until_explicit_dismiss():
-    e = Engagement()
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def test_wake_stamps_clock_and_tick_sleeps_only_after_timeout():
+    clock = FakeClock()
+    e = Engagement(120, clock=clock)
     assert e.state == "ASLEEP"
     e.wake()
     assert e.state == "ENGAGED"
 
-    # There is deliberately no clock or tick transition. A pause between turns does not end the
-    # conversation or require Daniel to address Atlas again.
-    assert not hasattr(e, "tick")
-    assert e.state == "ENGAGED"
+    clock.value = 120
+    assert e.tick() == "ENGAGED"
+    clock.value = 120.01
+    assert e.tick() == "ASLEEP"
+
+
+def test_directed_interaction_extends_timeout_but_is_noop_while_asleep():
+    clock = FakeClock()
+    e = Engagement(10, clock=clock)
+    e.interacted()
+    clock.value = 9
+    e.wake()
+    clock.value = 18
+    e.interacted()
+    clock.value = 27
+    assert e.tick() == "ENGAGED"
+    clock.value = 28.01
+    assert e.tick() == "ASLEEP"
+
+
+def test_dismiss_sleeps_immediately_and_tick_is_stable_while_asleep():
+    clock = FakeClock()
+    e = Engagement(120, clock=clock)
+    e.wake()
 
     e.dismiss()
     assert e.state == "ASLEEP"
+
+    clock.value = 500
+    assert e.tick() == "ASLEEP"
 
 
 def test_resolve_input_device_pins_by_substring():
@@ -82,7 +114,7 @@ def test_apply_agent_state_updates_ui_without_changing_engagement():
     from worker.app import _apply_agent_state
     from worker import state
 
-    e = Engagement()
+    e = Engagement(120)
     e.wake()
     pub = state.StatePublisher()
     _apply_agent_state(e, pub, "speaking")
@@ -94,7 +126,7 @@ def test_apply_agent_state_is_noop_while_asleep():
     from worker.app import _apply_agent_state
     from worker import state
 
-    e = Engagement()
+    e = Engagement(120)
     pub = state.StatePublisher()
     _apply_agent_state(e, pub, "speaking")
     assert e.state == "ASLEEP"

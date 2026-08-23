@@ -15,6 +15,7 @@ import yaml
 from livekit.agents import Agent, AgentSession, JobContext, StopResponse, WorkerOptions, cli
 from livekit.plugins import deepgram, elevenlabs, silero
 
+from worker import addressing as addressing_mod
 from worker import brain as brain_mod
 from worker import devicewatch
 from worker import engagement as engagement_mod
@@ -65,6 +66,21 @@ def _load_intents() -> dict:
 
 def _cfg() -> dict:
     return yaml.safe_load((ATLAS / "config" / "atlas.yaml").read_text(encoding="utf-8"))
+
+
+def _address_vocab(
+    cfg: dict,
+    *,
+    apps_path: Path | None = None,
+) -> tuple[str, ...]:
+    apps = tools_mod.load_apps(apps_path or ATLAS / "config" / "apps.yaml")
+    configured = cfg.get("address_vocab")
+    if not isinstance(configured, list):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    if not all(isinstance(value, str) and value.strip() for value in configured):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    app_words = [word for entry in apps.values() for word in entry.words]
+    return tuple([*app_words, *configured])
 
 
 def _stt_keyterms(cfg: dict) -> list[str]:
@@ -261,6 +277,7 @@ async def _handle_reflex(
     session,
     publisher: state.StatePublisher,
     dismiss,
+    on_spoken=None,
 ) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
@@ -275,6 +292,91 @@ async def _handle_reflex(
         session.interrupt()
     elif intent == "repeat" and repeated:
         await session.say(repeated, add_to_chat_ctx=False)
+        if on_spoken is not None:
+            on_spoken()
+    return True
+
+
+async def _handle_audio_turn(
+    text: str,
+    *,
+    intents: dict,
+    brain: brain_mod.Brain,
+    session,
+    publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
+    addressing: addressing_mod.Addressing,
+    sleep,
+) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    def _dismiss() -> None:
+        engagement.dismiss()
+        sleep()
+
+    handled = await _handle_reflex(
+        text,
+        intents=intents,
+        session=session,
+        publisher=publisher,
+        dismiss=_dismiss,
+        on_spoken=addressing.mark_activity,
+    )
+    if handled:
+        engagement.interacted()
+        return ""
+    previous = engagement.state
+    if engagement.tick() != engagement_mod.ENGAGED:
+        if previous == engagement_mod.ENGAGED:
+            sleep(announce=False)
+        return ""
+    normalized = router.normalize(text)
+    if not addressing.is_addressed(normalized):
+        publisher.add_line("ambient", text)
+        return ""
+    engagement.interacted()
+    response = await _submit_voice_turn(
+        text,
+        brain=brain,
+        session=session,
+        publisher=publisher,
+    )
+    if response:
+        engagement.interacted()
+        addressing.mark_activity()
+    return response
+
+
+async def _sleep_watch(
+    engagement: engagement_mod.Engagement,
+    sleep,
+    *,
+    interval_s: float = 5.0,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_s)
+        previous = engagement.state
+        current = engagement.tick()
+        if previous == engagement_mod.ENGAGED and current == engagement_mod.ASLEEP:
+            sleep(announce=False)
+
+
+def _sleep_session(
+    session,
+    publisher: state.StatePublisher,
+    *,
+    announce: bool = True,
+) -> bool:
+    if not session.input.audio_enabled:
+        return False
+    session.input.set_audio_enabled(False)
+    publisher.set_state(state.ASLEEP)
+    if announce:
+        session.say(SLEEP_LINE, add_to_chat_ctx=False)
+        publisher.add_line("atlas", SLEEP_LINE)
+    else:
+        publisher.add_line("system", "auto-sleep")
     return True
 
 
@@ -299,11 +401,14 @@ async def _await_speech(value) -> None:
     await value
 
 
-def _announce_terminal(job, publisher, session, engagement) -> None:
+def _announce_terminal(job, publisher, session, engagement, addressing=None) -> None:
     line = _terminal_line(job)
     publisher.add_line("atlas", line)
     if engagement.state != engagement_mod.ENGAGED:
         return
+    engagement.interacted()
+    if addressing is not None:
+        addressing.mark_activity()
     speech = session.say(line, add_to_chat_ctx=False)
     if not inspect.isawaitable(speech):
         return
@@ -337,7 +442,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     services = runtime.build(cfg, paired_url=_paired_url)
     publisher = state.StatePublisher(voice=cfg.get("active_voice"))
-    engagement = engagement_mod.Engagement()
+    engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
+    addressing = addressing_mod.Addressing(
+        float(cfg["address_window_s"]),
+        _address_vocab(cfg),
+    )
     publisher.set_output_device(_output_device_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
@@ -350,12 +459,13 @@ async def entrypoint(ctx: JobContext) -> None:
         if current_session is None:
             pending_terminal.append(job)
             return
-        _announce_terminal(job, publisher, current_session, engagement)
+        _announce_terminal(job, publisher, current_session, engagement, addressing)
 
     services.work.on_terminal(
         lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
     )
     stop_work = asyncio.Event()
+    sleep_task: asyncio.Task | None = None
     mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
     work_task = asyncio.create_task(services.work.run(stop_work))
     _BG_TASKS.update((mcp_task, work_task))
@@ -381,7 +491,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(agent=agent, room=ctx.room)
     session_box["session"] = session
     for terminal_job in pending_terminal:
-        _announce_terminal(terminal_job, publisher, session, engagement)
+        _announce_terminal(terminal_job, publisher, session, engagement, addressing)
     pending_terminal.clear()
 
     async def _submit(text: str) -> None:
@@ -408,6 +518,9 @@ async def entrypoint(ctx: JobContext) -> None:
     server_box["server"] = server
 
     async def _shutdown() -> None:
+        if sleep_task is not None:
+            sleep_task.cancel()
+            await asyncio.gather(sleep_task, return_exceptions=True)
         stop_work.set()
         await asyncio.gather(work_task, return_exceptions=True)
         await asyncio.gather(mcp_task, return_exceptions=True)
@@ -423,18 +536,12 @@ async def entrypoint(ctx: JobContext) -> None:
     session.input.set_audio_enabled(False)
 
     def _sleep(announce: bool = True) -> bool:
-        if not session.input.audio_enabled:
-            return False
-        session.input.set_audio_enabled(False)
-        publisher.set_state(state.ASLEEP)
-        if announce:
-            session.say(SLEEP_LINE, add_to_chat_ctx=False)
-            publisher.add_line("atlas", SLEEP_LINE)
-        return True
+        return _sleep_session(session, publisher, announce=announce)
 
     def _engage() -> None:
         already = engagement.state == engagement_mod.ENGAGED
         engagement.wake()
+        addressing.mark_activity()
         session.input.set_audio_enabled(True)
         if not already:
             publisher.start_session()
@@ -454,18 +561,22 @@ async def entrypoint(ctx: JobContext) -> None:
 
     intents = _load_intents()
 
-    async def _handle_audio_turn(text: str) -> None:
-        handled = await _handle_reflex(
+    async def _audio_turn(text: str) -> None:
+        await _handle_audio_turn(
             text,
             intents=intents,
+            brain=services.brain,
             session=session,
             publisher=publisher,
-            dismiss=lambda: (engagement.dismiss(), _sleep()),
+            engagement=engagement,
+            addressing=addressing,
+            sleep=_sleep,
         )
-        if not handled:
-            await _submit(text)
 
-    agent.turn_handler = _handle_audio_turn
+    agent.turn_handler = _audio_turn
+    sleep_task = asyncio.create_task(_sleep_watch(engagement, _sleep))
+    _BG_TASKS.add(sleep_task)
+    sleep_task.add_done_callback(_BG_TASKS.discard)
 
     async def _quiet_shutdown() -> None:
         wakeword.shutting_down.set()

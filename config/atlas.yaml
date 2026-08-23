@@ -2,6 +2,10 @@ fast_model: claude-haiku-4-5
 google_account: daniel.zhang.t1@gmail.com
 turn_timeout_s: 12.0
 max_tokens: 400
+engagement_timeout_s: 120
+address_window_s: 30
+address_vocab: [email, emails, inbox, mail, calendar, file, files, folder, open, close, launch,
+  cancel, status, workers, job, jobs, research, summary, write, draft, remind, timer]
 
 job_store_path: "%LOCALAPPDATA%/Atlas/jobs.sqlite3"
 work_workspace_path: "%LOCALAPPDATA%/Atlas/jobs"
