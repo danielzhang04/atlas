@@ -1,5 +1,10 @@
 """Addressed-speech gate tests over a deterministic clock."""
-from worker.addressing import Addressing
+from pathlib import Path
+
+import pytest
+import yaml
+
+from worker.addressing import Addressing, vocabulary
 from worker.router import normalize
 
 
@@ -45,3 +50,38 @@ def test_mark_activity_rearms_the_window():
     gate.mark_activity()
     clock.value = 11
     assert gate.is_addressed(normalize("ordinary follow up"))
+
+
+def test_vocabulary_uses_only_the_explicit_address_terms():
+    cfg = {
+        "address_vocab": ["gmail", "inbox", "workers"],
+        "apps": {"browser": {"words": ["browser"]}},
+    }
+
+    assert vocabulary(cfg) == ["gmail", "inbox", "workers"]
+
+
+def test_production_vocabulary_contains_only_unambiguous_domain_words():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "atlas.yaml"
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert vocabulary(cfg) == [
+        "gmail",
+        "inbox",
+        "unread",
+        "calendar",
+        "youtube",
+        "notion",
+        "github",
+        "spotify",
+        "workers",
+    ]
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [None, "gmail", ["gmail", ""]],
+)
+def test_vocabulary_rejects_invalid_address_terms(configured):
+    with pytest.raises(ValueError, match="address_vocab"):
+        vocabulary({"address_vocab": configured})

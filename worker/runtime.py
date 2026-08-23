@@ -69,19 +69,37 @@ def build(
     builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
             paired_url=paired_url, files=files)
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}
-    google_account = str(cfg.get("google_account", ""))
+    google_account = _required_text(cfg, "google_account")
 
-    def on_server(name: str, current_registry: ToolRegistry) -> None:
+    async def google_not_connected(_arguments: dict) -> str:
+        raise RuntimeError("google not connected")
+
+    current_search = [google_not_connected]
+
+    async def search(arguments: dict) -> str:
+        return await current_search[0](arguments)
+
+    register_count_mail(registry, search)
+
+    def on_server(name: str, _current_registry: ToolRegistry) -> None:
         if name != "google":
             return
 
-        async def search(arguments: dict):
-            return await current_registry.call("google__search_gmail_messages", arguments)
+        async def connected_search(arguments: dict) -> str:
+            return await mcp.call_raw(
+                "google",
+                "search_gmail_messages",
+                arguments,
+            )
 
-        register_count_mail(current_registry, search, google_account)
+        current_search[0] = connected_search
 
-    mcp = McpServers(load_mcp_config(ATLAS / "config" / "mcp.yaml"),
-                     on_server=on_server, **mcp_kwargs)
+    mcp = McpServers(
+        load_mcp_config(ATLAS / "config" / "mcp.yaml"),
+        on_server=on_server,
+        account_values={"user_google_email": google_account},
+        **mcp_kwargs,
+    )
     if client is None:
         from anthropic import AsyncAnthropic
 
@@ -92,7 +110,6 @@ def build(
         registry,
         model=model,
         persona=persona,
-        google_account=google_account,
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
     )

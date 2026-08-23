@@ -9,7 +9,7 @@ from worker import runtime
 from worker.brain import Brain
 from worker.jobstore import JobStore
 from worker.mcp_client import McpServers
-from worker.tools import Tool, ToolRegistry
+from worker.tools import ToolRegistry
 from worker.work import WorkManager
 
 
@@ -50,7 +50,7 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
     launcher = FakeLauncher()
     built = runtime.build({
         "fast_model": "claude-test",
-        "google_account": "daniel@example.com",
+        "google_account": "owner@example.test",
         "job_store_path": ":memory:",
         "work_workspace_path": str(tmp_path / "jobs"),
         "turn_timeout_s": 3,
@@ -72,6 +72,7 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
             "open", "focus", "confirm", "cancel_pending",
             "launch_work", "work_status", "cancel_work", "close",
             "find_file", "open_file", "read_file",
+            "count_mail",
         ]
         assert built.mcp.status() == [{
             "name": "demo", "connected": False, "tools": 0, "error": None,
@@ -91,34 +92,39 @@ def test_build_requires_the_small_trusted_configuration(monkeypatch, tmp_path):
         raise AssertionError("missing composition settings must fail at the config boundary")
 
 
-def test_build_retains_a_google_connection_hook_for_count_mail(monkeypatch, tmp_path):
+def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_search(
+    monkeypatch,
+    tmp_path,
+):
     root = _root(tmp_path)
     monkeypatch.setattr(runtime, "ATLAS", root)
 
     class CapturingMcp:
         def __init__(self, _config, **kwargs):
             self.on_server = kwargs["on_server"]
+            self.account_values = kwargs["account_values"]
+            self.calls = []
+
+        async def call_raw(self, server, tool, arguments):
+            self.calls.append((server, tool, arguments))
+            return "Found 3 messages matching 'in:inbox':"
 
     monkeypatch.setattr(runtime, "McpServers", CapturingMcp)
     built = runtime.build({
         "fast_model": "claude-test",
-        "google_account": "daniel@example.com",
+        "google_account": "owner@example.test",
         "job_store_path": ":memory:",
         "work_workspace_path": str(tmp_path / "jobs"),
     }, client=FakeClient(), launcher=FakeLauncher())
 
-    async def search(_arguments):
-        return "Found 3 messages matching 'in:inbox':"
-
     try:
-        built.registry.register(Tool(
-            name="google__search_gmail_messages",
-            description="Search Gmail.",
-            input_schema={"type": "object", "properties": {}},
-            run=search,
-        ))
+        disconnected = asyncio.run(
+            built.registry.call("count_mail", {"query": "in:inbox"}),
+        )
+
+        assert disconnected.content == "Google isn't connected yet"
         built.mcp.on_server("demo", built.registry)
-        assert "count_mail" not in built.registry.names()
+        assert built.registry.names().count("count_mail") == 1
 
         built.mcp.on_server("google", built.registry)
         result = asyncio.run(built.registry.call("count_mail", {"query": "in:inbox"}))
@@ -127,6 +133,18 @@ def test_build_retains_a_google_connection_hook_for_count_mail(monkeypatch, tmp_
             "query": "in:inbox",
             "count": 3,
             "exact": True,
+        }
+        assert built.mcp.calls == [(
+            "google",
+            "search_gmail_messages",
+            {
+                "query": "in:inbox",
+                "page_size": 500,
+                "include_headers": False,
+            },
+        )]
+        assert built.mcp.account_values == {
+            "user_google_email": "owner@example.test",
         }
     finally:
         built.store.close()

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from worker import desktopapps
@@ -5,10 +7,12 @@ from worker.desktopapps import DesktopAppError, DesktopApps, native_launcher
 
 
 def test_default_profiles_match_configured_signed_desktop_apps():
-    assert set(desktopapps.DEFAULT_PROFILES) == {"vscode", "wt", "chrome"}
+    assert set(desktopapps.DEFAULT_PROFILES) == {"vscode", "wt", "chrome", "notepad"}
     assert desktopapps.DEFAULT_PROFILES["vscode"].executable == "Code.exe"
     assert desktopapps.DEFAULT_PROFILES["wt"].executable == "wt.exe"
+    assert desktopapps.DEFAULT_PROFILES["wt"].close_executable == "WindowsTerminal.exe"
     assert desktopapps.DEFAULT_PROFILES["chrome"].executable == "chrome.exe"
+    assert desktopapps.DEFAULT_PROFILES["notepad"].executable == "notepad.exe"
 
 
 def test_open_and_focus_delegate_only_allowlisted_profiles():
@@ -89,8 +93,51 @@ def test_close_profile_uses_allowlisted_image_without_forcing_termination(monkey
     assert "/F" not in captured["command"]
     assert captured["kwargs"]["shell"] is False
     assert result == {"application": "vscode", "closed": True}
-    with pytest.raises(DesktopAppError, match="allowlisted"):
-        desktopapps.close_profile("notepad", killer=killer)
+
+
+def test_close_terminal_targets_every_windows_terminal_window(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(desktopapps, "_taskkill_executable", lambda: "taskkill.exe")
+
+    class Result:
+        returncode = 0
+
+    def killer(command, **_kwargs):
+        captured["command"] = command
+        return Result()
+
+    desktopapps.close_profile("wt", killer=killer)
+
+    assert captured["command"] == ["taskkill.exe", "/IM", "WindowsTerminal.exe"]
+    assert desktopapps._EXPECTED_PUBLISHERS["WindowsTerminal.exe"] == "Microsoft Corporation"
+
+
+def test_notepad_profile_opens_and_closes_the_signed_windows_image(monkeypatch):
+    captured = {}
+    windows = Path("C:/Windows")
+    monkeypatch.setattr(desktopapps, "_windows_directory", lambda: windows)
+    monkeypatch.setattr(Path, "is_file", lambda self: self == windows / "System32/notepad.exe")
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: captured.update(path=path, publisher=publisher) or True,
+    )
+    monkeypatch.setattr(desktopapps.os, "name", "nt")
+    monkeypatch.setattr(desktopapps, "_taskkill_executable", lambda: "taskkill.exe")
+
+    class Result:
+        returncode = 0
+
+    def killer(command, **_kwargs):
+        captured["close_command"] = command
+        return Result()
+
+    resolved = desktopapps._resolve_executable("notepad.exe")
+    desktopapps.close_profile("notepad", killer=killer)
+
+    assert resolved == str((windows / "System32/notepad.exe").resolve())
+    assert captured["publisher"] == "Microsoft Windows"
+    assert captured["close_command"] == ["taskkill.exe", "/IM", "notepad.exe"]
 
 
 def test_native_launcher_uses_resolved_executable_without_shell(monkeypatch):

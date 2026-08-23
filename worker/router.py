@@ -8,7 +8,8 @@ import yaml
 
 __all__ = ["filler_variants", "load_intents", "normalize", "route"]
 
-_STRIP = re.compile(r"[^a-z0-9\s]")
+_NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]")
+_LEGACY_STRIP = re.compile(r"[^a-z0-9\s]")
 _WS = re.compile(r"\s+")
 _LEAD_FILLER = {
     "okay", "ok", "no", "yes", "yeah", "please", "atlas", "hey", "now", "just",
@@ -18,7 +19,12 @@ _TAIL_FILLER = {"please", "now", "atlas", "okay", "ok"}
 
 
 def normalize(value: str) -> str:
-    return _WS.sub(" ", _STRIP.sub("", value.casefold())).strip()
+    separated = _NON_ALPHANUMERIC.sub(" ", value.casefold())
+    return _WS.sub(" ", separated).strip()
+
+
+def _legacy_normalize(value: str) -> str:
+    return _WS.sub(" ", _LEGACY_STRIP.sub("", value.casefold())).strip()
 
 
 def filler_variants(normalized: str) -> list[str]:
@@ -49,13 +55,17 @@ def route(utterance: str, intents: dict) -> tuple[str, str | None]:
     if not isinstance(utterance, str) or not utterance.strip():
         raise ValueError("utterance is empty")
     variants = filler_variants(normalize(utterance))
+    for variant in filler_variants(_legacy_normalize(utterance)):
+        if variant not in variants:
+            variants.append(variant)
     for name, raw in (intents or {}).items():
         spec = raw if isinstance(raw, dict) else {}
-        phrases = {
-            normalize(phrase)
-            for phrase in spec.get("phrases", ())
-            if isinstance(phrase, str)
-        }
+        phrases = set()
+        for phrase in spec.get("phrases", ()):
+            if not isinstance(phrase, str):
+                continue
+            phrases.add(normalize(phrase))
+            phrases.add(_legacy_normalize(phrase))
         if any(value in phrases for value in variants):
             return "reflex", str(name)
         patterns = spec.get("patterns", ())

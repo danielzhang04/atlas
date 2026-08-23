@@ -368,6 +368,56 @@ def test_mcp_result_refuses_later_launch_work_without_launching():
     assert work.launches == []
 
 
+@pytest.mark.parametrize(
+    "content_tool",
+    ["google__read", "read_file", "find_file", "count_mail"],
+)
+def test_content_bearing_tools_taint_every_later_call_in_the_turn(content_tool):
+    registry = FakeRegistry(ToolResult("ok", "content"), ToolResult("ok", "done"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name=content_tool)], stop_reason="tool_use"),
+        FakeStream(content=[tool_block(name="lookup")], stop_reason="tool_use"),
+        FakeStream(["Done."], content=[text_block("Done.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Check, then act")) == ["Done."]
+    assert registry.taints == [False, True]
+
+
+def test_content_result_refuses_a_later_action_in_the_same_tool_batch():
+    closed = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__read",
+        lambda _arguments: return_value("external content"),
+    ))
+    builtin(
+        registry,
+        {"vscode": AppEntry(exe="vscode", words=("editor",))},
+        BrainWork(),
+        profile_closer=closed.append,
+    )
+    client = FakeClient(
+        FakeStream(
+            content=[
+                tool_block(call_id="read", name="google__read"),
+                tool_block(call_id="close", name="close", arguments={"app": "editor"}),
+            ],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Ask again."], content=[text_block("Ask again.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Read and close")) == ["Ask again."]
+    results = client.messages.calls[1]["messages"][-1]["content"]
+    assert results[1]["content"] == (
+        "refused after external content; ask Daniel again next turn"
+    )
+    assert closed == []
+
+
 def test_mcp_result_refuses_later_https_open_but_allows_configured_alias():
     opened = []
     registry = ToolRegistry()
@@ -503,22 +553,15 @@ def test_transcript_is_bounded():
         asyncio.run(collect(brain, "x" * 4_097))
 
 
-def test_google_account_rule_is_conditional():
-    no_account = Brain(FakeClient(), FakeRegistry(), model="fast", persona="")
-    account = Brain(
-        FakeClient(), FakeRegistry(), model="fast", persona="", google_account="daniel@example.com",
-    )
-
-    assert "user_google_email" not in no_account._system_text
-    assert "Google tools need user_google_email = daniel@example.com." in account._system_text
-
-
 def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "find_file" in BASE_SYSTEM
     assert "read_file" in BASE_SYSTEM
     assert "analysis that needs code or produces artifacts" in BASE_SYSTEM
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
+    assert "summarize, sum, or analyze a truncated read_file result" in BASE_SYSTEM
+    assert "closes every window" in BASE_SYSTEM
+    assert "user_google_email" not in BASE_SYSTEM
 
 
 def test_split_spoken_uses_sentence_newline_and_length_boundaries():

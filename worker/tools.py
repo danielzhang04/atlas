@@ -170,15 +170,24 @@ class ToolRegistry:
         name: str,
         arguments: Mapping[str, Any],
     ) -> bool:
-        if name in {"confirm", "launch_work"}:
+        if name in {
+            "confirm",
+            "launch_work",
+            "close",
+            "focus",
+            "open_file",
+            "cancel_work",
+        }:
             return True
         if name != "open":
             return False
         target = arguments.get("target")
-        return (
-            not isinstance(target, str)
-            or target.strip().casefold() not in self._open_aliases
-        )
+        if not isinstance(target, str):
+            return False
+        normalized = target.strip().casefold()
+        if normalized in self._open_aliases:
+            return False
+        return _direct_https(target.strip())
 
     async def confirm(self, confirm_id: str) -> ToolResult:
         pending = self._pending
@@ -301,7 +310,7 @@ def builtin(
 
     async def find_file(arguments: dict) -> list[dict]:
         query = _text_argument(arguments, "query", maximum=512)
-        return files.find(query)
+        return await asyncio.to_thread(files.find, query)
 
     async def open_file(arguments: dict) -> dict:
         path = _text_argument(arguments, "path", maximum=2048)
@@ -321,7 +330,7 @@ def builtin(
         }, launch_work),
         ("work_status", "List active and recent work.", {}, work_status),
         ("cancel_work", "Cancel a background job.", {"job_id": {"type": "string"}}, cancel_work),
-        ("close", "Gracefully close an allowlisted desktop app.", {
+        ("close", "Gracefully close every window of an allowlisted desktop app.", {
             "app": {"type": "string"},
         }, close),
     )
@@ -330,7 +339,7 @@ def builtin(
             ("find_file", "Find files and folders under configured roots.", {
                 "query": {"type": "string"},
             }, find_file),
-            ("open_file", "Open a file or folder under configured roots.", {
+            ("open_file", "Open an inert document or media file under configured roots.", {
                 "path": {"type": "string"},
             }, open_file),
             ("read_file", "Read bounded text from a file under configured roots.", {
@@ -345,36 +354,47 @@ def builtin(
         registry.register(Tool(name, description, schema, run))
 
 
-def register_count_mail(registry: ToolRegistry,
-                        search: Callable[[dict], Awaitable[ToolResult]],
-                        account: str) -> None:
+def register_count_mail(
+    registry: ToolRegistry,
+    search: Callable[[dict], Awaitable[str]],
+) -> None:
     """Register an exact, bounded counter over Gmail search result pages."""
 
     async def count_mail(arguments: dict) -> ToolResult | dict:
         query = _text_argument(arguments, "query", maximum=1024)
         total = 0
         page_token = None
+        seen_tokens: set[str] = set()
         for _page in range(4):
             search_arguments = {
-                "query": query, "user_google_email": account,
-                "page_size": 500, "include_headers": False,
+                "query": query,
+                "page_size": 500,
+                "include_headers": False,
             }
             if page_token is not None:
                 search_arguments["page_token"] = page_token
-            result = await search(search_arguments)
-            if result.status != "ok":
-                return ToolResult("error", result.content)
-            found = _FOUND_MESSAGES.search(result.content)
+            try:
+                content = await search(search_arguments)
+            except RuntimeError as exc:
+                if str(exc) == "google not connected":
+                    return ToolResult("error", "Google isn't connected yet")
+                raise
+            found = _FOUND_MESSAGES.search(content)
             if found is None:
                 return ToolResult("error", "unexpected mail search result")
             page_count = int(found.group(1))
             if page_count > 500:
                 return ToolResult("error", "unexpected mail search result")
             total += page_count
-            token_match = _NEXT_PAGE_TOKEN.search(result.content)
+            token_match = _NEXT_PAGE_TOKEN.search(content)
             page_token = token_match.group(1) if token_match is not None else None
             if page_token is None:
                 return {"query": query, "count": total, "exact": True}
+            if page_count < 500:
+                return ToolResult("error", "unexpected mail search result")
+            if page_token in seen_tokens:
+                return {"query": query, "count": total, "exact": False}
+            seen_tokens.add(page_token)
         return {"query": query, "count": total, "exact": page_token is None}
 
     schema = {
