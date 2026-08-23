@@ -269,7 +269,10 @@ class Brain:
                     if confirmation_intent == "confirm":
                         name = "confirm"
                         result = await self.registry.confirm(pending.confirm_id)
-                        host_line = f"Done — {pending.name} executed."
+                        if result.status == "ok":
+                            host_line = f"Done — {pending.name} executed."
+                        else:
+                            host_line = f"That didn't go through: {result.content[:160]}."
                     else:
                         name = "cancel_pending"
                         result = self.registry.cancel_pending()
@@ -284,12 +287,35 @@ class Brain:
                             f"outcome without changing its meaning: {host_line}"
                         ),
                     }]
+                    narration_messages = messages
+                    if confirmation_intent == "confirm":
+                        narration_messages = [
+                            *messages,
+                            {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": pending.confirm_id,
+                                    "name": pending.name,
+                                    "input": pending.arguments,
+                                }],
+                            },
+                            {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": pending.confirm_id,
+                                    "content": result.content,
+                                    "is_error": result.status == "error",
+                                }],
+                            },
+                        ]
                     async with asyncio.timeout(self.turn_timeout_s):
                         async with self.client.messages.stream(
                             model=self.model,
                             max_tokens=self.max_tokens,
                             system=narration_system,
-                            messages=messages,
+                            messages=narration_messages,
                             tools=tools,
                             tool_choice={"type": "none"},
                         ) as stream:

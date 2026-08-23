@@ -64,7 +64,9 @@ def test_instant_call_reports_success_exception_and_timeout():
     result = _call(registry, "ok", {})
     assert result.status == "ok"
     assert json.loads(result.content) == {"answer": 42}
-    assert _call(registry, "fail", {}).content == "RuntimeError"
+    failed = _call(registry, "fail", {})
+    assert failed.status == "error"
+    assert failed.content == "RuntimeError"
     timeout = _call(registry, "slow", {})
     assert timeout.status == "error"
     assert timeout.content == "TimeoutError"

@@ -46,6 +46,7 @@ class FakeLauncher:
         self.log_calls = []
         self.status_calls = []
         self.cancel_calls = []
+        self.poll_calls = []
 
     def launch(self, **kwargs):
         self.launch_calls.append(kwargs)
@@ -61,11 +62,13 @@ class FakeLauncher:
         return self.session_id
 
     def logs(self, session_id, *, cwd):
+        self.poll_calls.append("logs")
         self.log_calls.append((session_id, cwd))
         index = min(len(self.log_calls) - 1, len(self.log_frames) - 1)
         return list(self.log_frames[index])
 
     def status(self, session_id, *, cwd):
+        self.poll_calls.append("status")
         self.status_calls.append((session_id, cwd))
         return self.status_value
 
@@ -302,13 +305,37 @@ def test_done_without_result_frame_records_result_missing(tmp_path):
     store = make_store()
     job = make_running_job(store)
     launcher = FakeLauncher(log_frames=[["ordinary output"]], status="done")
-    manager = WorkManager(store, launcher, tmp_path)
+    sleeps = []
+    manager = WorkManager(store, launcher, tmp_path, sleep=sleeps.append)
 
     manager._poll(job)
 
     terminal = store.get(job.job_id)
     assert terminal.state is JobState.FAILED
     assert terminal.error == "result_missing"
+    assert launcher.poll_calls[:2] == ["status", "logs"]
+    assert len(launcher.log_calls) == 4
+    assert sleeps == [2.0, 2.0, 2.0]
+
+
+def test_done_retries_logs_until_result_frame_arrives(tmp_path):
+    store = make_store()
+    job = make_running_job(store)
+    launcher = FakeLauncher(status="done")
+    sleeps = []
+    manager = WorkManager(store, launcher, tmp_path, sleep=sleeps.append)
+    launcher.log_frames = [
+        ["ordinary output"],
+        ["ordinary output", result_frame(manager, job.job_id, summary="finished")],
+    ]
+
+    manager._poll(job)
+
+    terminal = store.get(job.job_id)
+    assert terminal.state is JobState.SUCCEEDED
+    assert terminal.summary == "finished"
+    assert launcher.poll_calls == ["status", "logs", "logs"]
+    assert sleeps == [2.0]
 
 
 def test_needs_input_session_records_needs_input_failure(tmp_path):

@@ -37,6 +37,7 @@ except ModuleNotFoundError:
 
 import worker.mcp_client as mcp_client
 from worker.mcp_client import McpServers, load_mcp_config, policy_for
+from worker.tools import ToolRegistry
 
 
 class FakeRegistry:
@@ -241,6 +242,51 @@ def test_connect_registers_schema_policy_and_bounded_concatenated_text():
     assert content.endswith("…[truncated]")
     assert "\x00" not in content and "\x1f" not in content
     assert status == [{"name": "google", "connected": True, "tools": 3, "error": None}]
+
+
+@pytest.mark.parametrize(
+    ("is_error", "text"),
+    [
+        (True, "API error " + "x" * 5_000),
+        (False, "Error calling tool 'draft_gmail_message': HttpError 400"),
+    ],
+)
+def test_mirrored_tool_raises_bounded_runtime_error_for_mcp_errors(is_error, text):
+    class FakeErrorSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=text)],
+                isError=is_error,
+            )
+
+    servers = McpServers({"servers": {}})
+    remote_tool = SimpleNamespace(
+        name="draft_gmail_message",
+        description="Draft a Gmail message.",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    server_config = {"instant": ["draft_gmail_message"]}
+    tool = servers._mirror_tool(
+        "google",
+        server_config,
+        {},
+        FakeErrorSession(),
+        remote_tool,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(tool.run({}))
+
+    message = str(raised.value)
+    assert message.startswith(text[:40])
+    assert len(message) <= 4_096
+    if len(text) > 4_096:
+        assert message.endswith("…[truncated]")
+
+    registry = ToolRegistry()
+    registry.register(tool)
+    result = asyncio.run(registry.call(tool.name, {}))
+    assert result.status == "error"
 
 
 def test_account_parameter_is_hidden_and_host_injected_for_mirrored_and_raw_calls():

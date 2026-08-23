@@ -7,6 +7,7 @@ import logging
 import math
 from pathlib import Path
 import threading
+import time
 from typing import Callable, Mapping
 from uuid import uuid4
 
@@ -26,11 +27,13 @@ class WorkManager:
         *,
         poll_s: float = 2.0,
         folders: Mapping[str, Path] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.store = store
         self.launcher = launcher
         self.workspace_root = Path(workspace_root)
         self.poll_s = float(poll_s)
+        self._sleep = sleep
         self.folders = {
             str(name): Path(path)
             for name, path in (folders or {}).items()
@@ -227,9 +230,9 @@ class WorkManager:
             return
 
         job_dir = self.workspace_root / job.job_id
+        session_status = self.launcher.status(job.session_id, cwd=job_dir)
         lines = self.launcher.logs(job.session_id, cwd=job_dir)
         self._append_new_lines(job.job_id, lines)
-        session_status = self.launcher.status(job.session_id, cwd=job_dir)
         if session_status in {"running", "unknown"}:
             return
         if session_status == "needs_input":
@@ -256,6 +259,17 @@ class WorkManager:
             nonce=self._nonce(job.job_id),
             job_id=job.job_id,
         )
+        for _attempt in range(3):
+            if result is not None:
+                break
+            self._sleep(2.0)
+            lines = self.launcher.logs(job.session_id, cwd=job_dir)
+            self._append_new_lines(job.job_id, lines)
+            result = parse_result(
+                lines,
+                nonce=self._nonce(job.job_id),
+                job_id=job.job_id,
+            )
         if result is None:
             terminal = self._finish_running(
                 job.job_id,

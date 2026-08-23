@@ -301,11 +301,69 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
     ]
     request = client.messages.calls[0]
     assert request["tool_choice"] == {"type": "none"}
-    assert request["messages"] == [{
-        "role": "user",
-        "content": "yes go ahead and create the draft",
-    }]
+    assert request["messages"] == [
+        {
+            "role": "user",
+            "content": "yes go ahead and create the draft",
+        },
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "confirm-123",
+                "name": "google__draft_gmail_message",
+                "input": {"recipient": "daniel@example.test"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "confirm-123",
+                "content": "sent",
+                "is_error": False,
+            }],
+        },
+    ]
     assert "Done — google__draft_gmail_message executed." in request["system"][-1]["text"]
+
+
+def test_confirm_error_is_persisted_and_narrated_as_a_real_tool_error():
+    error = "API error: HttpError 400 " + "x" * 180
+    registry = FakeRegistry(ToolResult("error", error))
+    registry._pending = PendingAction(
+        confirm_id="confirm-error",
+        name="google__draft_gmail_message",
+        arguments={"recipient": "daniel@example.test"},
+        summary="draft summary",
+        expires=float("inf"),
+    )
+    client = FakeClient(FakeStream(
+        ["The draft failed."],
+        content=[text_block("The draft failed.")],
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    result = asyncio.run(collect(brain, "confirm"))
+
+    host_line = f"That didn't go through: {error[:160]}."
+    assert result == ["The draft failed."]
+    assert registry.pending is None
+    assert brain._history == [
+        {"role": "user", "content": "confirm"},
+        {"role": "assistant", "content": host_line},
+    ]
+    request = client.messages.calls[0]
+    assert host_line in request["system"][-1]["text"]
+    assert request["messages"][-1] == {
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "confirm-error",
+            "content": error,
+            "is_error": True,
+        }],
+    }
 
 
 def test_bare_confirm_executes_pending():

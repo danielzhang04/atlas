@@ -280,7 +280,12 @@ class McpServers:
             for block in result.content
             if getattr(block, "type", None) == "text"
         )
-        return _clean_text(text)
+        clean = _clean_text(text)
+        is_error = bool(getattr(result, "isError", False))
+        if is_error or clean.startswith("Error calling tool"):
+            message = _bounded_text(clean) or "MCP tool call failed"
+            raise RuntimeError(message)
+        return clean
 
     def status(self) -> list[dict]:
         return [dict(value) for value in self._status.values()]
