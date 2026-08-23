@@ -1,6 +1,7 @@
 """System-default audio device probes, polling, and stream followers."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -131,6 +132,38 @@ def test_watcher_treats_first_endpoint_after_missing_initial_probe_as_reopen():
     assert calls == ["Headset microphone"]
 
 
+def test_watcher_reopens_both_directions_after_both_initial_probes_are_missing():
+    input_sequence = [None, ("input-B", "Headset microphone")]
+    output_sequence = [None, ("output-B", "Headphones")]
+    calls = []
+    fired = threading.Event()
+
+    def probe(sequence):
+        return sequence.pop(0) if sequence else None
+
+    def changed(direction, name):
+        calls.append((direction, name))
+        if len(calls) == 2:
+            fired.set()
+
+    watcher = devicewatch.DeviceWatcher(
+        input_probe=lambda: probe(input_sequence),
+        output_probe=lambda: probe(output_sequence),
+        on_input_change=lambda name: changed("input", name),
+        on_output_change=lambda name: changed("output", name),
+        initial_ids={"input": None, "output": None},
+        period_s=0.01,
+    )
+    watcher.start()
+    assert fired.wait(timeout=2.0)
+    watcher.stop()
+
+    assert calls == [
+        ("input", "Headset microphone"),
+        ("output", "Headphones"),
+    ]
+
+
 def test_watcher_survives_probe_exception():
     sequence = ["boom", ("id-A", "Realtek"), ("id-B", "Px7")]
     calls = []
@@ -211,6 +244,12 @@ def test_livekit_capture_rate_is_read_from_installed_console_module():
     module = SimpleNamespace(SAMPLE_RATE=24_000)
 
     assert devicewatch.livekit_capture_rate(module=module) == 24_000
+
+
+def test_livekit_capture_rate_is_extracted_from_installed_console_code():
+    from livekit.agents.cli import _legacy
+
+    assert devicewatch.livekit_capture_rate(module=_legacy) == 24_000
 
 
 def test_output_follower_opens_resolved_device():
@@ -588,3 +627,34 @@ def test_audio_failure_publishes_error_before_requesting_restart():
         ),
         ("restart", "wake input unavailable"),
     ]
+
+
+def test_audio_restart_preserves_jobs_while_normal_worker_shutdown_cancels_them(
+    monkeypatch,
+):
+    from worker import app
+
+    monkeypatch.setattr(app, "_worker_exit_code", app.RESTART_EXIT_CODE)
+    assert not app._should_cancel_active_jobs(False)
+
+    monkeypatch.setattr(app, "_worker_exit_code", 0)
+    assert app._should_cancel_active_jobs(False)
+    assert not app._should_cancel_active_jobs(True)
+
+
+def test_audio_restart_flushes_job_store_before_stopping_state_server():
+    from worker import app
+
+    events = []
+
+    class Store:
+        def close(self):
+            events.append("store flushed")
+
+    class Server:
+        async def stop(self):
+            events.append("state server stopped")
+
+    asyncio.run(app._flush_store_and_stop_state_server(Store(), Server()))
+
+    assert events == ["store flushed", "state server stopped"]

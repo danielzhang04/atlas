@@ -1,6 +1,7 @@
 """Expose bounded local-file operations within configured roots."""
 from __future__ import annotations
 
+import asyncio
 import codecs
 import heapq
 import logging
@@ -81,6 +82,18 @@ _TEXT_EXTENSIONS = frozenset({
 })
 _UTF16_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_CLOUD_REPARSE_MASK = 0xFFFF0000
+_CLOUD_REPARSE_FAMILY = 0x90000000
+_CLOUD_PLACEHOLDER_ERROR = "file not available yet (cloud placeholder)"
+_FILE_DEADLINE_S = 5.0
+
+
+def _is_cloud_files_tag(value) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value & _CLOUD_REPARSE_MASK == _CLOUD_REPARSE_FAMILY
+    )
 
 
 class LocalFiles:
@@ -162,7 +175,11 @@ class LocalFiles:
             except OSError as exc:
                 raise ValueError("outside roots") from exc
             attributes = getattr(item_stat, "st_file_attributes", 0)
-            if attributes & _REPARSE_POINT or stat.S_ISLNK(item_stat.st_mode):
+            is_link = stat.S_ISLNK(item_stat.st_mode)
+            is_reparse = bool(attributes & _REPARSE_POINT)
+            reparse_tag = getattr(item_stat, "st_reparse_tag", None)
+            cloud_placeholder = is_reparse and _is_cloud_files_tag(reparse_tag)
+            if is_link or (is_reparse and not cloud_placeholder):
                 raise ValueError("reparse points are not allowed")
 
     def find(self, query: str, limit: int = _MAX_RESULTS,
@@ -300,6 +317,26 @@ class LocalFiles:
             "text": text,
             "truncated": truncated,
         }
+
+    async def open_file(self, path: str | Path) -> dict:
+        """Open a file off-loop, bounding a possible cloud hydration stall."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.open, path),
+                timeout=_FILE_DEADLINE_S,
+            )
+        except TimeoutError:
+            return {"error": _CLOUD_PLACEHOLDER_ERROR}
+
+    async def read_file(self, path: str | Path, max_bytes: int = 16_384) -> dict:
+        """Read a file off-loop, bounding a possible cloud hydration stall."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.read, path, max_bytes),
+                timeout=_FILE_DEADLINE_S,
+            )
+        except TimeoutError:
+            return {"error": _CLOUD_PLACEHOLDER_ERROR}
 
 
 def _decode_text(raw: bytes, *, truncated: bool) -> str:

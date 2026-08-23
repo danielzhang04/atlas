@@ -5,6 +5,7 @@ frame in, "wake"/"spike"/None out. These tests pin the ghost-wake fix: single-fr
 crossings must NOT wake Atlas, sustained crossings must, and one phrase fires exactly one wake.
 """
 import numpy as np
+import pytest
 
 from worker import wakeword
 from worker.wakeword import PATIENCE, REFRACTORY_S, THRESHOLD, WakeGate, normalized_audio_energy
@@ -121,13 +122,14 @@ def test_audio_bands_are_log_spaced_bounded_and_smoothed():
 
 
 class FakeWakeModel:
-    def __init__(self, scores=None):
+    def __init__(self, scores=None, key="hey_test"):
         self.frames = []
         self.scores = iter(scores or [])
+        self.key = key
 
     def predict(self, frame):
         self.frames.append(frame.copy())
-        return {"hey_test": next(self.scores, 0.1)}
+        return {self.key: next(self.scores, 0.1)}
 
 
 class FakeInputStream:
@@ -240,3 +242,91 @@ def test_listen_detects_a_sustained_synthetic_hey_atlas_score_shape():
     )
 
     assert wakes == ["hey atlas"]
+
+
+@pytest.mark.parametrize("failure_phase", ["open", "read"])
+def test_listen_retries_failed_open_or_read_three_times_then_reports_failure(
+    failure_phase,
+):
+    sd = FakeSoundDevice()
+    attempts = []
+    waits = []
+    failures = []
+
+    class FailingStream(FakeInputStream):
+        def __enter__(self):
+            if failure_phase == "open":
+                raise RuntimeError("open failed")
+            return self
+
+        def read(self, count):
+            raise RuntimeError("read failed")
+
+    def failing_stream(**options):
+        attempts.append(options)
+        return FailingStream(options)
+
+    sd.InputStream = failing_stream
+    wakeword.listen(
+        lambda: None,
+        model_name="hey_test",
+        device="follow",
+        sd_module=sd,
+        model_loader=lambda _name: (FakeWakeModel(), "hey_test"),
+        on_failure=failures.append,
+        wait=lambda delay: waits.append(delay) or False,
+    )
+
+    assert len(attempts) == 4
+    assert waits == [0.5, 1.0, 2.0]
+    assert failures == ["wake input unavailable"]
+
+
+def test_configured_wake_model_failure_uses_hey_jarvis_and_publishes_fallback():
+    sd = FakeSoundDevice()
+    fallback = FakeWakeModel(key="hey_jarvis")
+    loads = []
+    published = []
+    failures = []
+
+    def load(name):
+        loads.append(name)
+        if name == "hey_atlas":
+            raise RuntimeError("custom model missing")
+        return fallback, "hey_jarvis"
+
+    wakeword.listen(
+        lambda: None,
+        model_name="hey_atlas",
+        device="follow",
+        sd_module=sd,
+        model_loader=load,
+        max_frames=1,
+        on_model=published.append,
+        on_failure=failures.append,
+    )
+
+    assert loads == ["hey_atlas", "hey_jarvis"]
+    assert published == ["hey_jarvis (fallback)"]
+    assert failures == []
+    assert len(fallback.frames) == 1
+
+
+def test_configured_and_fallback_wake_models_failing_reports_model_unavailable():
+    loads = []
+    failures = []
+
+    def fail_load(name):
+        loads.append(name)
+        raise RuntimeError("model unavailable")
+
+    wakeword.listen(
+        lambda: None,
+        model_name="hey_atlas",
+        sd_module=FakeSoundDevice(),
+        model_loader=fail_load,
+        on_failure=failures.append,
+    )
+
+    assert loads == ["hey_atlas", "hey_jarvis"]
+    assert failures == ["wake model unavailable"]

@@ -176,14 +176,25 @@ class ClaudeLauncher:
     def available(self) -> bool:
         return self.executable is not None
 
-    def _run(self, argv: tuple[str, ...], cwd: Path, timeout: float = 15.0):
+    def _run(
+        self,
+        argv: tuple[str, ...],
+        cwd: Path,
+        timeout: float = 15.0,
+        *,
+        creationflags: int | None = None,
+    ):
         try:
+            process_options = {}
+            if creationflags is not None:
+                process_options["creationflags"] = creationflags
             if hasattr(self.runner, "run"):
                 return self.runner.run(
                     argv,
                     cwd=cwd,
                     env=self.environment,
                     timeout=timeout,
+                    **process_options,
                 )
             if self.runner is subprocess.run:
                 return self.runner(
@@ -196,12 +207,14 @@ class ClaudeLauncher:
                     encoding="utf-8",
                     errors="replace",
                     check=False,
+                    **process_options,
                 )
             return self.runner(
                 argv,
                 cwd=cwd,
                 env=self.environment,
                 timeout=timeout,
+                **process_options,
             )
         except (OSError, subprocess.SubprocessError):
             raise LauncherError("Claude Code command failed") from None
@@ -234,7 +247,13 @@ class ClaudeLauncher:
             name,
             prompt,
         )
-        result = self._run(argv, cwd, 60.0)
+        creationflags = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        result = self._run(
+            argv,
+            cwd,
+            60.0,
+            creationflags=creationflags,
+        )
         if result.returncode != 0:
             raise LauncherError("Claude Code launch failed")
         background_id = _parse_background_session_id(result.stdout)

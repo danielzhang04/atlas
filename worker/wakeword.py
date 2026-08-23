@@ -46,6 +46,8 @@ REFRACTORY_S = 3.0     # one wake per phrase, not one per 80ms frame while score
 BAND_COUNT = 24
 BAND_ATTACK = 0.45
 BAND_DECAY = 0.18
+FALLBACK_MODEL = "hey_jarvis"
+INPUT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
 # Set by app.py's shutdown callback so the wake thread's error path stays quiet on Ctrl+C.
 # A mic/model failure MID-RUN still logs CRITICAL (Atlas going silently DEAF is the real
@@ -280,28 +282,51 @@ def listen(
     model_loader=load_model,
     clock=None,
     max_frames: int | None = None,
+    on_failure: Callable[[str], None] | None = None,
+    on_model: Callable[[str], None] | None = None,
+    wait: Callable[[float], bool] | None = None,
 ) -> None:
     """Read native-rate 80 ms frames, resample to 16 kHz, and score wake audio.
 
     Follow mode starts on the current system default. ``device_switch`` changes cause the
     active stream to close after at most one frame and reopen at the new device's native rate.
     """
-    try:
-        if sd_module is None:
-            import sounddevice as sd
-        else:
-            sd = sd_module
-        if clock is None:
-            import time as _time
+    failure = on_failure or (lambda reason: None)
+    if sd_module is None:
+        import sounddevice as sd
+    else:
+        sd = sd_module
+    if clock is None:
+        import time as _time
 
-            clock = _time.monotonic
+        clock = _time.monotonic
+    wait_for_retry = wait or shutting_down.wait
+    try:
         model, predict_key = model_loader(model_name)
-        initial_device = resolve_input_device(device)
-        switch = device_switch or InputDeviceSwitch(initial_device)
-        gate = WakeGate(threshold=threshold, patience=patience)
-        smoothed_bands = [0.0] * BAND_COUNT
-        processed = 0
-        while True:
+    except Exception:
+        logger.error("configured wake model %r failed to load", model_name, exc_info=True)
+        try:
+            model, predict_key = model_loader(FALLBACK_MODEL)
+        except Exception:
+            logger.critical("wake model unavailable", exc_info=True)
+            failure("wake model unavailable")
+            return
+        fallback_name = f"{FALLBACK_MODEL} (fallback)"
+        logger.warning("using fallback wake model %s", FALLBACK_MODEL)
+        if on_model is not None:
+            try:
+                on_model(fallback_name)
+            except Exception:
+                logger.exception("wake-model state observer failed")
+
+    initial_device = resolve_input_device(device)
+    switch = device_switch or InputDeviceSwitch(initial_device)
+    gate = WakeGate(threshold=threshold, patience=patience)
+    smoothed_bands = [0.0] * BAND_COUNT
+    processed = 0
+    consecutive_failures = 0
+    while True:
+        try:
             selected_device, generation = switch.current()
             query_device = selected_device
             if query_device is None:
@@ -354,15 +379,28 @@ def listen(
                             gate.spike_frames,
                             gate.patience,
                         )
+                    consecutive_failures = 0
                     processed += 1
                     if max_frames is not None and processed >= max_frames:
                         return
-    except Exception:
-        if shutting_down.is_set():
-            logger.info("wake listener stopped during shutdown")
+        except Exception:
+            if shutting_down.is_set():
+                logger.info("wake listener stopped during shutdown")
+                return
+            if consecutive_failures < len(INPUT_RETRY_DELAYS):
+                delay = INPUT_RETRY_DELAYS[consecutive_failures]
+                consecutive_failures += 1
+                logger.warning(
+                    "wake input failed; retrying in %.1f seconds (%d/%d)",
+                    delay,
+                    consecutive_failures,
+                    len(INPUT_RETRY_DELAYS),
+                    exc_info=True,
+                )
+                if wait_for_retry(delay) or shutting_down.is_set():
+                    logger.info("wake listener stopped during shutdown")
+                    return
+                continue
+            logger.critical("wake input unavailable after retries", exc_info=True)
+            failure("wake input unavailable")
             return
-        logger.critical(
-            "wake-word listener died — Atlas is DEAF until the worker restarts "
-            "(likely mic device conflict or model load failure)",
-            exc_info=True,
-        )
