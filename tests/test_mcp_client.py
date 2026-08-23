@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import ModuleType
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -77,6 +78,75 @@ def test_stdio_session_discards_child_stderr(monkeypatch):
     asyncio.run(scenario())
     assert seen["spec"].command == "node"
     assert seen["errlog"] is subprocess.DEVNULL
+
+
+def test_default_stdio_session_records_pid_and_close_force_kills_tree(monkeypatch):
+    events = []
+
+    class FakeStdioClient:
+        process = SimpleNamespace(pid=2468)
+
+        async def __aenter__(self):
+            events.append("stdio enter")
+            return "read", "write"
+
+        async def __aexit__(self, *_args):
+            events.append("stdio exit")
+            return False
+
+    class FakeClientSession:
+        def __init__(self, read_stream, write_stream):
+            assert (read_stream, write_stream) == ("read", "write")
+
+        async def __aenter__(self):
+            events.append("session enter")
+            return self
+
+        async def __aexit__(self, *_args):
+            events.append("session exit")
+            return False
+
+        async def initialize(self):
+            events.append("initialize")
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    def fake_stdio_client(spec, *, errlog):
+        assert spec.command == "unused"
+        assert errlog is subprocess.DEVNULL
+        return FakeStdioClient()
+
+    monkeypatch.setattr(mcp_client, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(mcp_client, "ClientSession", FakeClientSession)
+
+    async def scenario():
+        kills = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            killer=lambda command, **kwargs: kills.append((command, kwargs)),
+        )
+        await servers.connect(FakeRegistry())
+        await servers.close()
+        await servers.close()
+        return kills
+
+    kills = asyncio.run(scenario())
+
+    assert kills == [(
+        ["taskkill", "/T", "/F", "/PID", "2468"],
+        {"check": False},
+    )]
+    assert events == [
+        "stdio enter",
+        "session enter",
+        "initialize",
+        "session exit",
+        "stdio exit",
+    ]
 
 
 def _server() -> FastMCP:
@@ -386,6 +456,48 @@ def test_connect_timeout_is_reported_by_class_name():
     assert asyncio.run(scenario()) == [
         {"name": "slow", "connected": False, "tools": 0, "error": "TimeoutError"},
     ]
+
+
+def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
+    events = []
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        events.append("entered")
+        try:
+            yield SimpleNamespace(
+                list_tools=lambda: asyncio.sleep(30),
+            )
+        finally:
+            events.append("closed")
+
+    async def scenario():
+        kills = []
+        servers = McpServers(
+            {
+                "servers": {"slow": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 60},
+            },
+            session_factory=factory,
+            killer=lambda command, **kwargs: kills.append((command, kwargs)),
+        )
+        servers._server_pids["slow"] = 1357
+        task = asyncio.create_task(servers.connect(FakeRegistry()))
+        while events != ["entered"]:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await servers.close()
+        return kills
+
+    kills = asyncio.run(scenario())
+
+    assert kills == [(
+        ["taskkill", "/T", "/F", "/PID", "1357"],
+        {"check": False},
+    )]
+    assert events == ["entered", "closed"]
 
 
 def test_claude_config_resolves_child_spec_without_leaking_env(tmp_path, caplog):

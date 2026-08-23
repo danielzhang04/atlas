@@ -8,7 +8,7 @@ import sys
 
 import yaml
 
-from worker import envload, runtime
+from worker import envload, jobobject, runtime
 from worker.jobstore import JobState
 
 __all__ = ["main", "run"]
@@ -59,6 +59,7 @@ async def run(utterance: str, *, no_mcp: bool = False) -> None:
 
 
 def main() -> int:
+    jobobject.assign_current_process()
     args = _arguments()
     asyncio.run(run(args.utterance, no_mcp=args.no_mcp))
     return 0

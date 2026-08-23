@@ -49,6 +49,49 @@ def test_find_is_case_insensitive_newest_first_limited_and_skips_unsafe_trees(tm
     assert results[0]["modified"] == 20
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "atlas voice layer design spec",
+        "voice layer",
+        "atlas-voice",
+    ],
+)
+def test_find_normalizes_realistic_design_spec_names_and_queries(tmp_path, query):
+    root = tmp_path / "kb"
+    spec = root / "docs" / "specs" / "2026-07-15-atlas-voice-layer-design.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("design", encoding="utf-8")
+
+    results = LocalFiles([root], opener=lambda _path: None).find(query)
+
+    assert [item["path"] for item in results] == [str(spec.resolve())]
+
+
+def test_find_falls_back_to_half_the_tokens_ranked_by_matches_then_mtime(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    strongest = root / "atlas-voice-layer-notes.md"
+    newer_weaker = root / "atlas-voice-overview.md"
+    older_weaker = root / "layer-design-outline.md"
+    strongest.write_text("three", encoding="utf-8")
+    newer_weaker.write_text("two", encoding="utf-8")
+    older_weaker.write_text("two", encoding="utf-8")
+    os.utime(strongest, (10, 10))
+    os.utime(newer_weaker, (30, 30))
+    os.utime(older_weaker, (20, 20))
+
+    results = LocalFiles([root], opener=lambda _path: None).find(
+        "atlas voice layer design",
+    )
+
+    assert [item["path"] for item in results] == [
+        str(strongest.resolve()),
+        str(newer_weaker.resolve()),
+        str(older_weaker.resolve()),
+    ]
+
+
 def test_find_stops_when_the_injected_clock_exhausts_the_budget(tmp_path):
     root = tmp_path / "root"
     root.mkdir()

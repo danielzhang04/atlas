@@ -19,7 +19,7 @@ from worker import addressing as addressing_mod
 from worker import brain as brain_mod
 from worker import devicewatch
 from worker import engagement as engagement_mod
-from worker import envload, mcp_client as mcp_client_mod, router, runtime, sanitize, state, stateserver
+from worker import envload, jobobject, mcp_client as mcp_client_mod, router, runtime, sanitize, state, stateserver
 from worker import tools as tools_mod
 from worker import wakeword, work as work_mod
 from worker.jobstore import JobState
@@ -506,6 +506,7 @@ def _emit_ui_url(authorizer: stateserver.PairingAuthorizer, port: int) -> str:
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    jobobject.assign_current_process()
     envload.load_private_environment()
     cfg = _cfg()
     authorizer = stateserver.PairingAuthorizer()
@@ -718,6 +719,7 @@ def _console_output_args(
 
 
 def main() -> int:
+    jobobject.assign_current_process()
     try:
         sys.argv.extend(_console_output_args(sys.argv, _cfg()))
     except Exception:

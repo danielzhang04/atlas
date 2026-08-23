@@ -18,11 +18,12 @@ from urllib.request import Request, urlopen
 
 import webview
 
+from worker import jobobject
+
 
 __all__ = [
     "ATLAS",
     "confirm_close",
-    "create_kill_on_close_job",
     "main",
     "read_ui_url",
     "run",
@@ -33,8 +34,6 @@ ATLAS = Path(__file__).resolve().parents[1]
 logger = logging.getLogger("atlas.desktop")
 ACTIVE_JOB_STATES = {"queued", "launching", "running"}
 ERROR_ALREADY_EXISTS = 183
-JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 MUTEX_NAME = "Local\\AtlasDesktop"
 STOPPED_HTML = """<!doctype html>
 <html lang="en">
@@ -54,55 +53,8 @@ STOPPED_HTML = """<!doctype html>
 </html>"""
 
 
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_ulonglong),
-        ("WriteOperationCount", ctypes.c_ulonglong),
-        ("OtherOperationCount", ctypes.c_ulonglong),
-        ("ReadTransferCount", ctypes.c_ulonglong),
-        ("WriteTransferCount", ctypes.c_ulonglong),
-        ("OtherTransferCount", ctypes.c_ulonglong),
-    ]
-
-
-class _BasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_longlong),
-        ("PerJobUserTimeLimit", ctypes.c_longlong),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _ExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _BasicLimitInformation),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
 def _kernel32_functions():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    kernel32.SetInformationJobObject.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    kernel32.SetInformationJobObject.restype = wintypes.BOOL
-    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.GetLastError.argtypes = []
@@ -120,53 +72,6 @@ def _close_handle(handle, *, close_handle=None) -> None:
         closer(handle)
     except Exception:
         logger.warning("could not close a Windows launcher handle")
-
-
-def create_kill_on_close_job(
-    proc,
-    *,
-    platform: str = os.name,
-    create_job=None,
-    set_information=None,
-    assign_process=None,
-    close_handle=None,
-):
-    """Assign the worker to a job whose tree dies with the launcher handle."""
-    if platform != "nt":
-        logger.warning("Windows Job Objects are unavailable on this platform")
-        return None
-    try:
-        if create_job is None or set_information is None or assign_process is None:
-            kernel32 = _kernel32_functions()
-            create_job = create_job or kernel32.CreateJobObjectW
-            set_information = set_information or kernel32.SetInformationJobObject
-            assign_process = assign_process or kernel32.AssignProcessToJobObject
-            close_handle = close_handle or kernel32.CloseHandle
-        job_handle = create_job(None, None)
-        if not job_handle:
-            raise OSError("CreateJobObjectW failed")
-        information = _ExtendedLimitInformation()
-        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        configured = set_information(
-            job_handle,
-            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-            ctypes.byref(information),
-            ctypes.sizeof(information),
-        )
-        if not configured:
-            raise OSError("SetInformationJobObject failed")
-        process_handle = getattr(proc, "_handle", None)
-        if not process_handle or not assign_process(job_handle, process_handle):
-            raise OSError("AssignProcessToJobObject failed")
-        return job_handle
-    except Exception:
-        if "job_handle" in locals() and job_handle:
-            try:
-                (close_handle or _kernel32_functions().CloseHandle)(job_handle)
-            except Exception:
-                pass
-        logger.warning("could not protect the worker with a kill-on-close Job Object")
-        return None
 
 
 def _create_instance_mutex(
@@ -383,7 +288,7 @@ def run(
     terminate: Callable = stop_child,
     create_mutex: Callable = _create_instance_mutex,
     show_already_running: Callable = _show_already_running,
-    assign_job: Callable = create_kill_on_close_job,
+    assign_job: Callable = jobobject.assign_process,
     close_handle: Callable = _close_handle,
     token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
     wait_url_timeout_s: float = 90,

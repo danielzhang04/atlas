@@ -5,6 +5,7 @@ import codecs
 import heapq
 import os
 from pathlib import Path
+import re
 import stat
 import time
 from typing import Callable, Sequence
@@ -13,6 +14,19 @@ __all__ = ["LocalFiles"]
 _SKIPPED_DIRECTORIES = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 _MAX_DEPTH = 6
 _MAX_RESULTS = 20
+_QUERY_STOP_WORDS = frozenset({
+    "the",
+    "a",
+    "an",
+    "of",
+    "my",
+    "file",
+    "files",
+    "spec",
+    "document",
+    "doc",
+})
+_NAME_SEPARATORS = re.compile(r"[-_.\s]+")
 _OPENABLE_EXTENSIONS = frozenset({
     ".txt",
     ".md",
@@ -121,20 +135,43 @@ class LocalFiles:
                 or not isinstance(budget_s, (int, float)) or budget_s <= 0):
             raise ValueError("invalid budget")
         maximum = min(limit, _MAX_RESULTS)
-        needle = query.strip().casefold()
+        tokens = tuple(
+            token
+            for token in _normalize_name(query).split()
+            if token not in _QUERY_STOP_WORDS
+        )
+        if not tokens:
+            return []
         deadline = self._clock() + float(budget_s)
-        matches: list[tuple[float, int, dict]] = []
+        exact_matches: list[tuple[float, int, dict]] = []
+        fallback_matches: list[tuple[int, float, int, dict]] = []
         sequence = [0]
         for root in self._roots:
             if self._clock() >= deadline:
                 break
-            self._scan(root, needle, deadline, matches, maximum, sequence)
-        newest = [item for _modified, _sequence, item in matches]
-        newest.sort(key=lambda item: item["modified"], reverse=True)
-        return newest
+            self._scan(
+                root,
+                tokens,
+                deadline,
+                exact_matches,
+                fallback_matches,
+                maximum,
+                sequence,
+            )
+        if exact_matches:
+            results = [item for _modified, _sequence, item in exact_matches]
+            results.sort(key=lambda item: item["modified"], reverse=True)
+            return results
+        fallback = [
+            (matched, modified, item)
+            for matched, modified, _sequence, item in fallback_matches
+        ]
+        fallback.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+        return [item for _matched, _modified, item in fallback]
 
-    def _scan(self, root: Path, needle: str, deadline: float,
-              matches: list[tuple[float, int, dict]], maximum: int,
+    def _scan(self, root: Path, tokens: tuple[str, ...], deadline: float,
+              exact_matches: list[tuple[float, int, dict]],
+              fallback_matches: list[tuple[int, float, int, dict]], maximum: int,
               sequence: list[int]) -> None:
         if not root.is_dir():
             return
@@ -151,25 +188,29 @@ class LocalFiles:
                         self._visit(
                             entry,
                             depth,
-                            needle,
+                            tokens,
                             pending,
-                            matches,
+                            exact_matches,
+                            fallback_matches,
                             maximum,
                             sequence,
                         )
             except OSError:
                 continue
 
-    def _visit(self, entry, depth: int, needle: str,
+    def _visit(self, entry, depth: int, tokens: tuple[str, ...],
                pending: list[tuple[Path, int]],
-               matches: list[tuple[float, int, dict]], maximum: int,
+               exact_matches: list[tuple[float, int, dict]],
+               fallback_matches: list[tuple[int, float, int, dict]], maximum: int,
                sequence: list[int]) -> None:
         if entry.name.casefold() in _SKIPPED_DIRECTORIES:
             return
         try:
             if entry.is_dir(follow_symlinks=False) and depth < _MAX_DEPTH - 1:
                 pending.append((self.resolve(entry.path), depth + 1))
-            if needle not in entry.name.casefold():
+            normalized_name = _normalize_name(entry.name)
+            matched = sum(token in normalized_name for token in tokens)
+            if matched < (len(tokens) + 1) // 2:
                 return
             resolved = self.resolve(entry.path)
             stat = resolved.stat()
@@ -180,12 +221,20 @@ class LocalFiles:
             "size": stat.st_size,
             "modified": stat.st_mtime,
         }
-        candidate = (stat.st_mtime, sequence[0], item)
+        current_sequence = sequence[0]
         sequence[0] += 1
-        if len(matches) < maximum:
-            heapq.heappush(matches, candidate)
+        if matched == len(tokens):
+            candidate = (stat.st_mtime, current_sequence, item)
+            if len(exact_matches) < maximum:
+                heapq.heappush(exact_matches, candidate)
+                return
+            heapq.heappushpop(exact_matches, candidate)
             return
-        heapq.heappushpop(matches, candidate)
+        candidate = (matched, stat.st_mtime, current_sequence, item)
+        if len(fallback_matches) < maximum:
+            heapq.heappush(fallback_matches, candidate)
+            return
+        heapq.heappushpop(fallback_matches, candidate)
 
     def open(self, path: str | Path) -> dict:
         resolved = self.resolve(path)
@@ -225,3 +274,7 @@ def _decode_text(raw: bytes, *, truncated: bool) -> str:
         return utf16_decoder.decode(raw, final=not truncated)
     except UnicodeDecodeError:
         raise ValueError("not a text file") from None
+
+
+def _normalize_name(value: str) -> str:
+    return _NAME_SEPARATORS.sub(" ", value.casefold()).strip()

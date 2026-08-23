@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import timedelta
 import json
@@ -35,6 +35,29 @@ SessionFactory = Callable[
     [str, StdioServerParameters], AsyncContextManager[ClientSession]
 ]
 ServerHook = Callable[[str, "ToolRegistry"], None]
+ProcessTreeKiller = Callable[..., subprocess.CompletedProcess]
+
+
+class _PidTrackingStdio(AbstractAsyncContextManager):
+    """Expose the process PID retained by MCP 1.29's stdio context."""
+    def __init__(self, spec: StdioServerParameters, on_pid: Callable[[int], None]) -> None:
+        self._context = stdio_client(spec, errlog=subprocess.DEVNULL)
+        self._on_pid = on_pid
+
+    async def __aenter__(self):
+        streams = await self._context.__aenter__()
+        process = getattr(self._context, "process", None)
+        generator = getattr(self._context, "gen", None)
+        frame = getattr(generator, "ag_frame", None)
+        if process is None and frame is not None:
+            process = frame.f_locals.get("process")
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            self._on_pid(pid)
+        return streams
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return await self._context.__aexit__(exc_type, exc_value, traceback)
 
 
 def load_mcp_config(path: Path) -> dict:
@@ -53,12 +76,20 @@ def policy_for(server_cfg: Mapping, defaults: Mapping, tool_name: str) -> Policy
 
 @asynccontextmanager
 async def _stdio_session(
-    _server_name: str, spec: StdioServerParameters
+    _server_name: str,
+    spec: StdioServerParameters,
+    *,
+    on_pid: Callable[[int], None] = lambda _pid: None,
 ):
-    async with stdio_client(spec, errlog=subprocess.DEVNULL) as (read_stream, write_stream):
+    async with _PidTrackingStdio(spec, on_pid) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             yield session
+
+
+def _taskkill(command: list[str], *, check: bool) -> subprocess.CompletedProcess:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(command, check=check, creationflags=creationflags)
 
 
 class McpServers:
@@ -70,21 +101,35 @@ class McpServers:
         session_factory: SessionFactory | None = None,
         on_server: ServerHook | None = None,
         account_values: Mapping[str, str] | None = None,
+        killer: ProcessTreeKiller = _taskkill,
     ):
         self._config = config
         self._claude_config_path = Path(claude_config_path)
-        self._session_factory = session_factory or _stdio_session
+        self._session_factory = session_factory or self._default_session
         self._on_server = on_server
         self._account_values = dict(account_values or {})
+        self._killer = killer
         self._stacks: dict[str, AsyncExitStack] = {}
         self._sessions: dict[str, ClientSession] = {}
         self._call_settings: dict[str, tuple[Mapping, float]] = {}
+        self._server_pids: dict[str, int] = {}
         self._closed = False
         servers = config.get("servers", {})
         self._status = {
             name: {"name": name, "connected": False, "tools": 0, "error": None}
             for name in servers
         }
+
+    def _default_session(
+        self,
+        server_name: str,
+        spec: StdioServerParameters,
+    ) -> AsyncContextManager[ClientSession]:
+        return _stdio_session(
+            server_name,
+            spec,
+            on_pid=lambda pid: self._server_pids.__setitem__(server_name, pid),
+        )
 
     async def connect(
         self,
@@ -137,7 +182,13 @@ class McpServers:
                 except Exception as exc:
                     _LOGGER.warning("MCP server %s hook failed: %s",
                                     name, type(exc).__name__)
+        except asyncio.CancelledError:
+            self._kill_server_tree(name)
+            with suppress(Exception):
+                await stack.aclose()
+            raise
         except Exception as exc:
+            self._kill_server_tree(name)
             with suppress(Exception):
                 await stack.aclose()
             error = type(exc).__name__
@@ -240,11 +291,25 @@ class McpServers:
         self._closed = True
         self._sessions.clear()
         self._call_settings.clear()
-        stacks = list(reversed(self._stacks.values()))
+        stacks = list(reversed(self._stacks.items()))
         self._stacks.clear()
-        for stack in stacks:
+        for name, stack in stacks:
+            self._kill_server_tree(name)
             with suppress(Exception):
                 await stack.aclose()
+        for name in tuple(self._server_pids):
+            self._kill_server_tree(name)
+        self._server_pids.clear()
+
+    def _kill_server_tree(self, name: str) -> None:
+        pid = self._server_pids.pop(name, None)
+        if pid is None:
+            return
+        command = ["taskkill", "/T", "/F", "/PID", str(pid)]
+        try:
+            self._killer(command, check=False)
+        except Exception:
+            _LOGGER.warning("MCP server %s process-tree cleanup failed", name)
 
 
 def _bounded_text(value: str) -> str:

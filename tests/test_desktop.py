@@ -1,7 +1,6 @@
 """Native Atlas desktop launcher behavior without real processes or windows."""
 from __future__ import annotations
 
-import ctypes
 from io import StringIO
 import json
 from pathlib import Path
@@ -202,67 +201,6 @@ def test_instance_mutex_uses_the_required_local_name_and_last_error():
     assert handle == 444
     assert already_running is True
     assert calls == [(None, False, "Local\\AtlasDesktop")]
-
-
-def test_worker_is_assigned_to_a_kill_on_close_job_object_after_spawn():
-    calls = []
-
-    def set_information(handle, info_class, pointer, size):
-        information = ctypes.cast(
-            pointer,
-            ctypes.POINTER(desktop._ExtendedLimitInformation),
-        ).contents
-        calls.append((
-            "configure",
-            handle,
-            info_class,
-            information.BasicLimitInformation.LimitFlags,
-            size,
-        ))
-        return True
-
-    handle = desktop.create_kill_on_close_job(
-        FakeProcess(),
-        platform="nt",
-        create_job=lambda security, name: calls.append(("create", security, name)) or 555,
-        set_information=set_information,
-        assign_process=lambda job, process: calls.append(("assign", job, process)) or True,
-    )
-
-    assert handle == 555
-    assert calls[0] == ("create", None, None)
-    assert calls[1][0:4] == (
-        "configure",
-        555,
-        desktop.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-        desktop.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    )
-    assert calls[2] == ("assign", 555, 8765)
-
-
-def test_job_object_failure_logs_warning_and_continues(caplog):
-    with caplog.at_level("WARNING", logger="atlas.desktop"):
-        handle = desktop.create_kill_on_close_job(
-            FakeProcess(),
-            platform="nt",
-            create_job=lambda *_args: 0,
-            set_information=lambda *_args: True,
-            assign_process=lambda *_args: True,
-        )
-
-    assert handle is None
-    assert "kill-on-close Job Object" in caplog.text
-
-
-def test_non_windows_job_object_logs_warning_and_continues(caplog):
-    with caplog.at_level("WARNING", logger="atlas.desktop"):
-        handle = desktop.create_kill_on_close_job(
-            FakeProcess(),
-            platform="posix",
-        )
-
-    assert handle is None
-    assert "Job Objects are unavailable" in caplog.text
 
 
 def test_close_confirmation_lists_active_jobs_and_can_veto_close():
