@@ -15,6 +15,7 @@ __all__ = [
     "DEFAULT_PROFILES",
     "DesktopAppError",
     "DesktopApps",
+    "close_profile",
     "focus_profile",
     "native_launcher",
     "open_profile",
@@ -130,6 +131,32 @@ def open_profile(app_id: str, url: str | None = None) -> object:
 def focus_profile(app_id: str) -> object:
     apps = DesktopApps(profiles=DEFAULT_PROFILES, launcher=native_launcher)
     return apps.focus(app_id)
+
+
+def close_profile(app_id: str, *, killer: Callable[..., object] = subprocess.run
+                  ) -> dict[str, object]:
+    """Request a graceful close for one allowlisted application image."""
+    try:
+        profile = DEFAULT_PROFILES[app_id]
+    except KeyError as exc:
+        raise DesktopAppError("app is not allowlisted") from exc
+    try:
+        result = killer(
+            [_taskkill_executable(), "/IM", profile.executable],
+            check=False,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, shell=False, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DesktopAppError("desktop application could not be closed") from exc
+    if getattr(result, "returncode", 1) != 0:
+        raise DesktopAppError("desktop application could not be closed")
+    return {"application": app_id, "closed": True}
+def _taskkill_executable() -> str:
+    taskkill = _windows_directory() / "System32/taskkill.exe"
+    if not taskkill.is_file():
+        raise DesktopAppError("Windows task termination is unavailable")
+    return str(taskkill.resolve())
 
 
 def native_launcher(executable: str, url: str | None) -> dict[str, object]:

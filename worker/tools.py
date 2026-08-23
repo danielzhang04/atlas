@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from worker import desktopapps
+from worker.localfiles import LocalFiles
 
 __all__ = [
     "AppEntry",
@@ -27,6 +28,7 @@ __all__ = [
     "WorkLike",
     "builtin",
     "load_apps",
+    "register_count_mail",
 ]
 
 Policy = Literal["instant", "confirm"]
@@ -36,6 +38,11 @@ _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTENT_LIMIT = 4096
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TRUNCATED = "…[truncated]"
+_FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
+_NEXT_PAGE_TOKEN = re.compile(
+    r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +237,9 @@ def builtin(
     opener: Callable[[str], None] = os.startfile,
     profile_opener: Callable[[str, str | None], object] = desktopapps.open_profile,
     profile_focuser: Callable[[str], object] = desktopapps.focus_profile,
+    profile_closer: Callable[[str], object] = desktopapps.close_profile,
     paired_url: Callable[[], str | None] | None = None,
+    files: LocalFiles | None = None,
 ) -> None:
     aliases = _aliases(apps)
     registry._configure_open_aliases(aliases)
@@ -279,6 +288,29 @@ def builtin(
         job = work.cancel(_text_argument(arguments, "job_id", maximum=256))
         return {"job_id": job.job_id, "status": _state_value(job.state), "title": job.title}
 
+    async def close(arguments: dict) -> ToolResult | dict:
+        target = _text_argument(arguments, "app", maximum=256)
+        entry = aliases.get(target.casefold())
+        if entry is None:
+            return ToolResult("error", "unknown app")
+        name, app = entry
+        if app.exe is None:
+            return ToolResult("error", "I can close apps, not browser tabs")
+        profile_closer(app.exe)
+        return {"closed": name}
+
+    async def find_file(arguments: dict) -> list[dict]:
+        query = _text_argument(arguments, "query", maximum=512)
+        return files.find(query)
+
+    async def open_file(arguments: dict) -> dict:
+        path = _text_argument(arguments, "path", maximum=2048)
+        return files.open(path)
+
+    async def read_file(arguments: dict) -> dict:
+        path = _text_argument(arguments, "path", maximum=2048)
+        return files.read(path)
+
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
@@ -289,19 +321,70 @@ def builtin(
         }, launch_work),
         ("work_status", "List active and recent work.", {}, work_status),
         ("cancel_work", "Cancel a background job.", {"job_id": {"type": "string"}}, cancel_work),
+        ("close", "Gracefully close an allowlisted desktop app.", {
+            "app": {"type": "string"},
+        }, close),
     )
+    if files is not None:
+        definitions += (
+            ("find_file", "Find files and folders under configured roots.", {
+                "query": {"type": "string"},
+            }, find_file),
+            ("open_file", "Open a file or folder under configured roots.", {
+                "path": {"type": "string"},
+            }, open_file),
+            ("read_file", "Read bounded text from a file under configured roots.", {
+                "path": {"type": "string"},
+            }, read_file),
+        )
     for name, description, properties, run in definitions:
-        registry.register(Tool(
-            name=name,
-            description=description,
-            input_schema={
-                "type": "object",
-                "properties": properties,
-                "required": list(properties),
-                "additionalProperties": False,
-            },
-            run=run,
-        ))
+        schema = {
+            "type": "object", "properties": properties,
+            "required": list(properties), "additionalProperties": False,
+        }
+        registry.register(Tool(name, description, schema, run))
+
+
+def register_count_mail(registry: ToolRegistry,
+                        search: Callable[[dict], Awaitable[ToolResult]],
+                        account: str) -> None:
+    """Register an exact, bounded counter over Gmail search result pages."""
+
+    async def count_mail(arguments: dict) -> ToolResult | dict:
+        query = _text_argument(arguments, "query", maximum=1024)
+        total = 0
+        page_token = None
+        for _page in range(4):
+            search_arguments = {
+                "query": query, "user_google_email": account,
+                "page_size": 500, "include_headers": False,
+            }
+            if page_token is not None:
+                search_arguments["page_token"] = page_token
+            result = await search(search_arguments)
+            if result.status != "ok":
+                return ToolResult("error", result.content)
+            found = _FOUND_MESSAGES.search(result.content)
+            if found is None:
+                return ToolResult("error", "unexpected mail search result")
+            page_count = int(found.group(1))
+            if page_count > 500:
+                return ToolResult("error", "unexpected mail search result")
+            total += page_count
+            token_match = _NEXT_PAGE_TOKEN.search(result.content)
+            page_token = token_match.group(1) if token_match is not None else None
+            if page_token is None:
+                return {"query": query, "count": total, "exact": True}
+        return {"query": query, "count": total, "exact": page_token is None}
+
+    schema = {
+        "type": "object", "properties": {"query": {"type": "string"}},
+        "required": ["query"], "additionalProperties": False,
+    }
+    registry.register(Tool(
+        "count_mail", "Count Gmail messages exactly across bounded search pages.",
+        schema, count_mail,
+    ))
 
 
 def _aliases(apps: Mapping[str, AppEntry]) -> dict[str, tuple[str, AppEntry]]:

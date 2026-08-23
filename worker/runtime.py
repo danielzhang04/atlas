@@ -9,8 +9,9 @@ from typing import Any, Callable
 from .brain import Brain
 from .claude_launcher import ClaudeLauncher
 from .jobstore import JobStore
+from .localfiles import LocalFiles
 from .mcp_client import McpServers, load_mcp_config
-from .tools import ToolRegistry, builtin, load_apps
+from .tools import ToolRegistry, builtin, load_apps, register_count_mail
 from .work import WorkManager
 
 __all__ = ["Runtime", "build"]
@@ -56,18 +57,31 @@ def build(
         raise ValueError("invalid Atlas configuration: max_tokens")
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
         raise ValueError("invalid Atlas configuration: turn_timeout_s")
+    raw_roots = cfg.get("file_roots", ())
+    if (isinstance(raw_roots, (str, bytes)) or not isinstance(raw_roots, (list, tuple))
+            or not all(isinstance(root, str) and root.strip() for root in raw_roots)):
+        raise ValueError("invalid Atlas configuration: file_roots")
 
     store = JobStore(store_path if store_path == ":memory:" else _path(store_path))
     work = WorkManager(store, launcher or ClaudeLauncher(), _path(workspace_path))
     registry = ToolRegistry()
-    builtin(
-        registry,
-        load_apps(ATLAS / "config" / "apps.yaml"),
-        work,
-        paired_url=paired_url,
-    )
+    files = LocalFiles([_path(root) for root in raw_roots]) if raw_roots else None
+    builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
+            paired_url=paired_url, files=files)
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}
-    mcp = McpServers(load_mcp_config(ATLAS / "config" / "mcp.yaml"), **mcp_kwargs)
+    google_account = str(cfg.get("google_account", ""))
+
+    def on_server(name: str, current_registry: ToolRegistry) -> None:
+        if name != "google":
+            return
+
+        async def search(arguments: dict):
+            return await current_registry.call("google__search_gmail_messages", arguments)
+
+        register_count_mail(current_registry, search, google_account)
+
+    mcp = McpServers(load_mcp_config(ATLAS / "config" / "mcp.yaml"),
+                     on_server=on_server, **mcp_kwargs)
     if client is None:
         from anthropic import AsyncAnthropic
 
@@ -78,7 +92,7 @@ def build(
         registry,
         model=model,
         persona=persona,
-        google_account=str(cfg.get("google_account", "")),
+        google_account=google_account,
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
     )

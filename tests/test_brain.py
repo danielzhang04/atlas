@@ -513,6 +513,14 @@ def test_google_account_rule_is_conditional():
     assert "Google tools need user_google_email = daniel@example.com." in account._system_text
 
 
+def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
+    assert "find_file" in BASE_SYSTEM
+    assert "read_file" in BASE_SYSTEM
+    assert "analysis that needs code or produces artifacts" in BASE_SYSTEM
+    assert "count_mail" in BASE_SYSTEM
+    assert "never count from a search page" in BASE_SYSTEM
+
+
 def test_split_spoken_uses_sentence_newline_and_length_boundaries():
     chunks, remainder = split_spoken("Short. This is a complete sentence!\nTrailing")
     assert chunks == ["Short. This is a complete sentence!\n"]
