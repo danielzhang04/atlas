@@ -38,6 +38,8 @@ ERROR_ALREADY_EXISTS = 183
 MUTEX_NAME = "Local\\AtlasDesktop"
 RESTART_EXIT_CODE = 21
 RESTART_INTERVAL_S = 30.0
+RESTART_BURST_WINDOW_S = 10.0 * 60.0
+MAX_RESTARTS_PER_BURST = 3
 STOPPED_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -293,10 +295,13 @@ def _watch_child(
     *,
     clock: Callable[[], float] = time.monotonic,
     restart_interval_s: float = RESTART_INTERVAL_S,
+    wait=None,
 ) -> None:
-    """Watch successive children and allow at most one audio restart per interval."""
+    """Watch children, deferring close restarts and stopping on the third burst."""
     current = proc
     last_restart_at = None
+    restart_requests: list[float] = []
+    wait_for_delay = wait or closing.wait
     while True:
         exit_code = current.wait()
         if closing.is_set():
@@ -305,12 +310,25 @@ def _watch_child(
             window.load_html(STOPPED_HTML)
             return
         now = clock()
-        if last_restart_at is not None and now - last_restart_at < restart_interval_s:
-            logger.critical("audio reconnect restart rate limit reached")
+        restart_requests = [
+            requested_at
+            for requested_at in restart_requests
+            if now - requested_at < RESTART_BURST_WINDOW_S
+        ]
+        restart_requests.append(now)
+        if len(restart_requests) >= MAX_RESTARTS_PER_BURST:
+            logger.critical("audio reconnect restart burst limit reached")
             window.load_html(STOPPED_HTML)
             return
-        last_restart_at = now
         window.load_html(RECONNECTING_HTML)
+        if last_restart_at is not None and now - last_restart_at < restart_interval_s:
+            delay = restart_interval_s - (now - last_restart_at)
+            logger.warning("deferring audio reconnect restart for %.1f seconds", delay)
+            if wait_for_delay(delay):
+                return
+            last_restart_at += restart_interval_s
+        else:
+            last_restart_at = now
         try:
             replacement = restart(current)
         except Exception:

@@ -1,10 +1,13 @@
 """Root confinement and bounded local-file behavior."""
 from __future__ import annotations
 
+import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from worker import localfiles
 from worker.localfiles import LocalFiles
 
 
@@ -275,3 +278,110 @@ def test_unknown_and_missing_roots_are_skipped_with_one_warning_each(tmp_path, c
         "skipping file root known:Unknown: unknown folder",
         f"skipping file root {missing}: directory is unavailable",
     ]
+
+
+def test_cloud_files_reparse_tag_is_allowed_inside_a_configured_root(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "OneDrive"
+    root.mkdir()
+    placeholder = root / "notes.txt"
+    placeholder.write_text("hydrated", encoding="utf-8")
+    real_lstat = os.lstat
+    actual = real_lstat(placeholder)
+
+    def tagged_lstat(path):
+        if os.fspath(path) != os.fspath(placeholder):
+            return real_lstat(path)
+        return SimpleNamespace(
+            st_file_attributes=localfiles._REPARSE_POINT,
+            st_reparse_tag=0x9000C01A,
+            st_mode=actual.st_mode,
+        )
+
+    files = LocalFiles([root], opener=lambda _path: None)
+    monkeypatch.setattr(localfiles.os, "lstat", tagged_lstat)
+
+    files._refuse_reparse_points(placeholder, root)
+
+
+def test_non_cloud_reparse_tag_remains_refused(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    linked = root / "linked.txt"
+    linked.write_text("data", encoding="utf-8")
+    actual = os.lstat(linked)
+
+    monkeypatch.setattr(
+        localfiles.os,
+        "lstat",
+        lambda _path: SimpleNamespace(
+            st_file_attributes=localfiles._REPARSE_POINT,
+            st_reparse_tag=0xA000000C,
+            st_mode=actual.st_mode,
+        ),
+    )
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    with pytest.raises(ValueError, match="reparse"):
+        files._refuse_reparse_points(linked, root)
+
+
+def test_open_file_and_read_file_run_off_loop_with_five_second_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    document = root / "notes.txt"
+    document.write_text("hello", encoding="utf-8")
+    opened = []
+    offloaded = []
+    deadlines = []
+    files = LocalFiles([root], opener=opened.append)
+
+    async def to_thread(function, *args):
+        offloaded.append(function.__name__)
+        return function(*args)
+
+    async def wait_for(awaitable, *, timeout):
+        deadlines.append(timeout)
+        return await awaitable
+
+    monkeypatch.setattr(localfiles.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(localfiles.asyncio, "wait_for", wait_for)
+
+    opened_result = asyncio.run(files.open_file(document))
+    read_result = asyncio.run(files.read_file(document))
+
+    assert opened_result == {"opened": str(document.resolve())}
+    assert read_result["text"] == "hello"
+    assert opened == [str(document.resolve())]
+    assert offloaded == ["open", "read"]
+    assert deadlines == [5.0, 5.0]
+
+
+@pytest.mark.parametrize("operation", ["open_file", "read_file"])
+def test_cloud_hydration_timeout_returns_file_not_available_error(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    document = root / "notes.txt"
+    document.write_text("hello", encoding="utf-8")
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    async def stalled_to_thread(_function, *_args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(localfiles.asyncio, "to_thread", stalled_to_thread)
+    monkeypatch.setattr(localfiles, "_FILE_DEADLINE_S", 0.01)
+
+    result = asyncio.run(getattr(files, operation)(document))
+
+    assert result == {
+        "error": "file not available yet (cloud placeholder)",
+    }

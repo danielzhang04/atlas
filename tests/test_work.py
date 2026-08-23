@@ -144,6 +144,32 @@ def test_launch_transitions_from_launching_to_running_with_session_id(tmp_path):
     assert launcher.launch_calls[0]["cwd"] == tmp_path / job.job_id
 
 
+def test_launching_row_persists_requested_session_before_background_cli_returns(
+    tmp_path,
+):
+    store = make_store()
+    launch_started = threading.Event()
+    release_launch = threading.Event()
+    launcher = FakeLauncher(
+        session_id="fedcba98",
+        launch_started=launch_started,
+        release_launch=release_launch,
+    )
+    manager = WorkManager(store, launcher, tmp_path)
+
+    job = manager.launch("Task", "brief")
+    assert launch_started.wait(timeout=2.0)
+    launching = store.get(job.job_id)
+
+    assert launching.state is JobState.LAUNCHING
+    assert launching.session_id == launcher.launch_calls[0]["session_id"]
+    assert launching.session_id
+
+    release_launch.set()
+    running = wait_for_state(store, job.job_id, JobState.RUNNING)
+    assert running.session_id == "fedcba98"
+
+
 def test_launcher_exception_transitions_job_to_failed_launch_failed(tmp_path):
     store = make_store()
     launcher = FakeLauncher(launch_error=RuntimeError("boom"))

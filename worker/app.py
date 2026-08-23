@@ -36,6 +36,36 @@ DEFAULT_DISMISS = ["that's all", "go to sleep"]
 WAKE_LINE = "Hey boss. What can I do for you?"
 SLEEP_LINE = "Okay, sleeping. Wake me when you need something."
 _BG_TASKS: set[asyncio.Task] = set()
+RESTART_EXIT_CODE = 21
+_worker_exit_code = 0
+
+
+class AudioRestartCoalescer:
+    """Debounce audio failures on the worker event loop."""
+
+    def __init__(self, restart, *, loop, delay_s: float = 2.0) -> None:
+        self._restart = restart
+        self._loop = loop
+        self._delay_s = float(delay_s)
+        self._reasons: list[str] = []
+        self._handle = None
+
+    def request(self, reason: str) -> None:
+        self._loop.call_soon_threadsafe(self._queue, str(reason))
+
+    def _queue(self, reason: str) -> None:
+        if reason not in self._reasons:
+            self._reasons.append(reason)
+        if self._handle is not None:
+            self._handle.cancel()
+        self._handle = self._loop.call_later(self._delay_s, self._fire)
+
+    def _fire(self) -> None:
+        reasons = self._reasons
+        self._reasons = []
+        self._handle = None
+        if reasons:
+            self._restart("; ".join(reasons))
 
 
 def _build_tts(cfg: dict):
@@ -154,9 +184,54 @@ def _console_singleton():
     return AgentsConsole.get_instance()
 
 
-def _restart_worker(reason: str) -> None:
+def _restart_worker(reason: str, shutdown=None) -> None:
+    global _worker_exit_code
     logger.critical("audio-follow requested worker restart: %s", reason)
-    os._exit(21)
+    _worker_exit_code = RESTART_EXIT_CODE
+    if shutdown is not None:
+        shutdown(reason)
+
+
+def _audio_failure_callback(publisher, direction: str, request_restart):
+    def _failed(reason: str) -> None:
+        name = None
+        try:
+            name = publisher.snapshot()["audio"][direction]["name"]
+        except Exception:
+            pass
+        publisher.set_audio_device(
+            direction,
+            {"name": name, "following": False, "error": str(reason)},
+        )
+        request_restart(str(reason))
+
+    return _failed
+
+
+def _wake_model_callback(publisher, loop=None):
+    def _changed(model_name: str) -> None:
+        setter = getattr(publisher, "set_wake_model", None)
+        if setter is None:
+            logger.warning("wake-model state hook is unavailable")
+            return
+        if loop is None:
+            setter(model_name)
+            return
+        loop.call_soon_threadsafe(setter, model_name)
+
+    return _changed
+
+
+def _should_cancel_active_jobs(shutdown_jobs_requested: bool) -> bool:
+    return not shutdown_jobs_requested and _worker_exit_code != RESTART_EXIT_CODE
+
+
+async def _flush_store_and_stop_state_server(store, server) -> None:
+    try:
+        store.close()
+    except Exception:
+        logger.exception("could not flush the job store during shutdown")
+    await server.stop()
 
 
 def _start_audio_follow(
@@ -208,17 +283,19 @@ def _start_audio_follow(
                 direction,
                 {"name": endpoint[1], "following": True},
             )
-    active_directions = [direction for direction in probes if initial[direction] is not None]
-    if not active_directions:
-        return None
+    active_directions = list(probes)
     try:
         console = console_factory()
     except Exception:
         logger.critical("audio-follow console is unavailable", exc_info=True)
         for direction in active_directions:
+            endpoint = initial[direction]
             publisher.set_audio_device(
                 direction,
-                {"name": initial[direction][1], "following": False},
+                {
+                    "name": endpoint[1] if endpoint is not None else None,
+                    "following": False,
+                },
             )
         return None
     try:
@@ -235,6 +312,16 @@ def _start_audio_follow(
             boot_output_index = None
         input_follower = None
         output_follower = None
+        input_failure = _audio_failure_callback(
+            publisher,
+            "input",
+            request_restart,
+        )
+        output_failure = _audio_failure_callback(
+            publisher,
+            "output",
+            request_restart,
+        )
         if "input" in active_directions:
             input_follower = input_follower_cls(
                 console,
@@ -242,7 +329,7 @@ def _start_audio_follow(
                 sd_module=sd,
                 switch_wake_input=wake_switch.switch_to,
                 initial_idx=boot_input_index,
-                request_restart=request_restart,
+                on_failure=input_failure,
             )
         if "output" in active_directions:
             output_follower = output_follower_cls(
@@ -250,7 +337,7 @@ def _start_audio_follow(
                 resolve_output=resolve_output,
                 sd_module=sd,
                 initial_idx=boot_output_index,
-                request_restart=request_restart,
+                request_restart=output_failure,
             )
 
         def _on_input_change(name: str) -> None:
@@ -267,7 +354,7 @@ def _start_audio_follow(
             period_s=1.5,
             initial_delay_s=2.0,
             initial_ids={
-                direction: initial[direction][0]
+                direction: initial[direction][0] if initial[direction] is not None else None
                 for direction in active_directions
             },
         )
@@ -276,9 +363,13 @@ def _start_audio_follow(
     except Exception:
         logger.critical("audio-follow wiring failed", exc_info=True)
         for direction in active_directions:
+            endpoint = initial[direction]
             publisher.set_audio_device(
                 direction,
-                {"name": initial[direction][1], "following": False},
+                {
+                    "name": endpoint[1] if endpoint is not None else None,
+                    "following": False,
+                },
             )
         return None
 
@@ -591,6 +682,7 @@ def _emit_ui_url(authorizer: stateserver.PairingAuthorizer, port: int) -> str:
 
 async def entrypoint(ctx: JobContext) -> None:
     jobobject.assign_current_process()
+    wakeword.shutting_down.clear()
     envload.load_private_environment()
     cfg = _cfg()
     authorizer = stateserver.PairingAuthorizer()
@@ -620,6 +712,15 @@ async def entrypoint(ctx: JobContext) -> None:
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
     loop = asyncio.get_running_loop()
+    restart_coalescer = AudioRestartCoalescer(
+        lambda reason: _restart_worker(reason, ctx.shutdown),
+        loop=loop,
+    )
+    audio_failure = _audio_failure_callback(
+        publisher,
+        "input",
+        restart_coalescer.request,
+    )
     session_box: dict[str, Any] = {}
     pending_terminal = []
 
@@ -710,21 +811,25 @@ async def entrypoint(ctx: JobContext) -> None:
         if sleep_task is not None:
             sleep_task.cancel()
             await asyncio.gather(sleep_task, return_exceptions=True)
-        if not shutdown_jobs_requested:
+        if _should_cancel_active_jobs(shutdown_jobs_requested):
             await services.work.cancel_active(timeout_s=15.0)
         stop_work.set()
         mcp_task.cancel()
         await asyncio.gather(work_task, return_exceptions=True)
         await asyncio.gather(mcp_task, return_exceptions=True)
         await services.mcp.close()
-        await server.stop()
-        services.store.close()
+        await _flush_store_and_stop_state_server(services.store, server)
 
     ctx.add_shutdown_callback(_shutdown)
     if TEXT_MODE:
         return
 
-    audio_watcher = _start_audio_follow(cfg, publisher, wake_switch)
+    audio_watcher = _start_audio_follow(
+        cfg,
+        publisher,
+        wake_switch,
+        request_restart=restart_coalescer.request,
+    )
     session.input.set_audio_enabled(False)
 
     def _sleep(announce: bool = True) -> bool:
@@ -788,6 +893,8 @@ async def entrypoint(ctx: JobContext) -> None:
             "patience": cfg.get("wake_patience", wakeword.PATIENCE),
             "on_signal": _on_audio_signal,
             "device_switch": wake_switch,
+            "on_failure": audio_failure,
+            "on_model": _wake_model_callback(publisher, loop),
         },
         daemon=True,
     ).start()
@@ -832,6 +939,8 @@ def _console_input_args(
 
 
 def main() -> int:
+    global _worker_exit_code
+    _worker_exit_code = 0
     jobobject.assign_current_process()
     try:
         cfg = _cfg()
@@ -840,7 +949,7 @@ def main() -> int:
     except Exception:
         logger.exception("could not resolve configured audio devices")
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-    return 0
+    return _worker_exit_code
 
 
 if __name__ == "__main__":

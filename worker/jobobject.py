@@ -12,6 +12,7 @@ __all__ = ["assign_current_process", "assign_process"]
 _LOGGER = logging.getLogger("atlas.jobobject")
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 _current_job_handle = None
@@ -198,7 +199,10 @@ def _assign_handle(
         raise OSError("CreateJobObjectW failed")
     try:
         information = _ExtendedLimitInformation()
-        information.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        information.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        )
         configured = set_information(
             job_handle,
             _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,

@@ -70,12 +70,16 @@ class WorkManager:
         try:
             job_dir = self.workspace_root / job_id
             job_dir.mkdir(parents=True, exist_ok=True)
+            requested_session_id = str(uuid4())
             with self._job_lock(job_id):
                 job = self.store.get(job_id)
                 if job.state is not JobState.QUEUED:
                     return
-                self.store.transition(job_id, JobState.LAUNCHING)
-            requested_session_id = str(uuid4())
+                self.store.transition(
+                    job_id,
+                    JobState.LAUNCHING,
+                    session_id=requested_session_id,
+                )
             prompt = worker_prompt(
                 job_id,
                 self._nonce(job_id),
