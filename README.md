@@ -18,21 +18,14 @@ Put voice-provider values in `%USERPROFILE%\.atlas\env`. MCP server commands, ar
 environment values remain in the user's existing `~/.claude.json`; neither file belongs in this
 repository.
 
-Run the Atlas app:
-
-```powershell
-.venv\Scripts\pythonw.exe -m worker.desktop
-```
-
-The native window is the only command-center host. It starts the voice worker and opens the paired
-command center. Closing the window stops Atlas. If jobs are active, Atlas shows their titles and
-confirms that closing will cancel them before it exits.
-
-To add Atlas to the Start menu for the current user:
+## Open the app
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_shortcut.ps1
 ```
+
+Run this once; it only creates the shortcuts. Then open Atlas from the Start menu or the Desktop icon
+like any app. Closing the window turns Atlas off.
 
 Run a single streaming text turn, with or without MCP connections:
 

@@ -369,3 +369,6 @@ def test_shortcut_installer_targets_pythonw_desktop_module():
     assert "pythonw.exe" in script
     assert '-m worker.desktop' in script
     assert "Atlas.lnk" in script
+    assert 'GetFolderPath("Desktop")' in script
+    assert "IconLocation" in script
+    assert "WindowStyle = 7" in script
