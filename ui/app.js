@@ -69,7 +69,9 @@
   }
 
   function syncNativeWindowControls() {
-    refs.windowControls.classList.toggle("no-native", nativeWindowApi() === null);
+    if (nativeWindowApi() !== null) {
+      refs.windowControls.classList.remove("no-native");
+    }
   }
 
   function callNativeWindow(method) {
@@ -102,6 +104,11 @@
   });
   window.addEventListener("pywebviewready", syncNativeWindowControls);
   syncNativeWindowControls();
+  window.setTimeout(() => {
+    if (nativeWindowApi() === null) {
+      refs.windowControls.classList.add("no-native");
+    }
+  }, 1500);
 
   function node(tag, className, text) {
     const element = document.createElement(tag);
