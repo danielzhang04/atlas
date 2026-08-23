@@ -243,15 +243,15 @@ class InputFollower:
                 return self._status(self._last_idx)
             try:
                 self._console.set_microphone_enabled(True, device=idx)
+                self._switch_wake_input(idx)
             except Exception:
                 logger.critical(
-                    "input follow: device %d (%r) failed to open; requesting worker restart",
+                    "input follow: device %d (%r) failed to switch; requesting worker restart",
                     idx,
                     name,
                     exc_info=True,
                 )
                 self._request_restart(f"stale snapshot opening input device {idx} ({name!r})")
                 return self._status(None)
-            self._switch_wake_input(idx)
             self._last_idx = idx
             return self._status(idx)

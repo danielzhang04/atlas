@@ -20,7 +20,10 @@ def test_initial_snapshot_has_only_live_voice_fields():
         "session_id": None,
         "voice": "mars",
         "transcript": [],
-        "output_device": None,
+        "audio": {
+            "input": {"name": None, "following": False},
+            "output": {"name": None, "following": False},
+        },
         "audio_energy": 0.0,
     }
 
@@ -111,33 +114,62 @@ def test_audio_energy_is_bounded_and_hidden_asleep():
     assert publisher.audio_energy == 0.0
 
 
-def test_output_device_and_voice_are_runtime_settable():
+def test_audio_devices_and_voice_are_runtime_settable():
     publisher = StatePublisher(clock=lambda: _dt(0))
-    publisher.set_output_device({"configured": "follow", "resolved": "Headphones", "following": True})
+    publisher.set_audio({
+        "input": {"name": "Headset microphone", "following": True},
+        "output": {"name": "Speakers", "following": False},
+    })
+    publisher.set_audio_device(
+        "output",
+        {"name": "Headphones", "following": True},
+    )
     publisher.voice = "matilda"
     snapshot = publisher.snapshot()
     assert snapshot["voice"] == "matilda"
-    assert snapshot["output_device"] == {
-        "configured": "follow",
-        "resolved": "Headphones",
-        "following": True,
+    assert snapshot["audio"] == {
+        "input": {"name": "Headset microphone", "following": True},
+        "output": {"name": "Headphones", "following": True},
+    }
+    assert "output_device" not in snapshot
+
+
+def test_audio_status_helpers_preserve_follow_and_pin_modes():
+    from worker import app
+
+    status = app._audio_status(
+        {
+            "wake_input_device": "follow",
+            "tts_output_device": "Speakers",
+        },
+        resolve_input=lambda _value: (_ for _ in ()).throw(AssertionError("unused")),
+        resolve_output=lambda _value: 5,
+        boot_input=lambda: "Headset microphone",
+        boot_output=lambda: "unused",
+        query_device=lambda index: {"name": f"device-{index}"},
+    )
+    assert status == {
+        "input": {"name": "Headset microphone", "following": True},
+        "output": {"name": "device-5", "following": False},
     }
 
 
-def test_output_device_helpers_preserve_follow_and_pin_modes():
-    from worker import app
+def test_audio_bands_are_bounded_copied_and_hidden_asleep():
+    publisher = StatePublisher(clock=lambda: _dt(0))
+    values = [index / 23 for index in range(24)]
+    publisher.set_audio_bands(values)
+    values[0] = 1.0
+    assert publisher.audio_bands == [0.0] * 24
 
-    follow = app._output_device_status(
-        {"tts_output_device": "follow"},
-        resolve=lambda _value: (_ for _ in ()).throw(AssertionError("must not resolve")),
-        boot_default=lambda: "Headphones",
-    )
-    pinned = app._output_device_status(
-        {"tts_output_device": "Speakers"},
-        resolve=lambda _value: 5,
-    )
-    assert follow == {"configured": "follow", "resolved": "Headphones", "following": True}
-    assert pinned["configured"] == "Speakers" and pinned["following"] is False
+    publisher.set_state(LISTENING)
+    visible = publisher.audio_bands
+    assert visible[0] == 0.0
+    assert visible[-1] == 1.0
+    visible[0] = 1.0
+    assert publisher.audio_bands[0] == 0.0
+
+    publisher.set_audio_bands([float("nan")] * 24)
+    assert publisher.audio_bands == [0.0] * 24
 
 
 def test_console_output_args_do_not_pin_follow_mode():

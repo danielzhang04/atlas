@@ -79,9 +79,13 @@ def resample_audio_frame(samples, source_rate: float) -> np.ndarray:
     if values.ndim > 1:
         values = values[:, 0]
     values = values.reshape(-1)
-    if values.size < 1 or not math.isfinite(float(source_rate)) or source_rate <= 0:
+    try:
+        rate = float(source_rate)
+    except (TypeError, ValueError, OverflowError):
+        rate = 0.0
+    if values.size < 1 or not math.isfinite(rate) or rate <= 0:
         return np.zeros(FRAME_SAMPLES, dtype=np.int16)
-    if values.size == FRAME_SAMPLES and abs(float(source_rate) - SAMPLE_RATE) < 0.5:
+    if values.size == FRAME_SAMPLES and abs(rate - SAMPLE_RATE) < 0.5:
         return values.astype(np.int16, copy=False)
     source_positions = np.linspace(0.0, 1.0, num=values.size, endpoint=False)
     target_positions = np.linspace(0.0, 1.0, num=FRAME_SAMPLES, endpoint=False)

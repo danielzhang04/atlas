@@ -29,7 +29,11 @@ def test_state_signal_assets_and_security_headers():
         publisher = StatePublisher(clock=lambda: _dt(0), voice="mars")
         publisher.start_session()
         publisher.set_state("LISTENING")
-        publisher.set_audio_energy(0.625)
+        publisher.set_audio({
+            "input": {"name": "Headset microphone", "following": True},
+            "output": {"name": "Headphones", "following": True},
+        })
+        publisher.set_audio_signal(0.625, [index / 23 for index in range(24)])
         server = await stateserver.start(publisher, 0, clock=lambda: _dt(1))
         try:
             return (
@@ -46,7 +50,15 @@ def test_state_signal_assets_and_security_headers():
     assert state_response[0] == 200
     assert payload["heartbeat"] == _dt(1).isoformat()
     assert payload["state"] == "LISTENING"
-    assert json.loads(signal[2]) == {"energy": 0.625}
+    assert payload["audio"] == {
+        "input": {"name": "Headset microphone", "following": True},
+        "output": {"name": "Headphones", "following": True},
+    }
+    assert "output_device" not in payload
+    assert json.loads(signal[2]) == {
+        "energy": 0.625,
+        "bands": [round(index / 23, 4) for index in range(24)],
+    }
     assert page[0] == 200 and "Atlas Engine" in page[2]
     assert state_response[1]["cache-control"] == "no-store"
     assert state_response[1]["x-frame-options"] == "DENY"

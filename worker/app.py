@@ -102,6 +102,7 @@ def _device_status(
     *,
     resolve,
     boot_default,
+    query_device=None,
 ) -> dict:
     if configured == FOLLOW_SENTINEL:
         return {"name": boot_default(), "following": True}
@@ -111,9 +112,11 @@ def _device_status(
     if index is None:
         return {"name": None, "following": False}
     try:
-        import sounddevice as sd
+        if query_device is None:
+            import sounddevice as sd
 
-        name = sd.query_devices(index)["name"]
+            query_device = sd.query_devices
+        name = query_device(index)["name"]
     except Exception:
         name = str(index)
     return {"name": name, "following": False}
@@ -126,17 +129,20 @@ def _audio_status(
     resolve_output=wakeword.resolve_output_device,
     boot_input=lambda: _boot_default_device_name(0),
     boot_output=lambda: _boot_default_device_name(1),
+    query_device=None,
 ) -> dict:
     return {
         "input": _device_status(
             cfg.get("wake_input_device"),
             resolve=resolve_input,
             boot_default=boot_input,
+            query_device=query_device,
         ),
         "output": _device_status(
             cfg.get("tts_output_device"),
             resolve=resolve_output,
             boot_default=boot_output,
+            query_device=query_device,
         ),
     }
 
@@ -163,6 +169,10 @@ def _start_audio_follow(
     output_follower_cls=devicewatch.OutputFollower,
     input_probe=devicewatch.current_default_input,
     output_probe=devicewatch.current_default_output,
+    resolve_input=wakeword.resolve_input_device,
+    resolve_output=wakeword.resolve_output_device,
+    sd_module=None,
+    request_restart=_restart_worker,
 ):
     input_following = cfg.get("wake_input_device") == FOLLOW_SENTINEL
     output_following = cfg.get("tts_output_device") == FOLLOW_SENTINEL
@@ -183,10 +193,14 @@ def _start_audio_follow(
         endpoint = initial[direction]
         if endpoint is None:
             logger.critical("%s-follow probe is unavailable", direction)
-            previous = publisher.snapshot()["audio"][direction]
+            previous_name = None
+            try:
+                previous_name = publisher.snapshot()["audio"][direction]["name"]
+            except Exception:
+                pass
             publisher.set_audio_device(
                 direction,
-                {"name": previous["name"], "following": False},
+                {"name": previous_name, "following": False},
             )
         else:
             publisher.set_audio_device(
@@ -207,7 +221,10 @@ def _start_audio_follow(
             )
         return None
     try:
-        import sounddevice as sd
+        if sd_module is None:
+            import sounddevice as sd
+        else:
+            sd = sd_module
 
         try:
             boot_input_index = sd.default.device[0]
@@ -220,19 +237,19 @@ def _start_audio_follow(
         if "input" in active_directions:
             input_follower = input_follower_cls(
                 console,
-                resolve_input=wakeword.resolve_input_device,
+                resolve_input=resolve_input,
                 sd_module=sd,
                 switch_wake_input=wake_switch.switch_to,
                 initial_idx=boot_input_index,
-                request_restart=_restart_worker,
+                request_restart=request_restart,
             )
         if "output" in active_directions:
             output_follower = output_follower_cls(
                 console,
-                resolve_output=wakeword.resolve_output_device,
+                resolve_output=resolve_output,
                 sd_module=sd,
                 initial_idx=boot_output_index,
-                request_restart=_restart_worker,
+                request_restart=request_restart,
             )
 
         def _on_input_change(name: str) -> None:
@@ -597,6 +614,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if wake_device and wake_device != FOLLOW_SENTINEL:
         initial_wake_device = wakeword.resolve_input_device(wake_device)
     wake_switch = wakeword.InputDeviceSwitch(initial_wake_device)
+    audio_watcher = None
     publisher.set_audio(_audio_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
@@ -683,6 +701,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def _shutdown() -> None:
         wakeword.shutting_down.set()
+        if audio_watcher is not None:
+            audio_watcher.stop()
         session.interrupt()
         turn_ownership.cancel()
         if sleep_task is not None:
@@ -702,7 +722,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if TEXT_MODE:
         return
 
-    _start_audio_follow(cfg, publisher, wake_switch)
+    audio_watcher = _start_audio_follow(cfg, publisher, wake_switch)
     session.input.set_audio_enabled(False)
 
     def _sleep(announce: bool = True) -> bool:
