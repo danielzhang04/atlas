@@ -13,6 +13,7 @@
     "config/persona.md",
   ];
   const ACTION_HEADER = "x-atlas-action-token";
+  const PAIRING_STORAGE_KEY = "atlas.pairing";
   const SIGNAL_INTERVAL_MS = 50;
 
   const refs = {
@@ -39,9 +40,12 @@
     mcpList: document.querySelector("#mcp-list"),
     configList: document.querySelector("#config-list"),
     pairingStatus: document.querySelector("#pairing-status"),
+    repairButton: document.querySelector("#repair-button"),
   };
 
   let actionToken = "";
+  let actionExpiresAt = 0;
+  let pairingExpiryTimer = 0;
   let currentView = "live";
   let jobs = [];
   let selectedJobId = "";
@@ -557,11 +561,35 @@
     return eventsByJob.get(jobId);
   }
 
+  function removeStoredPairing() {
+    try {
+      sessionStorage.removeItem(PAIRING_STORAGE_KEY);
+    } catch (_error) {
+      return;
+    }
+  }
+
+  function pairedUntilText() {
+    const expiry = new Date(actionExpiresAt * 1000);
+    const time = expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    return `Paired until ${time}`;
+  }
+
+  function renderPairingStatus() {
+    const paired = Boolean(actionToken) && actionExpiresAt * 1000 > Date.now();
+    refs.pairingStatus.textContent = paired ? pairedUntilText() : "Not paired";
+    refs.repairButton.disabled = !paired;
+  }
+
   function clearPairing() {
+    if (pairingExpiryTimer) window.clearTimeout(pairingExpiryTimer);
+    pairingExpiryTimer = 0;
     actionToken = "";
+    actionExpiresAt = 0;
+    removeStoredPairing();
     eventsByJob.clear();
     resultsByJob.clear();
-    refs.pairingStatus.textContent = "Not paired";
+    renderPairingStatus();
     const selected = jobs.find((job) => job.id === selectedResultId);
     setResultPanel(
       selected ? selected.title : "No job selected",
@@ -569,6 +597,37 @@
     );
     renderWorkers();
     renderHistory();
+  }
+
+  function setPairing(token, expiresAt) {
+    const expiration = Number(expiresAt);
+    if (typeof token !== "string" || !token || !Number.isFinite(expiration) || expiration * 1000 <= Date.now()) {
+      clearPairing();
+      return false;
+    }
+    if (pairingExpiryTimer) window.clearTimeout(pairingExpiryTimer);
+    actionToken = token;
+    actionExpiresAt = expiration;
+    try {
+      sessionStorage.setItem(PAIRING_STORAGE_KEY, JSON.stringify({token, expires_at: expiration}));
+    } catch (_error) {
+      clearPairing();
+      return false;
+    }
+    const delay = Math.min(expiration * 1000 - Date.now(), 2_147_000_000);
+    pairingExpiryTimer = window.setTimeout(clearPairing, delay);
+    renderPairingStatus();
+    return true;
+  }
+
+  function restorePairing() {
+    let stored = null;
+    try {
+      stored = JSON.parse(sessionStorage.getItem(PAIRING_STORAGE_KEY) || "null");
+    } catch (_error) {
+      removeStoredPairing();
+    }
+    if (!isRecord(stored) || !setPairing(stored.token, stored.expires_at)) clearPairing();
   }
 
   async function refreshEvents(job) {
@@ -814,6 +873,18 @@
     }
   }
 
+  async function pairWithToken(token) {
+    const response = await fetch("/pair", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({token}),
+    });
+    if (!response.ok) throw new Error("pairing failed");
+    const payload = await response.json();
+    if (!setPairing(payload.action_token, payload.expires_at)) throw new Error("invalid pairing");
+    await refreshJobs();
+  }
+
   async function pairFromFragment() {
     const params = new URLSearchParams(window.location.hash.slice(1));
     const token = params.get("pair");
@@ -822,20 +893,38 @@
     selectView("live");
     refs.pairingStatus.textContent = "Pairing";
     try {
-      const response = await fetch("/pair", {
-        method: "POST",
-        headers: {"content-type": "application/json"},
-        body: JSON.stringify({token}),
-      });
-      if (!response.ok) throw new Error("pairing failed");
-      const payload = await response.json();
-      actionToken = typeof payload.action_token === "string" ? payload.action_token : "";
-      refs.pairingStatus.textContent = actionToken ? "Paired" : "Not paired";
-      await refreshJobs();
+      await pairWithToken(token);
     } catch (_error) {
+      clearPairing();
       refs.pairingStatus.textContent = "Pairing failed";
     }
     return true;
+  }
+
+  async function renewPairing() {
+    if (!actionToken || actionExpiresAt * 1000 <= Date.now()) {
+      clearPairing();
+      return;
+    }
+    refs.repairButton.disabled = true;
+    refs.pairingStatus.textContent = "Re-pairing";
+    try {
+      const response = await fetch("/pair/bootstrap", {
+        cache: "no-store",
+        headers: {[ACTION_HEADER]: actionToken},
+      });
+      if (response.status === 401) {
+        clearPairing();
+        return;
+      }
+      if (!response.ok) throw new Error("renewal unavailable");
+      const payload = await response.json();
+      if (typeof payload.token !== "string" || !payload.token) throw new Error("invalid bootstrap");
+      await pairWithToken(payload.token);
+    } catch (_error) {
+      if (actionExpiresAt * 1000 <= Date.now()) clearPairing();
+      else renderPairingStatus();
+    }
   }
 
   async function handleHashChange() {
@@ -846,6 +935,8 @@
   CONFIG_PATHS.forEach((path) => refs.configList.append(node("li", "", path)));
   window.addEventListener("hashchange", handleHashChange);
   document.addEventListener("visibilitychange", updateLiveActivity);
+  refs.repairButton.addEventListener("click", renewPairing);
+  restorePairing();
   handleHashChange();
   refreshState();
   refreshJobs();

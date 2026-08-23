@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 from .brain import Brain
@@ -17,25 +19,46 @@ from .work import WorkManager
 __all__ = ["Runtime", "build"]
 
 ATLAS = Path(__file__).resolve().parents[1]
+logger = logging.getLogger("atlas.runtime")
 
 
 class _LazyAnthropicClient:
-    """Delay the provider import and client allocation until the first turn."""
+    """Warm the provider client off-thread while retaining lazy access."""
 
     def __init__(self, factory=None) -> None:
         self._factory = factory
         self._client = None
+        self._lock = threading.Lock()
+        self._warm_thread = threading.Thread(
+            target=self._warm,
+            name="atlas-anthropic-warmup",
+            daemon=True,
+        )
+        self._warm_thread.start()
 
-    @property
-    def messages(self):
-        if self._client is None:
+    def _client_instance(self):
+        if self._client is not None:
+            return self._client
+        with self._lock:
+            if self._client is not None:
+                return self._client
             factory = self._factory
             if factory is None:
                 from anthropic import AsyncAnthropic
 
                 factory = AsyncAnthropic
             self._client = factory()
-        return self._client.messages
+            return self._client
+
+    def _warm(self) -> None:
+        try:
+            self._client_instance()
+        except Exception as exc:
+            logger.warning("Anthropic client warmup failed (type=%s)", type(exc).__name__)
+
+    @property
+    def messages(self):
+        return self._client_instance().messages
 
 
 @dataclass(frozen=True, slots=True)

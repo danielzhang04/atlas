@@ -27,6 +27,7 @@ SPEAKING = "SPEAKING"
 SNAPSHOT_VERSION = 1
 DEFAULT_RING = 50
 BAND_COUNT = 24
+WAKE_MODEL_LIMIT = 128
 
 STATE_FROM_AGENT = {
     "thinking": THINKING,
@@ -48,9 +49,11 @@ class StatePublisher:
         clock: Callable[[], datetime] = _utcnow,
         ring_size: int = DEFAULT_RING,
         voice: str | None = None,
+        wake_model: str | None = None,
     ) -> None:
         self._clock = clock
         self.voice = voice
+        self.wake_model = _bounded_wake_model(wake_model)
         self._state = ASLEEP
         self._since = clock()
         self._session_id: str | None = None
@@ -162,6 +165,7 @@ class StatePublisher:
             "since": self._since.isoformat(),
             "session_id": self._session_id,
             "voice": self.voice,
+            "wake_model": self.wake_model,
             "transcript": list(self._ring),
             "audio": {
                 "input": dict(self._audio["input"]),
@@ -176,3 +180,9 @@ class StatePublisher:
                 fn(event)
             except Exception:
                 logger.exception("atlas state subscriber raised; skipping")
+
+
+def _bounded_wake_model(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:WAKE_MODEL_LIMIT]

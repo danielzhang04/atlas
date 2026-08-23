@@ -36,6 +36,9 @@ _Status = Literal["ok", "error", "needs_confirmation"]
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTENT_LIMIT = 4096
+_READBACK_ARGUMENT_LIMIT = 1_200
+_READBACK_VALUE_LIMIT = 160
+_HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
 _TRUNCATED = "…[truncated]"
@@ -136,6 +139,7 @@ class ToolRegistry:
                 "input_schema": deepcopy(tool.input_schema),
             }
             for tool in self._tools.values()
+            if tool.name not in _HOST_ONLY_TOOLS
         ]
 
     async def call(
@@ -146,6 +150,8 @@ class ToolRegistry:
         tainted: bool = False,
         transcript: str | None = None,
     ) -> ToolResult:
+        if name in _HOST_ONLY_TOOLS:
+            return ToolResult("error", "host-only")
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult("error", "unknown tool")
@@ -159,26 +165,27 @@ class ToolRegistry:
                 copied["brief"] = f"{transcript}{_TAINTED_BRIEF_SUFFIX}"
             if tool.policy == "confirm":
                 pending = self.pending
-                if pending is not None and pending.name == name:
+                if pending is not None:
                     return ToolResult(
                         "error",
-                        "already pending; Daniel must confirm or cancel first",
+                        "a previous action is still awaiting Daniel's yes or no",
                     )
-                serialized = json.dumps(copied)
+                serialized = json.dumps(copied, ensure_ascii=False)
+                if len(serialized) > _READBACK_ARGUMENT_LIMIT:
+                    return ToolResult("error", "too large to read back; split it")
                 pending = PendingAction(
                     confirm_id=secrets.token_urlsafe(8),
                     name=name,
                     arguments=copied,
-                    summary=f"{name} {serialized[:300]}",
+                    summary=_readback_summary(name, copied),
                     expires=self._clock() + 120.0,
                 )
                 self._pending = pending
                 return ToolResult(
                     "needs_confirmation",
                     _bound_content(
-                        f"NOT EXECUTED. Pending: {pending.summary}. Read this back and ask Daniel. "
-                        "When he agrees on a later turn, call confirm with "
-                        f'confirm_id="{pending.confirm_id}" — do not call {name} again.'
+                        "NOT EXECUTED. Read this summary back to Daniel and wait for his yes or no: "
+                        f"{pending.summary}."
                     ),
                     pending.confirm_id,
                 )
@@ -195,7 +202,6 @@ class ToolRegistry:
         arguments: Mapping[str, Any],
     ) -> bool:
         if name in {
-            "confirm",
             "close",
             "focus",
             "open_file",
@@ -298,12 +304,6 @@ def builtin(
         profile_focuser(app.exe)
         return {"focused": name}
 
-    async def confirm(arguments: dict) -> ToolResult:
-        return await registry.confirm(_text_argument(arguments, "confirm_id", maximum=256))
-
-    async def cancel_pending(_: dict) -> ToolResult:
-        return registry.cancel_pending()
-
     async def launch_work(arguments: dict) -> dict:
         title = _text_argument(arguments, "title", maximum=200)
         raw_brief = arguments.get("brief")
@@ -350,14 +350,6 @@ def builtin(
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
-        (
-            "confirm",
-            "After Daniel agrees on a later turn, execute the pending action using its confirm_id; "
-            "do not call the original tool again.",
-            {"confirm_id": {"type": "string"}},
-            confirm,
-        ),
-        ("cancel_pending", "Cancel the pending action.", {}, cancel_pending),
         ("launch_work", "Launch longer work in the background.", {
             "title": {"type": "string"}, "brief": {"type": "string"},
         }, launch_work),
@@ -490,6 +482,18 @@ def _serialize(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False)
+
+
+def _readback_summary(name: str, arguments: Mapping[str, Any]) -> str:
+    details = []
+    for key, value in arguments.items():
+        serialized = _serialize(value)
+        cleaned = _CONTROL_CHARACTERS.sub("", serialized)
+        if len(cleaned) > _READBACK_VALUE_LIMIT:
+            omitted = len(cleaned) - _READBACK_VALUE_LIMIT
+            cleaned = f"{cleaned[:_READBACK_VALUE_LIMIT]} …(+{omitted} chars)"
+        details.append(f"{key}: {cleaned}")
+    return f"{name} — " + ("; ".join(details) if details else "no arguments")
 
 
 def _bound_content(value: str) -> str:

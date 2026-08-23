@@ -53,6 +53,7 @@ JOB_FIELDS = (
     "id", "title", "status", "session_id", "created_at", "updated_at", "summary", "error",
 )
 MCP_FIELDS = ("name", "connected", "tools", "error")
+WAKE_MODEL_LIMIT = 128
 
 
 def _utcnow() -> datetime:
@@ -66,10 +67,12 @@ class PairingAuthorizer:
         self,
         *,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         token: str | None = None,
         ttl_s: float = 43_200,
     ) -> None:
         self._clock = clock
+        self._wall_clock = wall_clock
         self._ttl_s = float(ttl_s)
         self._pairing_token: str | None = token or secrets.token_urlsafe(24)
         self._bearers: dict[str, float] = {}
@@ -100,6 +103,18 @@ class PairingAuthorizer:
         self._pairing_token = None
         self._failures = 0
         return bearer
+
+    def expires_at(self, bearer: str) -> float:
+        self.authorize(bearer)
+        remaining = self._bearers[self._digest(bearer)] - self._clock()
+        return self._wall_clock() + max(0.0, remaining)
+
+    def renewal_bootstrap(self, bearer: str | None) -> str:
+        self.authorize(bearer)
+        token = secrets.token_urlsafe(24)
+        self._pairing_token = token
+        self._failures = 0
+        return token
 
     def authorize(self, bearer: str | None) -> None:
         if not bearer:
@@ -162,6 +177,12 @@ def _finite_number(value: Any) -> bool:
         and isinstance(value, (int, float))
         and math.isfinite(float(value))
     )
+
+
+def _bounded_string(value: Any, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:maximum]
 
 
 def _safe_job(value: Any) -> dict[str, Any] | None:
@@ -278,6 +299,7 @@ class StateServer:
 
     async def _handle_state(self, _request: web.Request) -> web.Response:
         payload = self._publisher.snapshot()
+        payload["wake_model"] = _bounded_string(payload.get("wake_model"), WAKE_MODEL_LIMIT)
         payload["heartbeat"] = self._clock().isoformat()
         return web.json_response(payload, headers={"cache-control": "no-store"})
 
@@ -420,7 +442,24 @@ class StateServer:
         except PermissionError as exc:
             raise web.HTTPUnauthorized(text=str(exc)) from None
         return web.json_response(
-            {"ok": True, "action_token": bearer}, headers={"cache-control": "no-store"},
+            {
+                "ok": True,
+                "action_token": bearer,
+                "expires_at": self._authorizer.expires_at(bearer),
+            },
+            headers={"cache-control": "no-store"},
+        )
+
+    async def _handle_pair_bootstrap(self, request: web.Request) -> web.Response:
+        if self._authorizer is None:
+            raise web.HTTPServiceUnavailable(text="Atlas UI pairing is unavailable")
+        try:
+            token = self._authorizer.renewal_bootstrap(request.headers.get(HEADER))
+        except PermissionError as exc:
+            raise web.HTTPForbidden(text=str(exc)) from None
+        return web.json_response(
+            {"token": token},
+            headers={"cache-control": "no-store"},
         )
 
     async def _handle_job_result(self, request: web.Request) -> web.Response:
@@ -490,6 +529,7 @@ class StateServer:
         app.router.add_get("/state", self._handle_state)
         app.router.add_get("/signal", self._handle_signal)
         app.router.add_post("/pair", self._handle_pair)
+        app.router.add_get("/pair/bootstrap", self._handle_pair_bootstrap)
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/mcp", self._handle_mcp)
         app.router.add_get("/jobs", self._handle_jobs)
