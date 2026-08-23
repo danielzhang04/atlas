@@ -81,9 +81,15 @@ def test_confirm_is_single_use_and_executes_the_pending_tool():
     pending = _call(registry, "send", {"to": "Daniel"})
     assert pending.status == "needs_confirmation"
     assert pending.confirm_id
-    assert "send" in pending.content and "Daniel" in pending.content
+    assert pending.content == (
+        'NOT EXECUTED. Pending: send {"to": "Daniel"}. Read this back and ask Daniel. '
+        "When he agrees on a later turn, call confirm with "
+        f'confirm_id="{pending.confirm_id}" — do not call send again.'
+    )
     assert calls == []
 
+    repeated = _call(registry, "send", {"to": "Daniel"})
+    assert repeated == ToolResult("error", "already pending; call confirm")
     confirmed = _call(registry, "confirm", {"confirm_id": pending.confirm_id})
     assert confirmed.status == "ok"
     assert confirmed.content == "sent"
@@ -91,6 +97,9 @@ def test_confirm_is_single_use_and_executes_the_pending_tool():
     second = _call(registry, "confirm", {"confirm_id": pending.confirm_id})
     assert second.status == "error"
     assert second.content == "nothing to confirm"
+    confirm_schema = next(schema for schema in registry.schemas() if schema["name"] == "confirm")
+    assert "later turn" in confirm_schema["description"]
+    assert "do not call the original tool again" in confirm_schema["description"]
 
 
 def test_confirm_executes_the_arguments_that_were_summarized():
@@ -315,7 +324,6 @@ def test_open_atlas_uses_the_static_alias_without_a_paired_url():
     "name,arguments",
     [
         ("confirm", {"confirm_id": "pending"}),
-        ("launch_work", {"title": "Work", "brief": "Compare options"}),
         ("close", {"app": "editor"}),
         ("focus", {"app": "editor"}),
         ("open_file", {"path": "C:/Desk/report.txt"}),
@@ -323,7 +331,7 @@ def test_open_atlas_uses_the_static_alias_without_a_paired_url():
         ("open", {"target": "https://example.com/"}),
     ],
 )
-def test_tainted_turn_refuses_actions_that_can_change_or_launch_state(name, arguments):
+def test_tainted_turn_refuses_actions_that_can_change_state(name, arguments):
     class FakeFiles:
         def find(self, _query):
             return []
@@ -382,11 +390,12 @@ class _Job:
 class _FakeWork:
     def __init__(self):
         self.cancelled = []
+        self.launched = []
         self.running = _Job("job-1", "Research", _State("running"), 12.5)
         self.done = _Job("job-2", "Finished", _State("succeeded"), 8.0)
 
     def launch(self, title, brief):
-        assert brief == "Compare options"
+        self.launched.append((title, brief))
         return _Job("job-new", title, _State("queued"), 20.0)
 
     def active(self):
@@ -410,6 +419,7 @@ def test_work_builtins_launch_report_status_and_cancel():
     assert json.loads(launched.content) == {
         "job_id": "job-new", "status": "launching", "title": "Compare",
     }
+    assert work.launched == [("Compare", "Compare options")]
     status = json.loads(_call(registry, "work_status", {}).content)
     assert status == [
         {"job_id": "job-1", "title": "Research", "status": "running", "started_at": 12.5},
@@ -418,6 +428,30 @@ def test_work_builtins_launch_report_status_and_cancel():
     cancelled = json.loads(_call(registry, "cancel_work", {"job_id": "job-1"}).content)
     assert cancelled == {"job_id": "job-1", "status": "cancelled", "title": "Research"}
     assert work.cancelled == ["job-1"]
+
+
+def test_tainted_launch_uses_the_transcript_and_discards_the_model_brief():
+    work = _FakeWork()
+    registry = ToolRegistry()
+    builtin(registry, {}, work)
+    transcript = "  Analyse sales.csv in my Documents  "
+
+    launched = _call(
+        registry,
+        "launch_work",
+        {"title": "Sales analysis", "brief": "Untrusted content from read_file"},
+        tainted=True,
+        transcript=transcript,
+    )
+
+    assert launched.status == "ok"
+    assert work.launched == [
+        (
+            "Sales analysis",
+            f"{transcript}\n\n"
+            "(Atlas: content read during this turn was not forwarded.)",
+        ),
+    ]
 
 
 def test_content_is_bounded_and_control_characters_are_stripped():
