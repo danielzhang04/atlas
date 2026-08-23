@@ -31,12 +31,17 @@ except ModuleNotFoundError:
         run: Callable[[dict], Awaitable[Any]]
         policy: Literal["instant", "confirm"] = "instant"
 
+    class McpToolError(RuntimeError):
+        pass
+
+    tools_module.McpToolError = McpToolError
     tools_module.Tool = Tool
     tools_module.Policy = Literal["instant", "confirm"]
     sys.modules["worker.tools"] = tools_module
 
 import worker.mcp_client as mcp_client
 from worker.mcp_client import McpServers, load_mcp_config, policy_for
+from worker.tools import McpToolError
 from worker.tools import ToolRegistry
 
 
@@ -251,7 +256,7 @@ def test_connect_registers_schema_policy_and_bounded_concatenated_text():
         (False, "Error calling tool 'draft_gmail_message': HttpError 400"),
     ],
 )
-def test_mirrored_tool_raises_bounded_runtime_error_for_mcp_errors(is_error, text):
+def test_mirrored_tool_raises_bounded_mcp_error_for_mcp_errors(is_error, text):
     class FakeErrorSession:
         async def call_tool(self, *_args, **_kwargs):
             return SimpleNamespace(
@@ -274,19 +279,18 @@ def test_mirrored_tool_raises_bounded_runtime_error_for_mcp_errors(is_error, tex
         remote_tool,
     )
 
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(McpToolError) as raised:
         asyncio.run(tool.run({}))
 
     message = str(raised.value)
     assert message.startswith(text[:40])
-    assert len(message) <= 4_096
-    if len(text) > 4_096:
-        assert message.endswith("…[truncated]")
+    assert len(message) <= 300
 
     registry = ToolRegistry()
     registry.register(tool)
     result = asyncio.run(registry.call(tool.name, {}))
     assert result.status == "error"
+    assert result.content == message
 
 
 def test_account_parameter_is_hidden_and_host_injected_for_mirrored_and_raw_calls():
@@ -335,6 +339,50 @@ def test_account_parameter_is_hidden_and_host_injected_for_mirrored_and_raw_call
     assert len(raw) > 5_000
     assert raw.endswith("Next page token: complete-token")
     assert "attacker@example.test" not in raw
+
+
+def test_account_scoped_calls_normalize_self_recipient_aliases_item_wise():
+    seen = []
+
+    class FakeSession:
+        async def call_tool(self, tool, *, arguments, read_timeout_seconds):
+            seen.append((tool, arguments, read_timeout_seconds))
+            return SimpleNamespace(content=[], isError=False)
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {}},
+            account_values={"user_google_email": "daniel@example.test"},
+        )
+        server_config = {"account_param": "user_google_email"}
+        await servers._call_session(
+            FakeSession(),
+            server_config,
+            8,
+            "draft_gmail_message",
+            {
+                "to": " me ",
+                "cc": "friend@example.test",
+                "bcc": ["MYSELF", "other@example.test", " Daniel "],
+                "recipient": "MY EMAIL",
+                "attendees": ["my email", 7],
+                "subject": "hello",
+            },
+        )
+
+    asyncio.run(scenario())
+
+    arguments = seen[0][1]
+    assert arguments["to"] == "daniel@example.test"
+    assert arguments["cc"] == "friend@example.test"
+    assert arguments["bcc"] == [
+        "daniel@example.test",
+        "other@example.test",
+        "daniel@example.test",
+    ]
+    assert arguments["recipient"] == "daniel@example.test"
+    assert arguments["attendees"] == ["daniel@example.test", 7]
+    assert arguments["subject"] == "hello"
 
 
 def test_connect_runs_the_server_hook_after_successful_tool_registration():
@@ -603,6 +651,60 @@ def test_close_is_idempotent():
         return exits
 
     assert asyncio.run(scenario()) == ["closed"]
+
+
+def test_connected_server_session_enters_and_exits_in_its_dedicated_task():
+    async def scenario():
+        task_ids = []
+        exits = []
+
+        @asynccontextmanager
+        async def factory(_server_name, _spec):
+            task_ids.append(id(asyncio.current_task()))
+            try:
+                async with create_connected_server_and_client_session(_server()) as session:
+                    yield session
+            finally:
+                task_ids.append(id(asyncio.current_task()))
+                exits.append("closed")
+
+        servers = McpServers(
+            {"servers": {"google": {"command": "unused"}}},
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        server_task = servers._server_tasks["google"]
+        await servers.close()
+        return task_ids, exits, server_task.done()
+
+    task_ids, exits, done = asyncio.run(scenario())
+
+    assert task_ids[0] == task_ids[1]
+    assert exits == ["closed"]
+    assert done is True
+
+
+def test_failed_server_task_ends_and_retains_disconnected_status():
+    async def scenario():
+        def factory(_server_name, _spec):
+            raise LookupError("unavailable")
+
+        servers = McpServers(
+            {"servers": {"broken": {"command": "bad"}}},
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        server_task = servers._server_tasks["broken"]
+        status = servers.status()
+        await servers.close()
+        return status, server_task.done()
+
+    status, done = asyncio.run(scenario())
+
+    assert status == [
+        {"name": "broken", "connected": False, "tools": 0, "error": "LookupError"},
+    ]
+    assert done is True
 
 
 def test_load_mcp_config_reads_mapping(tmp_path):

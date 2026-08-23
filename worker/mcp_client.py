@@ -17,7 +17,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 import yaml
 
-from .tools import Policy, Tool
+from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
     from .tools import ToolRegistry
@@ -28,6 +28,8 @@ __all__ = ["McpServers", "load_mcp_config", "policy_for"]
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_CONTENT = 4_096
+_RECIPIENT_ARGUMENTS = frozenset({"to", "cc", "bcc", "recipient", "attendees"})
+_SELF_RECIPIENTS = frozenset({"me", "myself", "my email"})
 _TRUNCATED = "…[truncated]"
 
 
@@ -109,10 +111,11 @@ class McpServers:
         self._on_server = on_server
         self._account_values = dict(account_values or {})
         self._killer = killer
-        self._stacks: dict[str, AsyncExitStack] = {}
         self._sessions: dict[str, ClientSession] = {}
         self._call_settings: dict[str, tuple[Mapping, float]] = {}
         self._server_pids: dict[str, int] = {}
+        self._server_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stop_events: dict[str, asyncio.Event] = {}
         self._closed = False
         servers = config.get("servers", {})
         self._status = {
@@ -143,12 +146,32 @@ class McpServers:
         defaults = self._config.get("defaults", {})
         timeout_s = float(defaults.get("connect_timeout_s", 20))
         server_hook = on_server or self._on_server
-        await asyncio.gather(*(
-            self._connect_one(name, server_cfg, defaults, timeout_s, registry, server_hook)
-            for name, server_cfg in servers.items()
-        ))
+        ready_events = []
+        for name, server_cfg in servers.items():
+            ready = asyncio.Event()
+            stop = asyncio.Event()
+            self._stop_events[name] = stop
+            self._server_tasks[name] = asyncio.create_task(
+                self._run_server(
+                    name,
+                    server_cfg,
+                    defaults,
+                    timeout_s,
+                    registry,
+                    server_hook,
+                    ready,
+                    stop,
+                ),
+                name=f"mcp-{name}",
+            )
+            ready_events.append(ready)
+        try:
+            await asyncio.gather(*(ready.wait() for ready in ready_events))
+        except asyncio.CancelledError:
+            await self._cancel_server_tasks()
+            raise
 
-    async def _connect_one(
+    async def _run_server(
         self,
         name: str,
         server_cfg: Mapping,
@@ -156,6 +179,8 @@ class McpServers:
         timeout_s: float,
         registry: ToolRegistry,
         on_server: ServerHook | None,
+        ready: asyncio.Event,
+        stop: asyncio.Event,
     ) -> None:
         stack = AsyncExitStack()
         try:
@@ -169,7 +194,6 @@ class McpServers:
                 ]
                 for tool in mirrored:
                     registry.register(tool)
-            self._stacks[name] = stack
             self._sessions[name] = session
             self._call_settings[name] = (
                 server_cfg,
@@ -182,18 +206,21 @@ class McpServers:
                 except Exception as exc:
                     _LOGGER.warning("MCP server %s hook failed: %s",
                                     name, type(exc).__name__)
+            ready.set()
+            await stop.wait()
         except asyncio.CancelledError:
-            self._kill_server_tree(name)
-            with suppress(Exception):
-                await stack.aclose()
             raise
         except Exception as exc:
-            self._kill_server_tree(name)
-            with suppress(Exception):
-                await stack.aclose()
             error = type(exc).__name__
             self._status[name].update(connected=False, tools=0, error=error)
             _LOGGER.warning("MCP server %s connection failed: %s", name, error)
+        finally:
+            ready.set()
+            self._sessions.pop(name, None)
+            self._call_settings.pop(name, None)
+            self._kill_server_tree(name)
+            with suppress(Exception):
+                await stack.aclose()
 
     def _resolve_spec(self, server_cfg: Mapping) -> StdioServerParameters:
         source: Mapping = server_cfg
@@ -268,6 +295,7 @@ class McpServers:
             account_value = self._account_values.get(account_param)
             if not isinstance(account_value, str) or not account_value:
                 raise RuntimeError("MCP account is not configured")
+            call_arguments = _normalize_recipients(call_arguments, account_value)
             call_arguments.pop(account_param, None)
             call_arguments[account_param] = account_value
         result = await session.call_tool(
@@ -284,7 +312,7 @@ class McpServers:
         is_error = bool(getattr(result, "isError", False))
         if is_error or clean.startswith("Error calling tool"):
             message = _bounded_text(clean) or "MCP tool call failed"
-            raise RuntimeError(message)
+            raise McpToolError(message)
         return clean
 
     def status(self) -> list[dict]:
@@ -296,15 +324,29 @@ class McpServers:
         self._closed = True
         self._sessions.clear()
         self._call_settings.clear()
-        stacks = list(reversed(self._stacks.items()))
-        self._stacks.clear()
-        for name, stack in stacks:
+        for name in tuple(self._server_tasks):
             self._kill_server_tree(name)
-            with suppress(Exception):
-                await stack.aclose()
+        for event in self._stop_events.values():
+            event.set()
+        tasks = list(self._server_tasks.values())
+        if tasks:
+            try:
+                async with asyncio.timeout(10):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                await self._cancel_server_tasks()
+        self._server_tasks.clear()
+        self._stop_events.clear()
         for name in tuple(self._server_pids):
             self._kill_server_tree(name)
         self._server_pids.clear()
+
+    async def _cancel_server_tasks(self) -> None:
+        tasks = list(self._server_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _kill_server_tree(self, name: str) -> None:
         pid = self._server_pids.pop(name, None)
@@ -330,6 +372,29 @@ def _clean_text(value: str) -> str:
         for char in value
         if char in "\n\t" or unicodedata.category(char) != "Cc"
     )
+
+
+def _normalize_recipients(arguments: Mapping[str, Any], account: str) -> dict[str, Any]:
+    normalized = dict(arguments)
+    local_part = account.partition("@")[0].strip().casefold()
+    self_values = set(_SELF_RECIPIENTS)
+    if local_part:
+        self_values.add(local_part)
+    for name, value in normalized.items():
+        if name.casefold() not in _RECIPIENT_ARGUMENTS:
+            continue
+        if isinstance(value, str):
+            if value.strip().casefold() in self_values:
+                normalized[name] = account
+            continue
+        if isinstance(value, list):
+            normalized[name] = [
+                account
+                if isinstance(item, str) and item.strip().casefold() in self_values
+                else item
+                for item in value
+            ]
+    return normalized
 
 
 def _without_account_parameter(schema: dict, account_param: Any) -> dict:

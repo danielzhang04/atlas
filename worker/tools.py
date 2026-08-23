@@ -20,6 +20,7 @@ from worker.localfiles import LocalFiles
 
 __all__ = [
     "AppEntry",
+    "McpToolError",
     "PendingAction",
     "Policy",
     "Tool",
@@ -47,6 +48,13 @@ _NEXT_PAGE_TOKEN = re.compile(
     r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+class McpToolError(RuntimeError):
+    """A bounded MCP failure that is safe to return to the model."""
+    def __init__(self, message: object) -> None:
+        clean = _CONTROL_CHARACTERS.sub("", str(message))
+        super().__init__((clean or "MCP tool call failed")[:300])
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +242,8 @@ class ToolRegistry:
         try:
             async with asyncio.timeout(self._timeout_s):
                 value = await tool.run(arguments)
+        except McpToolError as exc:
+            return ToolResult("error", str(exc))
         except Exception as exc:
             return ToolResult("error", type(exc).__name__)
         if isinstance(value, ToolResult):

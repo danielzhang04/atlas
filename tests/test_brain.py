@@ -966,6 +966,8 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "read every summary field back" in BASE_SYSTEM
     assert "host alone confirms or cancels" in BASE_SYSTEM
     assert "Do not call a confirmation tool" in BASE_SYSTEM
+    assert "\"myself\" means" in BASE_SYSTEM
+    assert "Daniel's own address" in BASE_SYSTEM
     assert "user_google_email" not in BASE_SYSTEM
 
 

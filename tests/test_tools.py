@@ -7,6 +7,7 @@ import pytest
 
 from worker.tools import (
     AppEntry,
+    McpToolError,
     Tool,
     ToolRegistry,
     ToolResult,
@@ -71,6 +72,23 @@ def test_instant_call_reports_success_exception_and_timeout():
     assert timeout.status == "error"
     assert timeout.content == "TimeoutError"
     assert _call(registry, "missing", {}).content == "unknown tool"
+
+
+def test_mcp_tool_error_passes_through_bounded_sanitized_message():
+    registry = ToolRegistry()
+
+    async def fail(_):
+        raise McpToolError("Invalid\x00 To\nheader " + "x" * 400)
+
+    registry.register(_tool("mcp_fail", run=fail))
+
+    result = _call(registry, "mcp_fail", {})
+
+    assert result.status == "error"
+    assert result.content.startswith("Invalid Toheader ")
+    assert len(result.content) == 300
+    assert "\x00" not in result.content
+    assert "\n" not in result.content
 
 
 def test_host_confirmation_is_single_use_and_model_calls_are_host_only():
