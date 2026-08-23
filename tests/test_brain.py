@@ -25,6 +25,7 @@ class FakeRegistry:
         self.results = list(results)
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.taints: list[bool] = []
+        self.transcripts: list[str | None] = []
         self.when_called = None
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -47,11 +48,13 @@ class FakeRegistry:
         arguments: dict[str, Any],
         *,
         tainted: bool = False,
+        transcript: str | None = None,
     ) -> ToolResult:
         if self.when_called is not None:
             self.when_called()
         self.calls.append((name, dict(arguments)))
         self.taints.append(tainted)
+        self.transcripts.append(transcript)
         return self.results.pop(0) if self.results else ToolResult("ok", "done")
 
 
@@ -224,8 +227,13 @@ def test_tool_use_continues_with_result_and_invokes_callback():
 
 
 def test_confirmation_status_and_id_survive_for_the_later_confirm_turn():
+    pending_content = (
+        'NOT EXECUTED. Pending: mutate {"message": "hello"}. Read this back and ask Daniel. '
+        'When he agrees on a later turn, call confirm with confirm_id="confirm-123" — do not call '
+        "mutate again."
+    )
     registry = FakeRegistry(
-        ToolResult("needs_confirmation", "mutate {\"message\": \"hello\"}", "confirm-123"),
+        ToolResult("needs_confirmation", pending_content, "confirm-123"),
         ToolResult("ok", "sent"),
     )
     client = FakeClient(
@@ -249,10 +257,9 @@ def test_confirmation_status_and_id_survive_for_the_later_confirm_turn():
     assert first == ["Should I send it?"]
     assert second == ["Sent."]
     tool_result = client.messages.calls[1]["messages"][-1]["content"][0]
-    assert tool_result["content"] == (
-        'needs_confirmation (confirm_id: confirm-123): mutate {"message": "hello"}'
-    )
+    assert tool_result["content"] == pending_content
     assert "Host pending confirmation id: confirm-123." in client.messages.calls[2]["system"][0]["text"]
+    assert registry.calls[-1] == ("confirm", {"confirm_id": "confirm-123"})
     assert brain._pending_confirm_id is None
 
 
@@ -337,7 +344,7 @@ def test_mcp_result_refuses_later_confirm_without_consuming_pending_and_next_tur
     assert third == ["Sent."]
 
 
-def test_mcp_result_refuses_later_launch_work_without_launching():
+def test_mcp_result_allows_launch_work_with_the_exact_turn_transcript():
     work = BrainWork()
     registry = ToolRegistry()
     registry.register(registry_tool(
@@ -354,18 +361,34 @@ def test_mcp_result_refuses_later_launch_work_without_launching():
             )],
             stop_reason="tool_use",
         ),
-        FakeStream(["Ask again next turn."], content=[text_block("Ask again next turn.")]),
+        FakeStream(["Launched."], content=[text_block("Launched.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
+    transcript = "  Read this and research it  "
 
-    assert asyncio.run(collect(brain, "Read this and research it")) == [
-        "Ask again next turn."
+    assert asyncio.run(collect(brain, transcript)) == ["Launched."]
+    launch_result = client.messages.calls[2]["messages"][-1]["content"][0]
+    assert launch_result["is_error"] is False
+    assert work.launches == [
+        (
+            "Research",
+            f"{transcript}\n\n"
+            "(Atlas: content read during this turn was not forwarded.)",
+        ),
     ]
-    refusal = client.messages.calls[2]["messages"][-1]["content"][0]
-    assert refusal["content"] == (
-        "refused after external content; ask Daniel again next turn"
+
+
+def test_brain_passes_the_exact_transcript_to_each_registry_call():
+    registry = FakeRegistry(ToolResult("ok", "done"))
+    client = FakeClient(
+        FakeStream(content=[tool_block()], stop_reason="tool_use"),
+        FakeStream(["Done."], content=[text_block("Done.")]),
     )
-    assert work.launches == []
+    brain = Brain(client, registry, model="fast", persona="")
+    transcript = "  Keep my spacing  "
+
+    assert asyncio.run(collect(brain, transcript)) == ["Done."]
+    assert registry.transcripts == [transcript]
 
 
 @pytest.mark.parametrize("content_tool", ["google__read", "read_file"])
@@ -576,6 +599,11 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "never count from a search page" in BASE_SYSTEM
     assert "summarize, sum, or analyze a truncated read_file result" in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM
+    assert "reading or acting inside a web page, or Chrome, uses launch_work" in BASE_SYSTEM
+    assert "unless the tool result for that call" in BASE_SYSTEM
+    assert "do not narrate between tool calls" in BASE_SYSTEM
+    assert "never re-call the" in BASE_SYSTEM
+    assert "only after confirm returns ok" in BASE_SYSTEM
     assert "user_google_email" not in BASE_SYSTEM
 
 

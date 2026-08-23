@@ -37,6 +37,7 @@ _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTENT_LIMIT = 4096
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
+_TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
 _TRUNCATED = "…[truncated]"
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
 _NEXT_PAGE_TOKEN = re.compile(
@@ -135,6 +136,7 @@ class ToolRegistry:
         arguments: Mapping[str, Any],
         *,
         tainted: bool = False,
+        transcript: str | None = None,
     ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
@@ -143,7 +145,21 @@ class ToolRegistry:
             copied = deepcopy(dict(arguments))
             if tainted and self._refused_after_external_content(name, copied):
                 return ToolResult("error", _TAINT_REFUSAL)
+            if tainted and name == "launch_work":
+                if not isinstance(transcript, str) or not transcript.strip():
+                    return ToolResult("error", "missing turn transcript")
+                copied["brief"] = f"{transcript}{_TAINTED_BRIEF_SUFFIX}"
             if tool.policy == "confirm":
+                pending = self._pending
+                if pending is not None and pending.expires <= self._clock():
+                    self._pending = None
+                    pending = None
+                if (
+                    pending is not None
+                    and pending.name == name
+                    and pending.arguments == copied
+                ):
+                    return ToolResult("error", "already pending; call confirm")
                 serialized = json.dumps(copied)
                 pending = PendingAction(
                     confirm_id=secrets.token_urlsafe(8),
@@ -155,7 +171,11 @@ class ToolRegistry:
                 self._pending = pending
                 return ToolResult(
                     "needs_confirmation",
-                    _bound_content(pending.summary),
+                    _bound_content(
+                        f"NOT EXECUTED. Pending: {pending.summary}. Read this back and ask Daniel. "
+                        "When he agrees on a later turn, call confirm with "
+                        f'confirm_id="{pending.confirm_id}" — do not call {name} again.'
+                    ),
                     pending.confirm_id,
                 )
             return await self._execute(tool, copied)
@@ -172,7 +192,6 @@ class ToolRegistry:
     ) -> bool:
         if name in {
             "confirm",
-            "launch_work",
             "close",
             "focus",
             "open_file",
@@ -286,7 +305,14 @@ def builtin(
 
     async def launch_work(arguments: dict) -> dict:
         title = _text_argument(arguments, "title", maximum=200)
-        brief = _text_argument(arguments, "brief", maximum=4096)
+        raw_brief = arguments.get("brief")
+        if isinstance(raw_brief, str) and raw_brief.endswith(_TAINTED_BRIEF_SUFFIX):
+            transcript = raw_brief[:-len(_TAINTED_BRIEF_SUFFIX)]
+            if not transcript.strip() or len(transcript) > 4096:
+                raise ValueError("invalid brief")
+            brief = raw_brief
+        else:
+            brief = _text_argument(arguments, "brief", maximum=4096)
         job = work.launch(title, brief)
         return {"job_id": job.job_id, "status": "launching", "title": job.title}
 
@@ -323,7 +349,13 @@ def builtin(
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
-        ("confirm", "Confirm the pending action.", {"confirm_id": {"type": "string"}}, confirm),
+        (
+            "confirm",
+            "After Daniel agrees on a later turn, execute the pending action using its confirm_id; "
+            "do not call the original tool again.",
+            {"confirm_id": {"type": "string"}},
+            confirm,
+        ),
         ("cancel_pending", "Cancel the pending action.", {}, cancel_pending),
         ("launch_work", "Launch longer work in the background.", {
             "title": {"type": "string"}, "brief": {"type": "string"},
