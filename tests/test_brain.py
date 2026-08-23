@@ -368,10 +368,7 @@ def test_mcp_result_refuses_later_launch_work_without_launching():
     assert work.launches == []
 
 
-@pytest.mark.parametrize(
-    "content_tool",
-    ["google__read", "read_file", "find_file", "count_mail"],
-)
+@pytest.mark.parametrize("content_tool", ["google__read", "read_file"])
 def test_content_bearing_tools_taint_every_later_call_in_the_turn(content_tool):
     registry = FakeRegistry(ToolResult("ok", "content"), ToolResult("ok", "done"))
     client = FakeClient(
@@ -383,6 +380,24 @@ def test_content_bearing_tools_taint_every_later_call_in_the_turn(content_tool):
 
     assert asyncio.run(collect(brain, "Check, then act")) == ["Done."]
     assert registry.taints == [False, True]
+
+
+@pytest.mark.parametrize(
+    ("first_tool", "later_tool"),
+    [("find_file", "open_file"), ("count_mail", "open")],
+)
+def test_metadata_tools_do_not_taint_later_calls_in_the_turn(first_tool, later_tool):
+    registry = FakeRegistry(ToolResult("ok", "metadata"), ToolResult("ok", "done"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name=first_tool)], stop_reason="tool_use"),
+        FakeStream(content=[tool_block(name=later_tool)], stop_reason="tool_use"),
+        FakeStream(["Done."], content=[text_block("Done.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Check, then open it")) == ["Done."]
+    assert registry.calls == [(first_tool, {}), (later_tool, {})]
+    assert registry.taints == [False, False]
 
 
 def test_content_result_refuses_a_later_action_in_the_same_tool_batch():

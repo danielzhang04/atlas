@@ -298,4 +298,4 @@ class Brain:
 
 
 def _content_bearing_tool(name: str) -> bool:
-    return "__" in name or name in {"read_file", "find_file", "count_mail"}
+    return "__" in name or name == "read_file"
