@@ -32,6 +32,8 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 logger = logging.getLogger("atlas.wakeword")
 
 ATLAS = Path(__file__).resolve().parents[1]  # same root convention as worker/app.py
@@ -41,6 +43,9 @@ SAMPLE_RATE = 16000
 THRESHOLD = 0.5
 PATIENCE = 3           # consecutive frames above threshold before a wake fires (240 ms @ 80 ms/frame)
 REFRACTORY_S = 3.0     # one wake per phrase, not one per 80ms frame while scores stay high
+BAND_COUNT = 24
+BAND_ATTACK = 0.45
+BAND_DECAY = 0.18
 
 # Set by app.py's shutdown callback so the wake thread's error path stays quiet on Ctrl+C.
 # A mic/model failure MID-RUN still logs CRITICAL (Atlas going silently DEAF is the real
@@ -66,6 +71,57 @@ def normalized_audio_energy(samples) -> float:
     rms = math.sqrt(mean_square) / 32768.0
     dbfs = 20.0 * math.log10(max(rms, 1e-9))
     return round(max(0.0, min(1.0, (dbfs + 55.0) / 45.0)), 4)
+
+
+def resample_audio_frame(samples, source_rate: float) -> np.ndarray:
+    """Linearly resample one native-rate 80 ms frame to 1280 int16 samples."""
+    values = np.asarray(samples)
+    if values.ndim > 1:
+        values = values[:, 0]
+    values = values.reshape(-1)
+    if values.size < 1 or not math.isfinite(float(source_rate)) or source_rate <= 0:
+        return np.zeros(FRAME_SAMPLES, dtype=np.int16)
+    if values.size == FRAME_SAMPLES and abs(float(source_rate) - SAMPLE_RATE) < 0.5:
+        return values.astype(np.int16, copy=False)
+    source_positions = np.linspace(0.0, 1.0, num=values.size, endpoint=False)
+    target_positions = np.linspace(0.0, 1.0, num=FRAME_SAMPLES, endpoint=False)
+    resampled = np.interp(target_positions, source_positions, values.astype(np.float32))
+    return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
+
+
+def normalized_audio_bands(samples, previous=None) -> list[float]:
+    """Return 24 smoothed log-spaced FFT band amplitudes bounded to 0..1."""
+    values = np.asarray(samples)
+    if values.ndim > 1:
+        values = values[:, 0]
+    values = values.reshape(-1).astype(np.float32)
+    if values.size < 2 or not np.all(np.isfinite(values)):
+        raw = np.zeros(BAND_COUNT, dtype=np.float32)
+    else:
+        values /= 32768.0
+        window = np.hanning(values.size).astype(np.float32)
+        scale = max(float(window.sum()) / 2.0, 1.0)
+        magnitudes = np.abs(np.fft.rfft(values * window)) / scale
+        frequencies = np.fft.rfftfreq(values.size, d=1.0 / SAMPLE_RATE)
+        edges = np.geomspace(60.0, SAMPLE_RATE / 2.0, BAND_COUNT + 1)
+        raw = np.zeros(BAND_COUNT, dtype=np.float32)
+        for index in range(BAND_COUNT):
+            if index == BAND_COUNT - 1:
+                mask = (frequencies >= edges[index]) & (frequencies <= edges[index + 1])
+            else:
+                mask = (frequencies >= edges[index]) & (frequencies < edges[index + 1])
+            amplitude = float(np.max(magnitudes[mask])) if np.any(mask) else 0.0
+            dbfs = 20.0 * math.log10(max(amplitude, 1e-9))
+            raw[index] = max(0.0, min(1.0, (dbfs + 70.0) / 60.0))
+    try:
+        prior = np.asarray(previous, dtype=np.float32)
+    except (TypeError, ValueError):
+        prior = np.zeros(BAND_COUNT, dtype=np.float32)
+    if prior.shape != (BAND_COUNT,) or not np.all(np.isfinite(prior)):
+        prior = np.zeros(BAND_COUNT, dtype=np.float32)
+    coefficients = np.where(raw > prior, BAND_ATTACK, BAND_DECAY)
+    smoothed = prior + coefficients * (raw - prior)
+    return [round(float(value), 4) for value in np.clip(smoothed, 0.0, 1.0)]
 
 
 def _resolve_model(model_name: str) -> tuple[str, str]:
@@ -148,12 +204,30 @@ class WakeGate:
         return "spike" if ended_early else None
 
 
+class InputDeviceSwitch:
+    """Thread-safe handoff that asks the wake loop to reopen on a new device index."""
+
+    def __init__(self, device: int | None = None) -> None:
+        self._device = device
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    def current(self) -> tuple[int | None, int]:
+        with self._lock:
+            return self._device, self._generation
+
+    def switch_to(self, device: int | None) -> None:
+        with self._lock:
+            self._device = device
+            self._generation += 1
+
+
 def resolve_input_device(substring: str | None, devices=None):
     """Index of the first input device whose name contains substring (case-insensitive).
     None/empty substring or no match -> None (system default). Pinning matters: Windows
     drifts the default input (e.g. to a Bluetooth hands-free path whose audio is too
     degraded/stuttery to score — 2026-07-20 desk finding), while a named wired mic is stable."""
-    if not substring:
+    if not substring or substring.casefold() == "follow":
         return None
     if devices is None:
         import sounddevice as sd
@@ -189,52 +263,102 @@ def resolve_output_device(substring: str | None, devices=None):
     return None
 
 
-def listen(on_wake: Callable[[], None], model_name: str = "hey_jarvis",
-           device: str | None = None, threshold: float = THRESHOLD,
-           patience: int = PATIENCE,
-           on_energy: Callable[[float], None] | None = None) -> None:
-    """Blocking mic loop: read 1280-sample int16 frames at 16 kHz, score each with the wake
-    model, and call on_wake() when `patience` CONSECUTIVE frames cross `threshold` (WakeGate —
-    single-frame spikes are the 2026-08-12 ghost-wake source and are logged, not fired).
-    Runs until interrupted. `device` is a name substring pinned via config (wake_input_device),
-    resolved above.
+def listen(
+    on_wake: Callable[[], None],
+    model_name: str = "hey_jarvis",
+    device: str | None = None,
+    threshold: float = THRESHOLD,
+    patience: int = PATIENCE,
+    on_energy: Callable[[float], None] | None = None,
+    on_signal: Callable[[float, list[float]], None] | None = None,
+    device_switch: InputDeviceSwitch | None = None,
+    sd_module=None,
+    model_loader=load_model,
+    clock=None,
+    max_frames: int | None = None,
+) -> None:
+    """Read native-rate 80 ms frames, resample to 16 kHz, and score wake audio.
 
-    Any failure here (mic busy/exclusive-mode conflict, model load error) would otherwise kill
-    the daemon thread silently and leave Atlas permanently ASLEEP — so log it LOUDLY (review
-    finding, T7)."""
+    Follow mode starts on the current system default. ``device_switch`` changes cause the
+    active stream to close after at most one frame and reopen at the new device's native rate.
+    """
     try:
-        import sounddevice as sd
+        if sd_module is None:
+            import sounddevice as sd
+        else:
+            sd = sd_module
+        if clock is None:
+            import time as _time
 
-        model, predict_key = load_model(model_name)
-        dev = resolve_input_device(device)
-        logger.info("wake listener on input device: %s",
-                    sd.query_devices(dev)["name"] if dev is not None else "system default")
-        import time as _time
-        with sd.InputStream(device=dev, samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_SAMPLES) as stream:
-            gate = WakeGate(threshold=threshold, patience=patience)
-            while True:
-                frame, _ = stream.read(FRAME_SAMPLES)
-                if on_energy is not None:
-                    try:
-                        on_energy(normalized_audio_energy(frame[:, 0]))
-                    except Exception:
-                        logger.exception("audio-energy observer failed; disabling visual signal")
-                        on_energy = None
-                scores = model.predict(frame[:, 0])
-                event = gate.update(scores.get(predict_key, 0.0), _time.monotonic())
-                if event == "wake":
-                    logger.info("wake fired (peak score %.2f over %d frames)", gate.peak, gate.run)
-                    on_wake()
-                elif event == "spike":
-                    # The ghost-wake signature: threshold crossed but not sustained. Keep these
-                    # visible so false-trigger pressure can be tuned from worker diagnostics.
-                    logger.info("wake spike suppressed (peak score %.2f, %d frame(s) < patience %d)",
-                                gate.peak, gate.spike_frames, gate.patience)
+            clock = _time.monotonic
+        model, predict_key = model_loader(model_name)
+        initial_device = resolve_input_device(device)
+        switch = device_switch or InputDeviceSwitch(initial_device)
+        gate = WakeGate(threshold=threshold, patience=patience)
+        smoothed_bands = [0.0] * BAND_COUNT
+        processed = 0
+        while True:
+            selected_device, generation = switch.current()
+            query_device = selected_device
+            if query_device is None:
+                query_device = sd.default.device[0]
+            device_info = sd.query_devices(query_device, kind="input")
+            native_rate = float(device_info["default_samplerate"])
+            native_samples = max(1, round(native_rate * FRAME_SAMPLES / SAMPLE_RATE))
+            logger.info(
+                "wake listener on input device: %s at %d Hz",
+                device_info.get("name", "system default"),
+                round(native_rate),
+            )
+            with sd.InputStream(
+                device=selected_device,
+                samplerate=native_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=native_samples,
+            ) as stream:
+                while switch.current()[1] == generation:
+                    frame, _ = stream.read(native_samples)
+                    model_frame = resample_audio_frame(frame, native_rate)
+                    energy = normalized_audio_energy(model_frame)
+                    smoothed_bands = normalized_audio_bands(model_frame, smoothed_bands)
+                    if on_energy is not None:
+                        try:
+                            on_energy(energy)
+                        except Exception:
+                            logger.exception("audio-energy observer failed; disabling visual signal")
+                            on_energy = None
+                    if on_signal is not None:
+                        try:
+                            on_signal(energy, smoothed_bands)
+                        except Exception:
+                            logger.exception("audio-signal observer failed; disabling visual signal")
+                            on_signal = None
+                    scores = model.predict(model_frame)
+                    event = gate.update(scores.get(predict_key, 0.0), clock())
+                    if event == "wake":
+                        logger.info(
+                            "wake fired (peak score %.2f over %d frames)",
+                            gate.peak,
+                            gate.run,
+                        )
+                        on_wake()
+                    elif event == "spike":
+                        logger.info(
+                            "wake spike suppressed (peak score %.2f, %d frame(s) < patience %d)",
+                            gate.peak,
+                            gate.spike_frames,
+                            gate.patience,
+                        )
+                    processed += 1
+                    if max_frames is not None and processed >= max_frames:
+                        return
     except Exception:
         if shutting_down.is_set():
             logger.info("wake listener stopped during shutdown")
             return
         logger.critical(
             "wake-word listener died — Atlas is DEAF until the worker restarts "
-            "(likely mic device conflict or model load failure)", exc_info=True)
+            "(likely mic device conflict or model load failure)",
+            exc_info=True,
+        )

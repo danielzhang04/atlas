@@ -285,8 +285,19 @@ class StateServer:
         value = getattr(self._publisher, "audio_energy", 0.0)
         if not _finite_number(value):
             value = 0.0
+        source_bands = getattr(self._publisher, "audio_bands", ())
+        if not isinstance(source_bands, (list, tuple)) or len(source_bands) != 24:
+            source_bands = [0.0] * 24
+        bands = []
+        for band in source_bands:
+            if not _finite_number(band):
+                band = 0.0
+            bands.append(round(max(0.0, min(1.0, float(band))), 4))
         return web.json_response(
-            {"energy": round(max(0.0, min(1.0, float(value))), 4)},
+            {
+                "energy": round(max(0.0, min(1.0, float(value))), 4),
+                "bands": bands,
+            },
             headers={"cache-control": "no-store"},
         )
 
