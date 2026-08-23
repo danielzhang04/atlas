@@ -344,7 +344,7 @@ def builtin(
 
     async def read_file(arguments: dict) -> dict:
         path = _text_argument(arguments, "path", maximum=2048)
-        return files.read(path)
+        return await files.read_file(path)
 
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
@@ -366,7 +366,7 @@ def builtin(
             ("open_file", "Open an inert document or media file under configured roots.", {
                 "path": {"type": "string"},
             }, open_file),
-            ("read_file", "Read bounded text from a file under configured roots.", {
+            ("read_file", "Read small text or route previewed large-file analysis to launch_work.", {
                 "path": {"type": "string"},
             }, read_file),
         )

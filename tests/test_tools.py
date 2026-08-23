@@ -254,8 +254,8 @@ def test_file_and_close_builtins_delegate_to_confined_services():
             calls.append(("open_file", path))
             return {"opened": path}
 
-        def read(self, path):
-            calls.append(("read", path))
+        async def read_file(self, path):
+            calls.append(("read_file", path))
             return {"path": path, "bytes": 3, "text": "abc"}
 
     apps = {
@@ -285,7 +285,7 @@ def test_file_and_close_builtins_delegate_to_confined_services():
     assert calls == [
         ("find", "report"),
         ("open_file", "C:/Desk/report.csv"),
-        ("read", "C:/Desk/report.csv"),
+        ("read_file", "C:/Desk/report.csv"),
         ("close", "vscode"),
     ]
     close_schema = next(
@@ -294,6 +294,12 @@ def test_file_and_close_builtins_delegate_to_confined_services():
         if schema["name"] == "close"
     )
     assert "close every window" in close_schema["description"].casefold()
+    read_schema = next(
+        schema
+        for schema in registry.schemas()
+        if schema["name"] == "read_file"
+    )
+    assert "launch_work" in read_schema["description"]
 
 
 def test_find_file_runs_the_directory_scan_off_the_event_loop_thread():

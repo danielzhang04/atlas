@@ -137,6 +137,16 @@ class FakeClient:
         self.messages = FakeMessages(responses)
 
 
+class DelayedFinalStream(FakeStream):
+    def __init__(self, *args, final_delay, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.final_delay = final_delay
+
+    async def get_final_message(self):
+        await asyncio.sleep(self.final_delay)
+        return self.final
+
+
 def text_block(text: str):
     return SimpleNamespace(type="text", text=text)
 
@@ -764,12 +774,77 @@ def test_fifth_model_round_disables_tools():
     ]
 
 
-def test_timeout_returns_only_fixed_sentence():
+def test_three_tool_rounds_each_get_a_fresh_model_call_budget():
+    class SlowRegistry(FakeRegistry):
+        async def call(self, *args, **kwargs):
+            await asyncio.sleep(0.05)
+            return await super().call(*args, **kwargs)
+
+    responses = [
+        DelayedFinalStream(
+            content=[tool_block(f"toolu_{index}")],
+            stop_reason="tool_use",
+            final_delay=0.03,
+        )
+        for index in range(3)
+    ]
+    responses.append(
+        DelayedFinalStream(
+            ["Finished."],
+            content=[text_block("Finished.")],
+            final_delay=0.03,
+        ),
+    )
+    client = FakeClient(*responses)
+    brain = Brain(
+        client,
+        SlowRegistry(),
+        model="fast",
+        persona="",
+        turn_timeout_s=0.15,
+        turn_ceiling_s=1.0,
+    )
+
+    assert asyncio.run(collect(brain, "loop")) == ["Finished."]
+    assert len(client.messages.calls) == 4
+
+
+def test_model_call_timeout_returns_only_fixed_sentence():
     client = FakeClient(FakeStream(["late"], content=[text_block("late")], delay=0.05))
-    brain = Brain(client, FakeRegistry(), model="fast", persona="", turn_timeout_s=0.01)
+    brain = Brain(
+        client,
+        FakeRegistry(),
+        model="fast",
+        persona="",
+        turn_timeout_s=0.01,
+        turn_ceiling_s=0.1,
+    )
 
     assert asyncio.run(collect(brain, "hello")) == ["I lost that one to a timeout. Still here."]
     assert brain._history == []
+
+
+def test_turn_ceiling_covers_tool_rounds():
+    class SlowRegistry(FakeRegistry):
+        async def call(self, *args, **kwargs):
+            await asyncio.sleep(0.05)
+            return await super().call(*args, **kwargs)
+
+    client = FakeClient(
+        FakeStream(content=[tool_block()], stop_reason="tool_use"),
+    )
+    brain = Brain(
+        client,
+        SlowRegistry(),
+        model="fast",
+        persona="",
+        turn_timeout_s=0.1,
+        turn_ceiling_s=0.01,
+    )
+
+    assert asyncio.run(collect(brain, "loop")) == [
+        "I lost that one to a timeout. Still here.",
+    ]
 
 
 def test_provider_exception_is_sanitized(caplog):
@@ -822,7 +897,10 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "analysis that needs code or produces artifacts" in BASE_SYSTEM
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
-    assert "summarize, sum, or analyze a truncated read_file result" in BASE_SYSTEM
+    assert (
+        "If read_file reports truncated, do not analyse the preview — "
+        "call launch_work with the exact path."
+    ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM
     assert "reading or acting inside a web page, or Chrome, uses launch_work" in BASE_SYSTEM
     assert "unless the tool result for that call" in BASE_SYSTEM

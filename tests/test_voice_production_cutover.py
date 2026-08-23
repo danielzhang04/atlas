@@ -49,7 +49,13 @@ def test_voice_worker_imports_new_lanes_and_removed_modules_are_absent():
 
 def test_production_config_has_only_revamp_composition_keys():
     config = (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8")
-    for key in ("google_account:", "work_workspace_path:", "turn_timeout_s:", "max_tokens:"):
+    for key in (
+        "google_account:",
+        "work_workspace_path:",
+        "turn_timeout_s:",
+        "turn_ceiling_s:",
+        "max_tokens:",
+    ):
         assert key in config
     for removed in (
         "local_file_roots", "desktop_target_aliases", "browser_bridge_url",

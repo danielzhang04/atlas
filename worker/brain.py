@@ -80,7 +80,7 @@ multiple steps, writing files, browsing, or more than a few seconds.
 After launch_work returns ok, say it is launching and will show in Workers; never pretend it is done.
 Use find_file and read_file for quick questions about a file. Use launch_work for
 analysis that needs code or produces artifacts.
-Do not summarize, sum, or analyze a truncated read_file result; use launch_work instead.
+If read_file reports truncated, do not analyse the preview — call launch_work with the exact path.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
 in:inbox for all; never count from a search page.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
@@ -192,15 +192,29 @@ class Brain:
         persona: str,
         max_tokens: int = 400,
         turn_timeout_s: float = 12.0,
+        turn_ceiling_s: float = 30.0,
         history_exchanges: int = 8,
         on_tool: Callable[[str, ToolResult], None] | None = None,
         clock: Callable[[], datetime] = datetime.now,
     ) -> None:
+        if (
+            isinstance(turn_timeout_s, bool)
+            or not isinstance(turn_timeout_s, (int, float))
+            or turn_timeout_s <= 0
+        ):
+            raise ValueError("turn_timeout_s must be positive")
+        if (
+            isinstance(turn_ceiling_s, bool)
+            or not isinstance(turn_ceiling_s, (int, float))
+            or turn_ceiling_s <= 0
+        ):
+            raise ValueError("turn_ceiling_s must be positive")
         self.client = client
         self.registry: _Registry = registry
         self.model = model
         self.max_tokens = max_tokens
-        self.turn_timeout_s = turn_timeout_s
+        self.turn_timeout_s = float(turn_timeout_s)
+        self.turn_ceiling_s = float(turn_ceiling_s)
         self.history_exchanges = history_exchanges
         self.on_tool = on_tool
         self._clock = clock
@@ -250,7 +264,7 @@ class Brain:
         tainted = False
         host_line: str | None = None
         try:
-            async with asyncio.timeout(self.turn_timeout_s):
+            async with asyncio.timeout(self.turn_ceiling_s):
                 if pending is not None and confirmation_intent is not None:
                     if confirmation_intent == "confirm":
                         name = "confirm"
@@ -270,21 +284,22 @@ class Brain:
                             f"outcome without changing its meaning: {host_line}"
                         ),
                     }]
-                    async with self.client.messages.stream(
-                        model=self.model,
-                        max_tokens=self.max_tokens,
-                        system=narration_system,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice={"type": "none"},
-                    ) as stream:
-                        async for delta in stream.text_stream:
-                            buffer += delta
-                            chunks, buffer = split_spoken(buffer)
-                            for chunk in chunks:
-                                spoken.append(chunk)
-                                yield chunk
-                        await stream.get_final_message()
+                    async with asyncio.timeout(self.turn_timeout_s):
+                        async with self.client.messages.stream(
+                            model=self.model,
+                            max_tokens=self.max_tokens,
+                            system=narration_system,
+                            messages=messages,
+                            tools=tools,
+                            tool_choice={"type": "none"},
+                        ) as stream:
+                            async for delta in stream.text_stream:
+                                buffer += delta
+                                chunks, buffer = split_spoken(buffer)
+                                for chunk in chunks:
+                                    spoken.append(chunk)
+                                    yield chunk
+                            await stream.get_final_message()
                     if buffer:
                         spoken.append(buffer)
                         yield buffer
@@ -293,21 +308,22 @@ class Brain:
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
-                    async with self.client.messages.stream(
-                        model=self.model,
-                        max_tokens=self.max_tokens,
-                        system=system,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                    ) as stream:
-                        async for delta in stream.text_stream:
-                            buffer += delta
-                            chunks, buffer = split_spoken(buffer)
-                            for chunk in chunks:
-                                spoken.append(chunk)
-                                yield chunk
-                        final = await stream.get_final_message()
+                    async with asyncio.timeout(self.turn_timeout_s):
+                        async with self.client.messages.stream(
+                            model=self.model,
+                            max_tokens=self.max_tokens,
+                            system=system,
+                            messages=messages,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        ) as stream:
+                            async for delta in stream.text_stream:
+                                buffer += delta
+                                chunks, buffer = split_spoken(buffer)
+                                for chunk in chunks:
+                                    spoken.append(chunk)
+                                    yield chunk
+                            final = await stream.get_final_message()
 
                     if getattr(final, "stop_reason", None) != "tool_use":
                         break

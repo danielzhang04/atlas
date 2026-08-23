@@ -1,6 +1,7 @@
 fast_model: claude-haiku-4-5
 google_account: daniel.zhang.t1@gmail.com
 turn_timeout_s: 12.0
+turn_ceiling_s: 30.0
 max_tokens: 400
 engagement_timeout_s: 120
 address_window_s: 30

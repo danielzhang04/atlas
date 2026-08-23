@@ -133,7 +133,7 @@ def test_find_does_not_follow_a_directory_link_outside_the_roots(tmp_path):
     assert LocalFiles([root], opener=lambda _path: None).find("haiku") == []
 
 
-def test_open_uses_the_resolved_path_and_read_reports_truncation(tmp_path):
+def test_open_uses_the_resolved_path_and_small_read_returns_full_text(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     note = root / "notes.txt"
@@ -143,13 +143,40 @@ def test_open_uses_the_resolved_path_and_read_reports_truncation(tmp_path):
 
     assert files.open(note) == {"opened": str(note.resolve())}
     assert opened == [str(note.resolve())]
-    result = files.read(note, max_bytes=12)
+    result = files.read(note)
     assert result == {
         "path": str(note.resolve()),
         "bytes": note.stat().st_size,
-        "text": "first\nsecond",
-        "truncated": True,
+        "text": "first\nsecond line tail",
+        "truncated": False,
     }
+
+
+def test_big_read_returns_only_a_short_preview_and_launch_work_note(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    report = root / "sales.csv"
+    text = "month,revenue\n" + "".join(
+        f"2026-{index:04},1000\n"
+        for index in range(2_000)
+    )
+    report.write_bytes(text.encode("utf-8"))
+    files = LocalFiles([root], opener=lambda _path: None)
+
+    result = asyncio.run(files.read_file(report))
+
+    assert report.stat().st_size > 16_384
+    assert result == {
+        "path": str(report.resolve()),
+        "bytes": report.stat().st_size,
+        "truncated": True,
+        "preview": text[:1_024],
+        "note": (
+            "too large to read in-lane; use launch_work with this exact path for analysis"
+        ),
+        "lines": 2_001,
+    }
+    assert "text" not in result
 
 
 @pytest.mark.parametrize(

@@ -86,6 +86,13 @@ _CLOUD_REPARSE_MASK = 0xFFFF0000
 _CLOUD_REPARSE_FAMILY = 0x90000000
 _CLOUD_PLACEHOLDER_ERROR = "file not available yet (cloud placeholder)"
 _FILE_DEADLINE_S = 5.0
+_READ_CAP_BYTES = 16_384
+_PREVIEW_CHARS = 1_024
+_PREVIEW_READ_BYTES = _PREVIEW_CHARS * 4 + len(codecs.BOM_UTF16_LE)
+_CHEAP_LINE_COUNT_BYTES = 1_048_576
+_LARGE_FILE_NOTE = (
+    "too large to read in-lane; use launch_work with this exact path for analysis"
+)
 
 
 def _is_cloud_files_tag(value) -> bool:
@@ -300,7 +307,7 @@ class LocalFiles:
         self._opener(str(resolved))
         return {"opened": str(resolved)}
 
-    def read(self, path: str | Path, max_bytes: int = 16_384) -> dict:
+    def read(self, path: str | Path, max_bytes: int = _READ_CAP_BYTES) -> dict:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("invalid max_bytes")
         resolved = self.resolve(path)
@@ -308,15 +315,34 @@ class LocalFiles:
             raise ValueError("not a text file")
         with resolved.open("rb") as stream:
             total_bytes = os.fstat(stream.fileno()).st_size
-            raw = stream.read(max_bytes)
-        truncated = total_bytes > len(raw)
-        text = _decode_text(raw, truncated=truncated)
-        return {
+            if total_bytes <= max_bytes:
+                raw = stream.read(max_bytes)
+                text = _decode_text(raw, truncated=False)
+                return {
+                    "path": str(resolved),
+                    "bytes": total_bytes,
+                    "text": text,
+                    "truncated": False,
+                }
+            if total_bytes <= _CHEAP_LINE_COUNT_BYTES:
+                raw = stream.read()
+                text = _decode_text(raw, truncated=False)
+                preview = text[:_PREVIEW_CHARS]
+                lines = len(text.splitlines())
+            else:
+                raw = stream.read(_PREVIEW_READ_BYTES)
+                preview = _decode_text(raw, truncated=True)[:_PREVIEW_CHARS]
+                lines = None
+        result = {
             "path": str(resolved),
             "bytes": total_bytes,
-            "text": text,
-            "truncated": truncated,
+            "truncated": True,
+            "preview": preview,
+            "note": _LARGE_FILE_NOTE,
         }
+        if lines is not None:
+            result["lines"] = lines
+        return result
 
     async def open_file(self, path: str | Path) -> dict:
         """Open a file off-loop, bounding a possible cloud hydration stall."""
@@ -328,7 +354,7 @@ class LocalFiles:
         except TimeoutError:
             return {"error": _CLOUD_PLACEHOLDER_ERROR}
 
-    async def read_file(self, path: str | Path, max_bytes: int = 16_384) -> dict:
+    async def read_file(self, path: str | Path, max_bytes: int = _READ_CAP_BYTES) -> dict:
         """Read a file off-loop, bounding a possible cloud hydration stall."""
         try:
             return await asyncio.wait_for(
