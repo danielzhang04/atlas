@@ -88,6 +88,55 @@ class FakeProcess:
         return self.exit_code
 
 
+class RecursiveAttributeGraph:
+    def __dir__(self):
+        return ["empty"]
+
+    def __getattr__(self, name):
+        if name == "empty":
+            return RecursiveAttributeGraph()
+        raise AttributeError(name)
+
+
+def _pywebview_api_walk(obj, seen=None, visits=None):
+    # pywebview reflects over every public API attribute and recursively walks
+    # non-callable objects with __module__, so window handles must stay private.
+    seen = set() if seen is None else seen
+    visits = [] if visits is None else visits
+    for name in dir(obj):
+        if len(visits) >= 200:
+            break
+        if name.startswith("_"):
+            continue
+        visits.append(name)
+        value = getattr(obj, name)
+        if callable(value) or not hasattr(value, "__module__"):
+            continue
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        _pywebview_api_walk(value, seen, visits)
+    return len(visits)
+
+
+def test_window_api_exposes_only_methods():
+    api = desktop.WindowApi()
+    api._window = RecursiveAttributeGraph()
+
+    assert all(
+        callable(getattr(api, name))
+        for name in dir(api)
+        if not name.startswith("_")
+    )
+
+
+def test_pywebview_injection_walk_terminates():
+    api = desktop.WindowApi()
+    api._window = RecursiveAttributeGraph()
+
+    assert _pywebview_api_walk(api) < 200
+
+
 def test_read_ui_url_ignores_noise_and_accepts_only_a_loopback_fragment_url():
     stream = StringIO(
         "worker starting\n"
@@ -225,12 +274,12 @@ def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch
     def window_factory(_title, _url, **kwargs):
         api = kwargs["js_api"]
         assert kwargs["frameless"] is True
-        assert api.window is None
+        assert api._window is None
         window.api = api
         return window
 
     def start(_function, _args):
-        assert window.api.window is window
+        assert window.api._window is window
         window.api.minimize()
         window.api.request_close()
 
@@ -267,7 +316,7 @@ def test_native_window_api_toggles_work_area_and_restores_saved_bounds(monkeypat
     screen = SimpleNamespace(frame=work_area)
     window = FakeWindow()
     api = desktop.WindowApi()
-    api.window = window
+    api._window = window
     monkeypatch.setattr(desktop, "webview", SimpleNamespace(screens=[screen]))
 
     api.toggle_maximize()

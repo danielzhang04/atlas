@@ -78,7 +78,7 @@ class WindowApi:
     """Expose native window controls to the frameless Atlas page."""
 
     def __init__(self) -> None:
-        self.window = None
+        self._window = None
         self._maximized = False
         self._restore_bounds = None
         self._lock = Lock()
@@ -107,11 +107,11 @@ class WindowApi:
         return int(x), int(y), int(width), int(height)
 
     def minimize(self) -> None:
-        if self.window is not None:
-            self.window.minimize()
+        if self._window is not None:
+            self._window.minimize()
 
     def toggle_maximize(self) -> None:
-        window = self.window
+        window = self._window
         if window is None:
             return
         with self._lock:
@@ -142,8 +142,8 @@ class WindowApi:
             self._maximized = True
 
     def request_close(self) -> None:
-        if self.window is not None:
-            self.window.destroy()
+        if self._window is not None:
+            self._window.destroy()
 
 
 def _kernel32_functions():
@@ -520,7 +520,7 @@ def run(
         )
         if window is None:
             return 1
-        window_api.window = window
+        window_api._window = window
 
         def _confirm_close_current() -> bool:
             with child_lock:
