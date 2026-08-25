@@ -230,6 +230,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     from worker import app
 
     calls = []
+    build_active = False
 
     class FakeWork:
         launcher = SimpleNamespace(available=True)
@@ -259,12 +260,17 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
         def warm_model_client(self):
+            assert not build_active
             calls.append("warm")
 
     def build(_cfg, *, paired_url):
+        nonlocal build_active
         assert callable(paired_url)
+        build_active = True
+        result = FakeRuntime()
+        build_active = False
         calls.append("build-returned")
-        return FakeRuntime()
+        return result
 
     class FakeSession:
         input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
@@ -305,8 +311,8 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.runtime, "build", build)
     monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
     monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
-    monkeypatch.setattr(app.addressing_mod, "Addressing", lambda *_args: object())
-    monkeypatch.setattr(app.addressing_mod, "vocabulary", lambda _cfg: [])
+    monkeypatch.setattr(app.router, "Addressing", lambda *_args: object())
+    monkeypatch.setattr(app.router, "vocabulary", lambda _cfg: [])
     monkeypatch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
     monkeypatch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
     monkeypatch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))

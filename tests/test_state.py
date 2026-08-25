@@ -145,9 +145,9 @@ def test_audio_devices_and_voice_are_runtime_settable():
 
 
 def test_audio_status_helpers_preserve_follow_and_pin_modes():
-    from worker import app
+    from worker import devicewatch
 
-    status = app._audio_status(
+    status = devicewatch.audio_status(
         {
             "wake_input_device": "follow",
             "tts_output_device": "Speakers",
