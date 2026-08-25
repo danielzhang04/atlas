@@ -21,6 +21,13 @@ Non-negotiable rules:
    profiles; the model never supplies an executable path.
 8. Run focused tests, the full standalone suite, `git diff --check`, and adversarial code/security
    review before declaring a slice complete.
+9. Objects passed to pywebview as `js_api` expose only explicitly reviewed public methods; native
+   objects, handles, locks, windows, callbacks and mutable state stay private (underscore); every
+   `js_api` class has a reflection-walk regression test.
+10. Persistent logs are bounded and host-shaped: never pairing or shutdown tokens, credentials,
+    private environment values, MCP child environments, prompts, or raw child stdout.
+11. No new eager third-party import on the desktop or worker startup path without an importtime
+    comparison and idle-RSS check recorded in the change.
 
 Do not merge, deploy, activate external connections, or launch paid/background work unless the user
 explicitly authorizes that exact action.

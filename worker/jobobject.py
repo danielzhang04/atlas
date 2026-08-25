@@ -22,6 +22,7 @@ def kill_process_tree(
     pid: int,
     *,
     check: bool,
+    force: bool = True,
     runner=None,
 ) -> subprocess.CompletedProcess:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -30,8 +31,11 @@ def kill_process_tree(
     taskkill = os.path.abspath(os.path.join(system_root, "System32", "taskkill.exe"))
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     run = runner or subprocess.run
+    argv = [taskkill, "/PID", str(pid), "/T"]
+    if force:
+        argv.append("/F")
     return run(
-        [taskkill, "/PID", str(pid), "/T", "/F"],
+        argv,
         check=check,
         creationflags=creationflags,
     )
