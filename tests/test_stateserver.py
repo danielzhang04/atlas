@@ -142,7 +142,7 @@ def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
     assert "localStorage" not in script[2]
     assert 'authenticatedJson("/pair/bootstrap"' in script[2]
     assert "window.setTimeout(clearPairing" in script[2]
-    assert "if (response.status === 401)" in script[2]
+    assert "if (response.status === 401 && (authenticated || clearUnauthorized)) clearPairing();" in script[2]
     assert "restorePairing();" in script[2]
     assert "paired until ${time}" in script[2]
 
