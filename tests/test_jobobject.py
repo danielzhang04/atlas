@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ctypes
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -11,6 +13,27 @@ from worker import jobobject
 class FakeProcess:
     _handle = 8765
     pid = 4321
+
+
+def test_kill_process_tree_uses_trusted_absolute_taskkill(monkeypatch):
+    calls = []
+    system_root = Path(r"C:\TrustedWindows")
+    monkeypatch.setenv("SystemRoot", str(system_root))
+
+    result = jobobject.kill_process_tree(
+        4321,
+        check=False,
+        runner=lambda argv, **kwargs: calls.append((argv, kwargs)) or "completed",
+    )
+
+    assert result == "completed"
+    assert calls == [(
+        [str(system_root / "System32" / "taskkill.exe"), "/PID", "4321", "/T", "/F"],
+        {
+            "check": False,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        },
+    )]
 
 
 def _fakes(calls):

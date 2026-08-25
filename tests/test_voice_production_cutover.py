@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 from livekit.agents import StopResponse
+import yaml
 
+from worker import runtime
 from worker.app import AtlasAgent, _stt_keyterms
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,22 +49,35 @@ def test_voice_worker_imports_new_lanes_and_removed_modules_are_absent():
     assert not (ROOT / "browser_bridge").exists()
 
 
-def test_production_config_has_only_revamp_composition_keys():
-    config = (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8")
+def test_production_config_has_only_revamp_composition_keys(tmp_path):
+    config_text = (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8")
     for key in (
         "google_account:",
         "work_workspace_path:",
         "turn_timeout_s:",
-        "turn_ceiling_s:",
         "max_tokens:",
     ):
-        assert key in config
+        assert key in config_text
     for removed in (
         "local_file_roots", "desktop_target_aliases", "browser_bridge_url",
         "google_broker_endpoint", "receipt_journal_path", "agentic_workspace_path",
         "subscription_health_path", "interpreter_timeout_s",
     ):
-        assert removed not in config
+        assert removed not in config_text
+
+    config = yaml.safe_load(config_text)
+    configured_ceiling = config["turn_ceiling_s"] + 7
+    config.update(
+        job_store_path=":memory:",
+        work_workspace_path=str(tmp_path / "jobs"),
+        file_roots=[],
+        turn_ceiling_s=configured_ceiling,
+    )
+    built = runtime.build(config, client=object())
+    try:
+        assert built.brain.turn_ceiling_s == configured_ceiling
+    finally:
+        built.store.close()
 
 
 def test_agent_always_stops_after_the_host_turn_handler():

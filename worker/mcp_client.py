@@ -1,4 +1,3 @@
-"""Connect configured MCP servers and mirror their tools into the Atlas registry."""
 from __future__ import annotations
 
 import asyncio
@@ -13,13 +12,14 @@ import subprocess
 from typing import Any, AsyncContextManager, TYPE_CHECKING
 import unicodedata
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
 import yaml
 
+from .jobobject import kill_process_tree
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters
     from .tools import ToolRegistry
 
 
@@ -34,15 +34,22 @@ _TRUNCATED = "…[truncated]"
 
 
 SessionFactory = Callable[
-    [str, StdioServerParameters], AsyncContextManager[ClientSession]
+    [str, "StdioServerParameters"], AsyncContextManager["ClientSession"]
 ]
 ServerHook = Callable[[str, "ToolRegistry"], None]
 ProcessTreeKiller = Callable[..., subprocess.CompletedProcess]
 
 
+def _load_mcp_transport():
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    return ClientSession, StdioServerParameters, stdio_client
+
+
 class _PidTrackingStdio(AbstractAsyncContextManager):
-    """Expose the process PID retained by MCP 1.29's stdio context."""
     def __init__(self, spec: StdioServerParameters, on_pid: Callable[[int], None]) -> None:
+        _, _, stdio_client = _load_mcp_transport()
         self._context = stdio_client(spec, errlog=subprocess.DEVNULL)
         self._on_pid = on_pid
 
@@ -83,15 +90,11 @@ async def _stdio_session(
     *,
     on_pid: Callable[[int], None] = lambda _pid: None,
 ):
+    ClientSession, _, _ = _load_mcp_transport()
     async with _PidTrackingStdio(spec, on_pid) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             yield session
-
-
-def _taskkill(command: list[str], *, check: bool) -> subprocess.CompletedProcess:
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(command, check=check, creationflags=creationflags)
 
 
 class McpServers:
@@ -103,7 +106,7 @@ class McpServers:
         session_factory: SessionFactory | None = None,
         on_server: ServerHook | None = None,
         account_values: Mapping[str, str] | None = None,
-        killer: ProcessTreeKiller = _taskkill,
+        killer: ProcessTreeKiller = kill_process_tree,
     ):
         self._config = config
         self._claude_config_path = Path(claude_config_path)
@@ -223,6 +226,7 @@ class McpServers:
                 await stack.aclose()
 
     def _resolve_spec(self, server_cfg: Mapping) -> StdioServerParameters:
+        _, StdioServerParameters, _ = _load_mcp_transport()
         source: Mapping = server_cfg
         config_name = server_cfg.get("from_claude_config")
         if config_name:
@@ -265,7 +269,6 @@ class McpServers:
         tool: str,
         arguments: Mapping[str, Any],
     ) -> str:
-        """Call one connected server tool without the mirrored content bound."""
         session = self._sessions.get(server)
         settings = self._call_settings.get(server)
         if session is None or settings is None:
@@ -352,9 +355,8 @@ class McpServers:
         pid = self._server_pids.pop(name, None)
         if pid is None:
             return
-        command = ["taskkill", "/T", "/F", "/PID", str(pid)]
         try:
-            self._killer(command, check=False)
+            self._killer(pid, check=False)
         except Exception:
             _LOGGER.warning("MCP server %s process-tree cleanup failed", name)
 
@@ -367,11 +369,8 @@ def _bounded_text(value: str) -> str:
 
 
 def _clean_text(value: str) -> str:
-    return "".join(
-        char
-        for char in value
-        if char in "\n\t" or unicodedata.category(char) != "Cc"
-    )
+    return "".join(char for char in value
+                   if char in "\n\t" or unicodedata.category(char) != "Cc")
 
 
 def _normalize_recipients(arguments: Mapping[str, Any], account: str) -> dict[str, Any]:

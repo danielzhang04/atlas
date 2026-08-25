@@ -1,8 +1,8 @@
-"""Compose the Atlas tool, model, MCP, and background-work lanes."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -23,18 +23,22 @@ logger = logging.getLogger("atlas.runtime")
 
 
 class _LazyAnthropicClient:
-    """Warm the provider client off-thread while retaining lazy access."""
-
     def __init__(self, factory=None) -> None:
         self._factory = factory
         self._client = None
         self._lock = threading.Lock()
-        self._warm_thread = threading.Thread(
-            target=self._warm,
-            name="atlas-anthropic-warmup",
-            daemon=True,
-        )
-        self._warm_thread.start()
+        self._warm_thread = None
+
+    def warm(self) -> None:
+        with self._lock:
+            if self._client is not None or self._warm_thread is not None:
+                return
+            self._warm_thread = threading.Thread(
+                target=self._warm,
+                name="atlas-anthropic-warmup",
+                daemon=True,
+            )
+            self._warm_thread.start()
 
     def _client_instance(self):
         if self._client is not None:
@@ -69,9 +73,10 @@ class Runtime:
     brain: Brain
     store: JobStore
 
-
-def _path(value: str) -> Path:
-    return Path(os.path.expanduser(os.path.expandvars(value)))
+    def warm_model_client(self) -> None:
+        warm = getattr(self.brain.client, "warm", None)
+        if warm is not None:
+            warm()
 
 
 def _required_text(cfg: dict[str, Any], name: str) -> str:
@@ -89,28 +94,32 @@ def build(
     session_factory=None,
     paired_url: Callable[[], str | None] | None = None,
 ) -> Runtime:
-    """Build services without connecting MCP or starting background work."""
     model = _required_text(cfg, "fast_model")
     store_path = _required_text(cfg, "job_store_path")
     workspace_path = _required_text(cfg, "work_workspace_path")
     max_tokens = cfg.get("max_tokens", 400)
     timeout_s = cfg.get("turn_timeout_s", 12.0)
+    ceiling_s = cfg.get("turn_ceiling_s", 30.0)
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
         raise ValueError("invalid Atlas configuration: max_tokens")
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
         raise ValueError("invalid Atlas configuration: turn_timeout_s")
+    if (isinstance(ceiling_s, bool) or not isinstance(ceiling_s, (int, float))
+            or not math.isfinite(ceiling_s) or ceiling_s <= 0 or ceiling_s < timeout_s):
+        raise ValueError("invalid Atlas configuration: turn_ceiling_s")
     raw_roots = cfg.get("file_roots", ())
     if (isinstance(raw_roots, (str, bytes)) or not isinstance(raw_roots, (list, tuple))
             or not all(isinstance(root, str) and root.strip() for root in raw_roots)):
         raise ValueError("invalid Atlas configuration: file_roots")
 
-    store = JobStore(store_path if store_path == ":memory:" else _path(store_path))
+    store = JobStore(store_path if store_path == ":memory:" else Path(
+        os.path.expanduser(os.path.expandvars(store_path))))
     registry = ToolRegistry()
     files = LocalFiles(raw_roots) if raw_roots else None
     work = WorkManager(
         store,
         launcher or ClaudeLauncher(),
-        _path(workspace_path),
+        Path(os.path.expanduser(os.path.expandvars(workspace_path))),
         folders=files.folders if files is not None else {},
     )
     builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
@@ -157,5 +166,6 @@ def build(
         persona=persona,
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
+        turn_ceiling_s=float(ceiling_s),
     )
     return Runtime(registry, mcp, work, brain, store)

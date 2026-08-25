@@ -53,6 +53,25 @@ class FakeRegistry:
         self.tools.append(tool)
 
 
+def test_import_does_not_load_external_mcp_package():
+    root = Path(__file__).resolve().parents[1]
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(root)!r}); "
+        "import worker.mcp_client; "
+        "assert 'mcp' not in sys.modules, sorted(name for name in sys.modules if name.startswith('mcp'))"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_stdio_session_discards_child_stderr(monkeypatch):
     class StopSession(Exception):
         pass
@@ -71,13 +90,17 @@ def test_stdio_session_discards_child_stderr(monkeypatch):
         seen["errlog"] = errlog
         return FakeStdioClient()
 
-    monkeypatch.setattr(mcp_client, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(
+        mcp_client,
+        "_load_mcp_transport",
+        lambda: (None, SimpleNamespace, fake_stdio_client),
+    )
 
     async def scenario():
         with pytest.raises(StopSession):
             async with mcp_client._stdio_session(
                 "google",
-                mcp_client.StdioServerParameters(command="node"),
+                SimpleNamespace(command="node"),
             ):
                 pass
 
@@ -123,8 +146,11 @@ def test_default_stdio_session_records_pid_and_close_force_kills_tree(monkeypatc
         assert errlog is subprocess.DEVNULL
         return FakeStdioClient()
 
-    monkeypatch.setattr(mcp_client, "stdio_client", fake_stdio_client)
-    monkeypatch.setattr(mcp_client, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(
+        mcp_client,
+        "_load_mcp_transport",
+        lambda: (FakeClientSession, SimpleNamespace, fake_stdio_client),
+    )
 
     async def scenario():
         kills = []
@@ -133,7 +159,7 @@ def test_default_stdio_session_records_pid_and_close_force_kills_tree(monkeypatc
                 "servers": {"google": {"command": "unused"}},
                 "defaults": {"connect_timeout_s": 1},
             },
-            killer=lambda command, **kwargs: kills.append((command, kwargs)),
+            killer=lambda pid, **kwargs: kills.append((pid, kwargs)),
         )
         await servers.connect(FakeRegistry())
         await servers.close()
@@ -143,7 +169,7 @@ def test_default_stdio_session_records_pid_and_close_force_kills_tree(monkeypatc
     kills = asyncio.run(scenario())
 
     assert kills == [(
-        ["taskkill", "/T", "/F", "/PID", "2468"],
+        2468,
         {"check": False},
     )]
     assert events == [
@@ -573,7 +599,7 @@ def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
                 "defaults": {"connect_timeout_s": 60},
             },
             session_factory=factory,
-            killer=lambda command, **kwargs: kills.append((command, kwargs)),
+            killer=lambda pid, **kwargs: kills.append((pid, kwargs)),
         )
         servers._server_pids["slow"] = 1357
         task = asyncio.create_task(servers.connect(FakeRegistry()))
@@ -588,7 +614,7 @@ def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
     kills = asyncio.run(scenario())
 
     assert kills == [(
-        ["taskkill", "/T", "/F", "/PID", "1357"],
+        1357,
         {"check": False},
     )]
     assert events == ["entered", "closed"]
