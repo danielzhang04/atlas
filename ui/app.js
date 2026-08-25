@@ -104,7 +104,7 @@
     return typeof value === "string" && value.trim() ? value.trim() : "—";
   }
 
-  function displayString(value) { return typeof value === "string" && value.trim() ? value : "—"; }
+  function displayString(value) { return typeof value === "string" && value.trim() ? value : "\u2014"; }
 
   function clamp(value, minimum = 0, maximum = 1) {
     return Math.max(minimum, Math.min(maximum, value));
@@ -583,7 +583,8 @@
   }
   function pairedUntilText() {
     const expiry = new Date(actionExpiresAt * 1000);
-    return `paired until ${expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
+    const time = expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    return `paired until ${time}`;
   }
   function renderPairingStatus() {
     const paired = Boolean(actionToken) && actionExpiresAt * 1000 > Date.now();
