@@ -104,7 +104,7 @@
     return typeof value === "string" && value.trim() ? value.trim() : "—";
   }
 
-  function displayString(value) { return typeof value === "string" && value.trim() ? value : "—"; }
+  function displayString(value) { return typeof value === "string" && value.trim() ? value : "2014"; }
 
   function clamp(value, minimum = 0, maximum = 1) {
     return Math.max(minimum, Math.min(maximum, value));
