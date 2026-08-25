@@ -1,6 +1,15 @@
+param([switch]$Force)
+
 $ErrorActionPreference = "Stop"
 
 $atlasRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$canonicalRoot = "C:\Users\danie\Atlas"
+if (-not $Force -and -not $atlasRoot.Equals(
+        $canonicalRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [Console]::Error.WriteLine(
+        "Refusing to install Atlas shortcuts outside C:\Users\danie\Atlas. Pass -Force to override.")
+    exit 1
+}
 $pythonw = Join-Path $atlasRoot ".venv\Scripts\pythonw.exe"
 if (-not (Test-Path -LiteralPath $pythonw -PathType Leaf)) {
     throw "Atlas virtual environment is missing pythonw.exe: $pythonw"

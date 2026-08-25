@@ -61,3 +61,15 @@ git diff --check
 
 Live voice, account-backed MCP, desktop opening, and paid work remain explicit human verification
 steps.
+
+## Deploy / promote
+
+The canonical deployed checkout is `C:\Users\danie\Atlas`. Fast-forward that checkout, update
+`.venv` when `requirements.txt` or `requirements-dev.txt` changed, run `scripts\doctor.ps1`, run the
+full test suite, and then reinstall the shortcut from the canonical root only. The Start-menu
+shortcut runs `.venv\Scripts\pythonw.exe -m worker.desktop` with the canonical checkout as its
+working directory.
+
+Dependency policy: direct dependencies stay declared by role. Pin versions when dependency drift
+affects behavior or startup, and re-run the `worker.app` import-time benchmark whenever a dependency
+changes.
