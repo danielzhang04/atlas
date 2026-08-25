@@ -388,7 +388,7 @@ def test_unsupported_livekit_rate_keeps_wake_native_and_leaves_livekit_unchanged
 
 
 def test_start_audio_follow_wires_both_directions_into_one_watcher():
-    from worker import app, state, wakeword
+    from worker import state, wakeword
 
     publisher = state.StatePublisher()
     wake_switch = wakeword.InputDeviceSwitch(1)
@@ -404,7 +404,7 @@ def test_start_audio_follow_wires_both_directions_into_one_watcher():
         def start(self):
             self.started = True
 
-    watcher = app._start_audio_follow(
+    watcher = devicewatch.start_audio_follow(
         {"wake_input_device": "follow", "tts_output_device": "follow"},
         publisher,
         wake_switch,
@@ -438,16 +438,65 @@ def test_start_audio_follow_wires_both_directions_into_one_watcher():
     }
 
 
+def test_start_audio_follow_requires_and_wires_restart_callback():
+    from inspect import Parameter, signature
+
+    from worker import state, wakeword
+
+    publisher = state.StatePublisher()
+    captured = {}
+    restarts = []
+
+    class FakeInputFollower:
+        def __init__(self, _console, *, on_failure, **_kwargs):
+            captured["failure"] = on_failure
+
+        def swap_to(self, _name):
+            raise AssertionError("unused")
+
+    class FakeWatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    assert (
+        signature(devicewatch.start_audio_follow).parameters["request_restart"].default
+        is Parameter.empty
+    )
+    devicewatch.start_audio_follow(
+        {"wake_input_device": "follow", "tts_output_device": "Speakers"},
+        publisher,
+        wakeword.InputDeviceSwitch(),
+        request_restart=restarts.append,
+        input_probe=lambda: ("input-A", "Initial microphone"),
+        console_factory=FakeConsole,
+        watcher_cls=FakeWatcher,
+        input_follower_cls=FakeInputFollower,
+        sd_module=FakeSd(),
+    )
+
+    captured["failure"]("follower failed")
+
+    assert restarts == ["follower failed"]
+    assert publisher.snapshot()["audio"]["input"] == {
+        "name": "Initial microphone",
+        "following": False,
+    }
+
+
 def test_start_audio_follow_skips_when_both_devices_are_pinned():
-    from worker import app, state, wakeword
+    from worker import state, wakeword
 
     publisher = state.StatePublisher()
     wake_switch = wakeword.InputDeviceSwitch(1)
 
-    watcher = app._start_audio_follow(
+    watcher = devicewatch.start_audio_follow(
         {"wake_input_device": "Intel", "tts_output_device": "Speakers"},
         publisher,
         wake_switch,
+        request_restart=lambda _reason: None,
         console_factory=lambda: (_ for _ in ()).throw(AssertionError("unused")),
     )
 
@@ -455,7 +504,7 @@ def test_start_audio_follow_skips_when_both_devices_are_pinned():
 
 
 def test_start_audio_follow_keeps_polling_direction_with_missing_initial_probe():
-    from worker import app, wakeword
+    from worker import wakeword
 
     published = []
     watcher_instances = []
@@ -476,10 +525,11 @@ def test_start_audio_follow_keeps_polling_direction_with_missing_initial_probe()
         def start(self):
             self.started = True
 
-    watcher = app._start_audio_follow(
+    watcher = devicewatch.start_audio_follow(
         {"wake_input_device": "follow", "tts_output_device": "Speakers"},
         Publisher(),
         wakeword.InputDeviceSwitch(),
+        request_restart=lambda _reason: None,
         input_probe=lambda: None,
         console_factory=FakeConsole,
         watcher_cls=FakeWatcher,
@@ -499,15 +549,16 @@ def test_start_audio_follow_keeps_polling_direction_with_missing_initial_probe()
 
 
 def test_start_audio_follow_console_failure_marks_active_direction_not_following():
-    from worker import app, state, wakeword
+    from worker import state, wakeword
 
     publisher = state.StatePublisher()
     wake_switch = wakeword.InputDeviceSwitch()
 
-    watcher = app._start_audio_follow(
+    watcher = devicewatch.start_audio_follow(
         {"wake_input_device": "follow", "tts_output_device": "Speakers"},
         publisher,
         wake_switch,
+        request_restart=lambda _reason: None,
         input_probe=lambda: ("input-A", "Headset microphone"),
         console_factory=lambda: (_ for _ in ()).throw(ImportError("no console")),
     )
@@ -558,8 +609,6 @@ def test_worker_restart_requests_graceful_shutdown_with_reserved_exit_code(monke
 
 
 def test_audio_restart_coalescer_collapses_events_within_two_seconds():
-    from worker import app
-
     callbacks = []
     restarts = []
 
@@ -580,7 +629,7 @@ def test_audio_restart_coalescer_collapses_events_within_two_seconds():
             callbacks.append((delay, handle))
             return handle
 
-    coalescer = app.AudioRestartCoalescer(
+    coalescer = devicewatch.AudioRestartCoalescer(
         restarts.append,
         loop=Loop(),
     )
@@ -596,8 +645,6 @@ def test_audio_restart_coalescer_collapses_events_within_two_seconds():
 
 
 def test_audio_failure_publishes_error_before_requesting_restart():
-    from worker import app
-
     events = []
 
     class Publisher:
@@ -607,7 +654,7 @@ def test_audio_failure_publishes_error_before_requesting_restart():
         def set_audio_device(self, direction, status):
             events.append(("publish", direction, status))
 
-    callback = app._audio_failure_callback(
+    callback = devicewatch.audio_failure_callback(
         Publisher(),
         "input",
         lambda reason: events.append(("restart", reason)),

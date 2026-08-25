@@ -12,9 +12,39 @@ import logging
 import threading
 import textwrap
 
+from worker import wakeword
+
 logger = logging.getLogger("atlas.devicewatch")
+FOLLOW_SENTINEL = "follow"
 
 logging.getLogger("comtypes").setLevel(logging.WARNING)
+
+
+class AudioRestartCoalescer:
+    """Debounce audio failures on the worker event loop."""
+
+    def __init__(self, restart, *, loop, delay_s: float = 2.0) -> None:
+        self._restart = restart
+        self._loop = loop
+        self._delay_s = float(delay_s)
+        self._reasons: list[str] = []
+        self._handle = None
+
+    def request(self, reason: str) -> None:
+        self._loop.call_soon_threadsafe(self._queue, str(reason))
+
+    def _queue(self, reason: str) -> None:
+        if reason not in self._reasons:
+            self._reasons.append(reason)
+        if self._handle is not None:
+            self._handle.cancel()
+        self._handle = self._loop.call_later(self._delay_s, self._fire)
+
+    def _fire(self) -> None:
+        reasons, self._reasons = self._reasons, []
+        self._handle = None
+        if reasons:
+            self._restart("; ".join(reasons))
 
 
 def decide(prev_id: str | None, current_id: str | None) -> str:
@@ -59,6 +89,55 @@ def current_default_input():
     except Exception:
         logger.debug("default-input probe failed", exc_info=True)
         return None
+
+
+def _boot_default_device_name(direction: int) -> str | None:
+    try:
+        import sounddevice as sd
+
+        return sd.query_devices(sd.default.device[direction])["name"]
+    except Exception:
+        return None
+
+
+def _device_status(configured, *, resolve, boot_default, query_device=None) -> dict:
+    if configured == FOLLOW_SENTINEL:
+        return {"name": boot_default(), "following": True}
+    if not configured:
+        return {"name": None, "following": False}
+    index = resolve(configured)
+    if index is None:
+        return {"name": None, "following": False}
+    try:
+        if query_device is None:
+            import sounddevice as sd
+
+            query_device = sd.query_devices
+        name = query_device(index)["name"]
+    except Exception:
+        name = str(index)
+    return {"name": name, "following": False}
+
+
+def audio_status(
+    cfg: dict,
+    *,
+    resolve_input=wakeword.resolve_input_device,
+    resolve_output=wakeword.resolve_output_device,
+    boot_input=lambda: _boot_default_device_name(0),
+    boot_output=lambda: _boot_default_device_name(1),
+    query_device=None,
+) -> dict:
+    return {
+        "input": _device_status(
+            cfg.get("wake_input_device"), resolve=resolve_input,
+            boot_default=boot_input, query_device=query_device,
+        ),
+        "output": _device_status(
+            cfg.get("tts_output_device"), resolve=resolve_output,
+            boot_default=boot_output, query_device=query_device,
+        ),
+    }
 
 
 class DeviceWatcher:
@@ -342,3 +421,137 @@ class InputFollower:
             self._switch_wake_input(idx)
             self._last_idx = idx
             return self._status(idx)
+
+
+def _console_singleton():
+    from livekit.agents.cli._legacy import AgentsConsole
+
+    return AgentsConsole.get_instance()
+
+
+def _published_name(publisher, direction: str) -> str | None:
+    try:
+        return publisher.snapshot()["audio"][direction]["name"]
+    except Exception:
+        return None
+
+
+def audio_failure_callback(publisher, direction: str, request_restart):
+    def _failed(reason: str) -> None:
+        publisher.set_audio_device(direction, {
+            "name": _published_name(publisher, direction),
+            "following": False,
+            "error": str(reason),
+        })
+        request_restart(str(reason))
+
+    return _failed
+
+
+def start_audio_follow(
+    cfg: dict,
+    publisher,
+    wake_switch,
+    *,
+    console_factory=_console_singleton,
+    watcher_cls=DeviceWatcher,
+    input_follower_cls=InputFollower,
+    output_follower_cls=OutputFollower,
+    input_probe=current_default_input,
+    output_probe=current_default_output,
+    resolve_input=wakeword.resolve_input_device,
+    resolve_output=wakeword.resolve_output_device,
+    sd_module=None,
+    request_restart,
+):
+    probes = {}
+    if cfg.get("wake_input_device") == FOLLOW_SENTINEL:
+        probes["input"] = input_probe
+    if cfg.get("tts_output_device") == FOLLOW_SENTINEL:
+        probes["output"] = output_probe
+    if not probes:
+        return None
+
+    initial = {}
+    for direction, probe in probes.items():
+        try:
+            initial[direction] = probe()
+        except Exception:
+            initial[direction] = None
+        endpoint = initial[direction]
+        if endpoint is None:
+            logger.critical("%s-follow probe is unavailable", direction)
+        publisher.set_audio_device(direction, {
+            "name": endpoint[1] if endpoint is not None else _published_name(publisher, direction),
+            "following": endpoint is not None,
+        })
+
+    try:
+        console = console_factory()
+    except Exception:
+        logger.critical("audio-follow console is unavailable", exc_info=True)
+        for direction, endpoint in initial.items():
+            publisher.set_audio_device(direction, {
+                "name": endpoint[1] if endpoint is not None else None,
+                "following": False,
+            })
+        return None
+
+    try:
+        if sd_module is None:
+            import sounddevice as sd
+        else:
+            sd = sd_module
+        try:
+            boot_input_index = sd.default.device[0]
+            boot_output_index = sd.default.device[1]
+        except Exception:
+            boot_input_index = boot_output_index = None
+
+        input_follower = output_follower = None
+        if "input" in probes:
+            input_follower = input_follower_cls(
+                console,
+                resolve_input=resolve_input,
+                sd_module=sd,
+                switch_wake_input=wake_switch.switch_to,
+                initial_idx=boot_input_index,
+                on_failure=audio_failure_callback(publisher, "input", request_restart),
+            )
+        if "output" in probes:
+            output_follower = output_follower_cls(
+                console,
+                resolve_output=resolve_output,
+                sd_module=sd,
+                initial_idx=boot_output_index,
+                request_restart=audio_failure_callback(publisher, "output", request_restart),
+            )
+
+        def _on_input_change(name: str) -> None:
+            publisher.set_audio_device("input", input_follower.swap_to(name))
+
+        def _on_output_change(name: str) -> None:
+            publisher.set_audio_device("output", output_follower.swap_to(name))
+
+        watcher = watcher_cls(
+            input_probe=input_probe if input_follower is not None else None,
+            output_probe=output_probe if output_follower is not None else None,
+            on_input_change=_on_input_change,
+            on_output_change=_on_output_change,
+            period_s=1.5,
+            initial_delay_s=2.0,
+            initial_ids={
+                direction: initial[direction][0] if initial[direction] is not None else None
+                for direction in probes
+            },
+        )
+        watcher.start()
+        return watcher
+    except Exception:
+        logger.critical("audio-follow wiring failed", exc_info=True)
+        for direction, endpoint in initial.items():
+            publisher.set_audio_device(direction, {
+                "name": endpoint[1] if endpoint is not None else None,
+                "following": False,
+            })
+        return None

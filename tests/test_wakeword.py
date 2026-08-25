@@ -225,6 +225,55 @@ def test_listen_closes_and_reopens_on_input_switch_with_native_rates():
     assert all(len(bands) == wakeword.BAND_COUNT for _energy, bands in signals)
 
 
+def test_listen_publishes_fresh_wake_frame_bands_before_engagement(monkeypatch):
+    sd = FakeSoundDevice()
+    model = FakeWakeModel([0.1, 0.1, 0.9])
+    band_calls = []
+    call_order = []
+    awake = True
+    stale_bands = [0.75] * wakeword.BAND_COUNT
+
+    def count_bands(frame, previous):
+        band_calls.append((len(model.frames), list(previous)))
+        return stale_bands if len(band_calls) == 1 else [0.25] * wakeword.BAND_COUNT
+
+    def bands_enabled():
+        return awake
+
+    def on_signal(_energy, bands):
+        nonlocal awake
+        if awake:
+            awake = False
+            call_order.append("sleep")
+        else:
+            call_order.append(("signal", list(bands)))
+
+    def on_wake():
+        nonlocal awake
+        call_order.append("engage")
+        awake = True
+
+    monkeypatch.setattr(wakeword, "normalized_audio_bands", count_bands)
+    wakeword.listen(
+        on_wake,
+        model_name="hey_test",
+        device="follow",
+        threshold=0.5,
+        patience=1,
+        on_signal=on_signal,
+        bands_enabled=bands_enabled,
+        sd_module=sd,
+        model_loader=lambda _name: (model, "hey_test"),
+        clock=lambda: 100.0,
+        max_frames=3,
+    )
+
+    assert [frame_number for frame_number, _previous in band_calls] == [0, 3]
+    assert band_calls[1][1] == [0.0] * wakeword.BAND_COUNT
+    assert call_order == ["sleep", ("signal", [0.25] * wakeword.BAND_COUNT), "engage"]
+    assert len(model.frames) == 3
+
+
 def test_listen_detects_a_sustained_synthetic_hey_atlas_score_shape():
     sd = FakeSoundDevice()
     model = FakeWakeModel([0.1, 0.72, 0.83, 0.91, 0.2])
