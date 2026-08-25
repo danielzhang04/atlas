@@ -15,6 +15,7 @@ def test_initial_snapshot_publishes_live_voice_and_wake_configuration():
     assert publisher.state == ASLEEP
     assert publisher.snapshot() == {
         "version": 1,
+        "ready": False,
         "state": ASLEEP,
         "since": _dt(0).isoformat(),
         "session_id": None,

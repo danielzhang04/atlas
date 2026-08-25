@@ -55,6 +55,7 @@ class StatePublisher:
         self.voice = voice
         self.wake_model = _bounded_wake_model(wake_model)
         self._state = ASLEEP
+        self.ready = False
         self._since = clock()
         self._session_id: str | None = None
         self._ring: deque[dict] = deque(maxlen=ring_size)
@@ -161,6 +162,7 @@ class StatePublisher:
     def snapshot(self) -> dict:
         return {
             "version": SNAPSHOT_VERSION,
+            "ready": self.ready,
             "state": self._state,
             "since": self._since.isoformat(),
             "session_id": self._session_id,
