@@ -145,9 +145,12 @@ def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
     assert "if (response.status === 401 && (authenticated || clearUnauthorized)) clearPairing();" in script[2]
     assert "restorePairing();" in script[2]
     assert "paired until ${time}" in script[2]
+    assert 'publicJson("/health"' in script[2]
+    assert '"/mcp"' not in script[2]
+    assert "renderMcp(health.mcp);" in script[2]
 
 
-def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
+def test_jobs_events_and_health_are_fixed_public_projections():
     job_id = str(uuid4())
     after_seen = []
     jobs = [{
@@ -179,7 +182,6 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
             job_event_provider=lambda requested, after: (
                 after_seen.append((requested, after)) or events
             ),
-            mcp_provider=lambda: mcp,
             health_provider=lambda: {"claude": True, "mcp": mcp},
         )
         event_headers = {stateserver.HEADER: bearer}
@@ -191,8 +193,8 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
                     path=f"/jobs/{job_id}/events?after=3",
                     headers=event_headers,
                 ),
-                await _request(server, path="/mcp"),
                 await _request(server, path="/health"),
+                await _request(server, path="/mcp"),
                 await _request(
                     server,
                     path=f"/jobs/{job_id}/events?after=bad",
@@ -207,23 +209,119 @@ def test_jobs_events_after_mcp_and_health_are_fixed_public_projections():
         finally:
             await server.stop()
 
-    job_response, event_response, mcp_response, health_response, invalid, oversized = asyncio.run(scenario())
+    job_response, event_response, health_response, missing_mcp, invalid, oversized = asyncio.run(scenario())
     expected = {key: value for key, value in jobs[0].items() if key != "secret"}
     assert json.loads(job_response[2]) == {"jobs": [expected]}
     assert json.loads(event_response[2]) == {"events": [{
         "sequence": 4, "timestamp": 12.5, "kind": "output", "text": "working\n",
     }]}
     assert after_seen == [(job_id, 3)]
-    assert json.loads(mcp_response[2]) == {"servers": [{
-        "name": "google", "connected": True, "tools": 11, "error": None,
-    }]}
     assert "must-not-escape" not in health_response[2]
     assert json.loads(health_response[2]) == {
         "claude": True,
         "mcp": [{"name": "google", "connected": True, "tools": 11, "error": None}],
     }
+    assert missing_mcp[0] == 404
     assert invalid[0] == 400
     assert oversized[0] == 400
+
+
+def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypatch):
+    from worker import app
+
+    calls = []
+
+    class FakeWork:
+        launcher = SimpleNamespace(available=True)
+
+        def on_terminal(self, _callback):
+            return None
+
+        async def cancel(self, _job_id):
+            return True
+
+        async def run(self, _stop):
+            return None
+
+    class FakeMcp:
+        async def connect(self, _registry):
+            return None
+
+        def status(self):
+            return []
+
+    class FakeRuntime:
+        def __init__(self):
+            self.brain = SimpleNamespace(on_tool=None)
+            self.work = FakeWork()
+            self.mcp = FakeMcp()
+            self.registry = object()
+            self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+
+        def warm_model_client(self):
+            calls.append("warm")
+
+    def build(_cfg, *, paired_url):
+        assert callable(paired_url)
+        calls.append("build-returned")
+        return FakeRuntime()
+
+    class FakeSession:
+        input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
+
+        async def start(self, **_kwargs):
+            return None
+
+        def interrupt(self):
+            return None
+
+    class FakeServer:
+        port = 4321
+
+    async def start_server(*_args, **_kwargs):
+        calls.append("server-started")
+        return FakeServer()
+
+    class FakeContext:
+        room = object()
+
+        async def connect(self):
+            return None
+
+        def add_shutdown_callback(self, _callback):
+            return None
+
+        def shutdown(self, _reason):
+            return None
+
+    cfg = {
+        "active_voice": "mars",
+        "engagement_timeout_s": 30,
+        "address_window_s": 10,
+        "state_port": 0,
+    }
+    monkeypatch.setattr(app, "TEXT_MODE", True)
+    monkeypatch.setattr(app, "_cfg", lambda: cfg)
+    monkeypatch.setattr(app.runtime, "build", build)
+    monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
+    monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
+    monkeypatch.setattr(app.addressing_mod, "Addressing", lambda *_args: object())
+    monkeypatch.setattr(app.addressing_mod, "vocabulary", lambda _cfg: [])
+    monkeypatch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
+    monkeypatch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
+    monkeypatch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))
+    monkeypatch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+    monkeypatch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
+    monkeypatch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
+    monkeypatch.setattr(app, "_build_tts", lambda _cfg: object())
+    monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
+    monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
+    monkeypatch.setattr(app.stateserver, "start", start_server)
+    monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: calls.append("ui-emitted"))
+
+    asyncio.run(app.entrypoint(FakeContext()))
+
+    assert calls == ["build-returned", "server-started", "ui-emitted", "warm"]
 
 
 def test_pairing_protects_job_events_private_results_and_cancellation():

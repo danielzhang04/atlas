@@ -247,20 +247,15 @@ def _safe_mcp(value: Any) -> list[dict[str, Any]]:
     for item in value[:32]:
         if not isinstance(item, dict):
             continue
-        if (
-            not isinstance(item.get("name"), str)
-            or not isinstance(item.get("connected"), bool)
-            or isinstance(item.get("tools"), bool)
-            or not isinstance(item.get("tools"), int)
+        name, connected, tools, error = (item.get(key) for key in MCP_FIELDS)
+        if not (
+            isinstance(name, str) and isinstance(connected, bool)
+            and isinstance(tools, int) and not isinstance(tools, bool)
+            and (error is None or isinstance(error, str))
         ):
             continue
-        error = item.get("error")
-        if error is not None and not isinstance(error, str):
-            continue
         servers.append({
-            "name": item["name"][:128],
-            "connected": item["connected"],
-            "tools": max(0, item["tools"]),
+            "name": name[:128], "connected": connected, "tools": max(0, tools),
             "error": error[:128] if error is not None else None,
         })
     return servers
@@ -277,7 +272,6 @@ class StateServer:
         job_event_provider=None,
         result_provider=None,
         cancel_provider=None,
-        mcp_provider=None,
         health_provider=None,
         shutdown_token: str | None = None,
         shutdown_provider=None,
@@ -289,7 +283,6 @@ class StateServer:
         self._job_event_provider = job_event_provider
         self._result_provider = result_provider
         self._cancel_provider = cancel_provider
-        self._mcp_provider = mcp_provider
         self._health_provider = health_provider
         self._shutdown_token = shutdown_token
         self._shutdown_provider = shutdown_provider
@@ -373,17 +366,6 @@ class StateServer:
             raise web.HTTPServiceUnavailable(text="job events unavailable") from None
         return web.json_response(
             {"events": _safe_events(value)}, headers={"cache-control": "no-store"},
-        )
-
-    async def _handle_mcp(self, _request: web.Request) -> web.Response:
-        value = []
-        if self._mcp_provider is not None:
-            try:
-                value = await _provide(self._mcp_provider)
-            except Exception as exc:
-                logger.warning("MCP status provider failed: %s", type(exc).__name__)
-        return web.json_response(
-            {"servers": _safe_mcp(value)}, headers={"cache-control": "no-store"},
         )
 
     async def _handle_health(self, _request: web.Request) -> web.Response:
@@ -531,7 +513,6 @@ class StateServer:
         app.router.add_post("/pair", self._handle_pair)
         app.router.add_get("/pair/bootstrap", self._handle_pair_bootstrap)
         app.router.add_get("/health", self._handle_health)
-        app.router.add_get("/mcp", self._handle_mcp)
         app.router.add_get("/jobs", self._handle_jobs)
         app.router.add_get("/jobs/{job_id}/events", self._handle_job_events)
         app.router.add_get("/jobs/{job_id}/result", self._handle_job_result)
@@ -569,7 +550,6 @@ async def start(
     job_event_provider=None,
     result_provider=None,
     cancel_provider=None,
-    mcp_provider=None,
     health_provider=None,
     shutdown_token: str | None = None,
     shutdown_provider=None,
@@ -582,7 +562,6 @@ async def start(
         job_event_provider=job_event_provider,
         result_provider=result_provider,
         cancel_provider=cancel_provider,
-        mcp_provider=mcp_provider,
         health_provider=health_provider,
         shutdown_token=shutdown_token,
         shutdown_provider=shutdown_provider,

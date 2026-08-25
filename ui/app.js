@@ -11,7 +11,7 @@
    * Polling request budget:
    * Live (visible): 600 signal + 60 state + 30 jobs + (30 x active jobs) events/min.
    * Hidden: 0 signal + 12 state + 12 jobs + 0 events = 24/min (88.2% below 204).
-   * Settings adds 12 health + 12 mcp requests/min only while visible.
+   * Settings adds 12 health requests/min only while visible.
    */
   const SIGNAL_INTERVAL_MS = 100;
   const STATE_INTERVAL_MS = 1000;
@@ -833,10 +833,9 @@
   function refreshSettings() {
     return runOnce("settings", async () => {
       try {
-        const request = {cache: "no-store", ignoreHttpError: true};
-        const [mcp, health] = await Promise.all([publicJson("/mcp", request), publicJson("/health", request)]);
-        if (mcp) renderMcp(mcp.servers);
+        const health = await publicJson("/health", {cache: "no-store", ignoreHttpError: true});
         if (health) {
+          renderMcp(health.mcp);
           refs.claudeStatus.textContent = health.claude ? "Available" : "Unavailable";
           refs.claudeStatus.classList.toggle("is-unavailable", !health.claude);
         }

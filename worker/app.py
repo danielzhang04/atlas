@@ -420,10 +420,6 @@ def _jobs_projection(work: work_mod.WorkManager) -> list[dict]:
     return [job.to_public() for job in [*work.active(), *work.recent(50)]]
 
 
-def _health(mcp: mcp_client_mod.McpServers, launcher) -> dict:
-    return {"claude": launcher.available, "mcp": mcp.status()}
-
-
 def _emit_ui_url(authorizer: stateserver.PairingAuthorizer, port: int) -> str:
     url = stateserver.pairing_url(authorizer, port)
     if url is None:
@@ -546,13 +542,13 @@ async def entrypoint(ctx: JobContext) -> None:
         job_event_provider=services.store.events,
         result_provider=services.store.result,
         cancel_provider=services.work.cancel,
-        mcp_provider=services.mcp.status,
-        health_provider=lambda: _health(services.mcp, services.work.launcher),
+        health_provider=lambda: {"claude": services.work.launcher.available, "mcp": services.mcp.status()},
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
     )
     server_box["server"] = server
     _emit_ui_url(authorizer, server.port)
+    services.warm_model_client()
 
     async def _shutdown() -> None:
         wakeword.shutting_down.set()
