@@ -30,7 +30,8 @@ ATLAS = Path(__file__).resolve().parents[1]
 logger = logging.getLogger("atlas.app")
 
 TTS_VOICE = "aura-2-andromeda-en"
-FOLLOW_SENTINEL = "follow"
+FOLLOW_SENTINEL = devicewatch.FOLLOW_SENTINEL
+_audio_status = devicewatch.audio_status
 TEXT_MODE = "--text" in sys.argv
 DEFAULT_DISMISS = ["that's all", "go to sleep"]
 WAKE_LINE = "Hey boss. What can I do for you?"
@@ -38,34 +39,6 @@ SLEEP_LINE = "Okay, sleeping. Wake me when you need something."
 _BG_TASKS: set[asyncio.Task] = set()
 RESTART_EXIT_CODE = 21
 _worker_exit_code = 0
-
-
-class AudioRestartCoalescer:
-    """Debounce audio failures on the worker event loop."""
-
-    def __init__(self, restart, *, loop, delay_s: float = 2.0) -> None:
-        self._restart = restart
-        self._loop = loop
-        self._delay_s = float(delay_s)
-        self._reasons: list[str] = []
-        self._handle = None
-
-    def request(self, reason: str) -> None:
-        self._loop.call_soon_threadsafe(self._queue, str(reason))
-
-    def _queue(self, reason: str) -> None:
-        if reason not in self._reasons:
-            self._reasons.append(reason)
-        if self._handle is not None:
-            self._handle.cancel()
-        self._handle = self._loop.call_later(self._delay_s, self._fire)
-
-    def _fire(self) -> None:
-        reasons = self._reasons
-        self._reasons = []
-        self._handle = None
-        if reasons:
-            self._restart("; ".join(reasons))
 
 
 def _build_tts(cfg: dict):
@@ -119,93 +92,12 @@ def _apply_agent_state(engagement, publisher, agent_state: str) -> None:
         publisher.set_state(mapped)
 
 
-def _boot_default_device_name(direction: int) -> str | None:
-    try:
-        import sounddevice as sd
-
-        return sd.query_devices(sd.default.device[direction])["name"]
-    except Exception:
-        return None
-
-
-def _device_status(
-    configured: str | None,
-    *,
-    resolve,
-    boot_default,
-    query_device=None,
-) -> dict:
-    if configured == FOLLOW_SENTINEL:
-        return {"name": boot_default(), "following": True}
-    if not configured:
-        return {"name": None, "following": False}
-    index = resolve(configured)
-    if index is None:
-        return {"name": None, "following": False}
-    try:
-        if query_device is None:
-            import sounddevice as sd
-
-            query_device = sd.query_devices
-        name = query_device(index)["name"]
-    except Exception:
-        name = str(index)
-    return {"name": name, "following": False}
-
-
-def _audio_status(
-    cfg: dict,
-    *,
-    resolve_input=wakeword.resolve_input_device,
-    resolve_output=wakeword.resolve_output_device,
-    boot_input=lambda: _boot_default_device_name(0),
-    boot_output=lambda: _boot_default_device_name(1),
-    query_device=None,
-) -> dict:
-    return {
-        "input": _device_status(
-            cfg.get("wake_input_device"),
-            resolve=resolve_input,
-            boot_default=boot_input,
-            query_device=query_device,
-        ),
-        "output": _device_status(
-            cfg.get("tts_output_device"),
-            resolve=resolve_output,
-            boot_default=boot_output,
-            query_device=query_device,
-        ),
-    }
-
-
-def _console_singleton():
-    from livekit.agents.cli._legacy import AgentsConsole
-
-    return AgentsConsole.get_instance()
-
-
 def _restart_worker(reason: str, shutdown=None) -> None:
     global _worker_exit_code
     logger.critical("audio-follow requested worker restart: %s", reason)
     _worker_exit_code = RESTART_EXIT_CODE
     if shutdown is not None:
         shutdown(reason)
-
-
-def _audio_failure_callback(publisher, direction: str, request_restart):
-    def _failed(reason: str) -> None:
-        name = None
-        try:
-            name = publisher.snapshot()["audio"][direction]["name"]
-        except Exception:
-            pass
-        publisher.set_audio_device(
-            direction,
-            {"name": name, "following": False, "error": str(reason)},
-        )
-        request_restart(str(reason))
-
-    return _failed
 
 
 def _wake_model_callback(publisher, loop=None):
@@ -232,146 +124,6 @@ async def _flush_store_and_stop_state_server(store, server) -> None:
     except Exception:
         logger.exception("could not flush the job store during shutdown")
     await server.stop()
-
-
-def _start_audio_follow(
-    cfg: dict,
-    publisher,
-    wake_switch,
-    *,
-    console_factory=_console_singleton,
-    watcher_cls=devicewatch.DeviceWatcher,
-    input_follower_cls=devicewatch.InputFollower,
-    output_follower_cls=devicewatch.OutputFollower,
-    input_probe=devicewatch.current_default_input,
-    output_probe=devicewatch.current_default_output,
-    resolve_input=wakeword.resolve_input_device,
-    resolve_output=wakeword.resolve_output_device,
-    sd_module=None,
-    request_restart=_restart_worker,
-):
-    input_following = cfg.get("wake_input_device") == FOLLOW_SENTINEL
-    output_following = cfg.get("tts_output_device") == FOLLOW_SENTINEL
-    if not input_following and not output_following:
-        return None
-
-    initial = {}
-    probes = {}
-    if input_following:
-        probes["input"] = input_probe
-    if output_following:
-        probes["output"] = output_probe
-    for direction, probe in probes.items():
-        try:
-            initial[direction] = probe()
-        except Exception:
-            initial[direction] = None
-        endpoint = initial[direction]
-        if endpoint is None:
-            logger.critical("%s-follow probe is unavailable", direction)
-            previous_name = None
-            try:
-                previous_name = publisher.snapshot()["audio"][direction]["name"]
-            except Exception:
-                pass
-            publisher.set_audio_device(
-                direction,
-                {"name": previous_name, "following": False},
-            )
-        else:
-            publisher.set_audio_device(
-                direction,
-                {"name": endpoint[1], "following": True},
-            )
-    active_directions = list(probes)
-    try:
-        console = console_factory()
-    except Exception:
-        logger.critical("audio-follow console is unavailable", exc_info=True)
-        for direction in active_directions:
-            endpoint = initial[direction]
-            publisher.set_audio_device(
-                direction,
-                {
-                    "name": endpoint[1] if endpoint is not None else None,
-                    "following": False,
-                },
-            )
-        return None
-    try:
-        if sd_module is None:
-            import sounddevice as sd
-        else:
-            sd = sd_module
-
-        try:
-            boot_input_index = sd.default.device[0]
-            boot_output_index = sd.default.device[1]
-        except Exception:
-            boot_input_index = None
-            boot_output_index = None
-        input_follower = None
-        output_follower = None
-        input_failure = _audio_failure_callback(
-            publisher,
-            "input",
-            request_restart,
-        )
-        output_failure = _audio_failure_callback(
-            publisher,
-            "output",
-            request_restart,
-        )
-        if "input" in active_directions:
-            input_follower = input_follower_cls(
-                console,
-                resolve_input=resolve_input,
-                sd_module=sd,
-                switch_wake_input=wake_switch.switch_to,
-                initial_idx=boot_input_index,
-                on_failure=input_failure,
-            )
-        if "output" in active_directions:
-            output_follower = output_follower_cls(
-                console,
-                resolve_output=resolve_output,
-                sd_module=sd,
-                initial_idx=boot_output_index,
-                request_restart=output_failure,
-            )
-
-        def _on_input_change(name: str) -> None:
-            publisher.set_audio_device("input", input_follower.swap_to(name))
-
-        def _on_output_change(name: str) -> None:
-            publisher.set_audio_device("output", output_follower.swap_to(name))
-
-        watcher = watcher_cls(
-            input_probe=input_probe if input_follower is not None else None,
-            output_probe=output_probe if output_follower is not None else None,
-            on_input_change=_on_input_change,
-            on_output_change=_on_output_change,
-            period_s=1.5,
-            initial_delay_s=2.0,
-            initial_ids={
-                direction: initial[direction][0] if initial[direction] is not None else None
-                for direction in active_directions
-            },
-        )
-        watcher.start()
-        return watcher
-    except Exception:
-        logger.critical("audio-follow wiring failed", exc_info=True)
-        for direction in active_directions:
-            endpoint = initial[direction]
-            publisher.set_audio_device(
-                direction,
-                {
-                    "name": endpoint[1] if endpoint is not None else None,
-                    "following": False,
-                },
-            )
-        return None
 
 
 class AtlasAgent(Agent):
@@ -708,15 +460,15 @@ async def entrypoint(ctx: JobContext) -> None:
         initial_wake_device = wakeword.resolve_input_device(wake_device)
     wake_switch = wakeword.InputDeviceSwitch(initial_wake_device)
     audio_watcher = None
-    publisher.set_audio(_audio_status(cfg))
+    publisher.set_audio(devicewatch.audio_status(cfg))
 
     services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
     loop = asyncio.get_running_loop()
-    restart_coalescer = AudioRestartCoalescer(
+    restart_coalescer = devicewatch.AudioRestartCoalescer(
         lambda reason: _restart_worker(reason, ctx.shutdown),
         loop=loop,
     )
-    audio_failure = _audio_failure_callback(
+    audio_failure = devicewatch.audio_failure_callback(
         publisher,
         "input",
         restart_coalescer.request,
@@ -824,7 +576,7 @@ async def entrypoint(ctx: JobContext) -> None:
     if TEXT_MODE:
         return
 
-    audio_watcher = _start_audio_follow(
+    audio_watcher = devicewatch.start_audio_follow(
         cfg,
         publisher,
         wake_switch,
@@ -892,6 +644,7 @@ async def entrypoint(ctx: JobContext) -> None:
             "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
             "patience": cfg.get("wake_patience", wakeword.PATIENCE),
             "on_signal": _on_audio_signal,
+            "bands_enabled": lambda: publisher.state != state.ASLEEP,
             "device_switch": wake_switch,
             "on_failure": audio_failure,
             "on_model": _wake_model_callback(publisher, loop),

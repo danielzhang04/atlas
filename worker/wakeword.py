@@ -277,6 +277,7 @@ def listen(
     patience: int = PATIENCE,
     on_energy: Callable[[float], None] | None = None,
     on_signal: Callable[[float, list[float]], None] | None = None,
+    bands_enabled: Callable[[], bool] | None = None,
     device_switch: InputDeviceSwitch | None = None,
     sd_module=None,
     model_loader=load_model,
@@ -350,14 +351,15 @@ def listen(
                     frame, _ = stream.read(native_samples)
                     model_frame = resample_audio_frame(frame, native_rate)
                     energy = normalized_audio_energy(model_frame)
-                    smoothed_bands = normalized_audio_bands(model_frame, smoothed_bands)
                     if on_energy is not None:
                         try:
                             on_energy(energy)
                         except Exception:
                             logger.exception("audio-energy observer failed; disabling visual signal")
                             on_energy = None
-                    if on_signal is not None:
+                    bands_active = on_signal is not None and (bands_enabled is None or bands_enabled())
+                    if bands_active:
+                        smoothed_bands = normalized_audio_bands(model_frame, smoothed_bands)
                         try:
                             on_signal(energy, smoothed_bands)
                         except Exception:
@@ -366,11 +368,14 @@ def listen(
                     scores = model.predict(model_frame)
                     event = gate.update(scores.get(predict_key, 0.0), clock())
                     if event == "wake":
-                        logger.info(
-                            "wake fired (peak score %.2f over %d frames)",
-                            gate.peak,
-                            gate.run,
-                        )
+                        logger.info("wake fired (peak score %.2f over %d frames)", gate.peak, gate.run)
+                        if on_signal is not None and not bands_active:
+                            smoothed_bands = normalized_audio_bands(model_frame, [0.0] * BAND_COUNT)
+                            try:
+                                on_signal(energy, smoothed_bands)
+                            except Exception:
+                                logger.exception("audio-signal observer failed; disabling visual signal")
+                                on_signal = None
                         on_wake()
                     elif event == "spike":
                         logger.info(
