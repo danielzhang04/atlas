@@ -1,14 +1,13 @@
-"""Keep Atlas process trees inside kill-on-close Windows Job Objects."""
 from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
 import logging
 import os
+import subprocess
 from threading import Lock
 
-__all__ = ["assign_current_process", "assign_process"]
-
+__all__ = ["assign_current_process", "assign_process", "kill_process_tree"]
 _LOGGER = logging.getLogger("atlas.jobobject")
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -17,6 +16,25 @@ _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 _current_job_handle = None
 _current_job_lock = Lock()
+
+
+def kill_process_tree(
+    pid: int,
+    *,
+    check: bool,
+    runner=None,
+) -> subprocess.CompletedProcess:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    taskkill = os.path.abspath(os.path.join(system_root, "System32", "taskkill.exe"))
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    run = runner or subprocess.run
+    return run(
+        [taskkill, "/PID", str(pid), "/T", "/F"],
+        check=check,
+        creationflags=creationflags,
+    )
 
 
 class _IoCounters(ctypes.Structure):
@@ -86,7 +104,6 @@ def assign_current_process(
     current_process=None,
     close_handle=None,
 ):
-    """Assign this process to one retained kill-on-close Job Object."""
     global _current_job_handle
     if platform != "nt":
         _LOGGER.warning("Windows Job Objects are unavailable on this platform")
@@ -135,7 +152,6 @@ def assign_process(
     open_process=None,
     close_handle=None,
 ):
-    """Assign a process handle, PID, or Popen-like object to a new Job Object."""
     if platform != "nt":
         _LOGGER.warning("Windows Job Objects are unavailable on this platform")
         return None
