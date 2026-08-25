@@ -1,101 +1,63 @@
 (() => {
   "use strict";
 
-  const ROUTES = new Set(["live", "history", "settings"]);
+  const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
   const VOICE_STATES = new Set(["ASLEEP", "LISTENING", "THINKING", "SPEAKING"]);
   const TRANSCRIPT_ROLES = new Set(["user", "atlas", "tool", "ambient", "system"]);
   const ACTIVE_JOB_STATES = new Set(["queued", "launching", "running"]);
-  const CONFIG_PATHS = [
-    "config/atlas.yaml",
-    "config/apps.yaml",
-    "config/mcp.yaml",
-    "config/intents.yaml",
-    "config/persona.md",
-  ];
   const ACTION_HEADER = "x-atlas-action-token";
   const PAIRING_STORAGE_KEY = "atlas.pairing";
-  const SIGNAL_INTERVAL_MS = 50;
+  /*
+   * Polling request budget:
+   * Live (visible): 600 signal + 60 state + 30 jobs + (30 x active jobs) events/min.
+   * Hidden: 0 signal + 12 state + 12 jobs + 0 events = 24/min (88.2% below 204).
+   * Settings adds 12 health + 12 mcp requests/min only while visible.
+   */
+  const SIGNAL_INTERVAL_MS = 100;
+  const STATE_INTERVAL_MS = 1000;
+  const JOBS_INTERVAL_MS = 2000;
+  const HIDDEN_INTERVAL_MS = 5000;
+  const SETTINGS_INTERVAL_MS = 5000;
 
   const refs = {
-    connection: document.querySelector("#connection"),
-    topbar: document.querySelector(".topbar"),
-    windowControls: document.querySelector("#window-controls"),
-    windowMinimize: document.querySelector("#window-minimize"),
-    windowMaximize: document.querySelector("#window-maximize"),
-    windowClose: document.querySelector("#window-close"),
-    canvas: document.querySelector("#engine-canvas"),
-    stateLabel: document.querySelector("#state-label"),
-    audioLine: document.querySelector("#audio-line"),
-    transcript: document.querySelector("#transcript"),
-    workerSummary: document.querySelector("#worker-summary"),
-    workerTabs: document.querySelector("#worker-tabs"),
-    workerOutput: document.querySelector("#worker-output"),
-    history: document.querySelector("#history-list"),
-    historyCount: document.querySelector("#history-count"),
-    resultTitle: document.querySelector("#result-title"),
-    resultPlaceholder: document.querySelector("#result-placeholder"),
-    historyResult: document.querySelector("#history-result"),
-    voiceStatus: document.querySelector("#voice-status"),
-    wakeStatus: document.querySelector("#wake-status"),
-    audioInput: document.querySelector("#audio-input"),
-    audioInputMode: document.querySelector("#audio-input-mode"),
-    audioOutput: document.querySelector("#audio-output"),
-    audioOutputMode: document.querySelector("#audio-output-mode"),
-    claudeStatus: document.querySelector("#claude-status"),
-    mcpList: document.querySelector("#mcp-list"),
-    configList: document.querySelector("#config-list"),
-    pairingStatus: document.querySelector("#pairing-status"),
-    repairButton: document.querySelector("#repair-button"),
+    connection: document.querySelector("#connection"), topbar: document.querySelector(".topbar"),
+    windowControls: document.querySelector("#window-controls"), windowMinimize: document.querySelector("#window-minimize"),
+    windowMaximize: document.querySelector("#window-maximize"), windowClose: document.querySelector("#window-close"),
+    canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
+    audioLine: document.querySelector("#audio-line"), transcript: document.querySelector("#transcript"),
+    workerSummary: document.querySelector("#worker-summary"), workerTabs: document.querySelector("#worker-tabs"),
+    workerOutput: document.querySelector("#worker-output"), history: document.querySelector("#history-list"),
+    historyCount: document.querySelector("#history-count"), resultTitle: document.querySelector("#result-title"),
+    resultPlaceholder: document.querySelector("#result-placeholder"), historyResult: document.querySelector("#history-result"),
+    voiceStatus: document.querySelector("#voice-status"), wakeStatus: document.querySelector("#wake-status"),
+    audioInput: document.querySelector("#audio-input"), audioInputMode: document.querySelector("#audio-input-mode"),
+    audioOutput: document.querySelector("#audio-output"), audioOutputMode: document.querySelector("#audio-output-mode"),
+    claudeStatus: document.querySelector("#claude-status"), mcpList: document.querySelector("#mcp-list"),
+    pairingStatus: document.querySelector("#pairing-status"), repairButton: document.querySelector("#repair-button"),
   };
 
-  let actionToken = "";
-  let actionExpiresAt = 0;
-  let pairingExpiryTimer = 0;
-  let currentView = "live";
-  let jobs = [];
-  let selectedJobId = "";
-  let selectedResultId = "";
-  let transcriptSignature = "";
-  let signalTimer = 0;
-  let signalRequestPending = false;
-  let stateRequestPending = false;
-  let jobsRequestPending = false;
-  let settingsRequestPending = false;
+  let actionToken = "", actionExpiresAt = 0, pairingExpiryTimer = 0;
+  let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
+  let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
+  const pendingRequests = new Set();
   const eventsByJob = new Map();
   const resultsByJob = new Map();
 
-  function nativeWindowApi() {
-    return window.pywebview?.api || null;
-  }
-
+  function nativeWindowApi() { return window.pywebview?.api || null; }
   function syncNativeWindowControls() {
-    if (nativeWindowApi() !== null) {
-      refs.windowControls.classList.remove("no-native");
-    }
+    if (nativeWindowApi() !== null) refs.windowControls.classList.remove("no-native");
   }
-
   function callNativeWindow(method) {
     const api = nativeWindowApi();
-    if (api === null || typeof api[method] !== "function") {
-      return;
-    }
+    if (api === null || typeof api[method] !== "function") return;
     Promise.resolve(api[method]()).catch(() => {});
   }
-
   document.querySelectorAll(".no-drag").forEach((element) => {
-    element.addEventListener("mousedown", (event) => {
-      event.stopPropagation();
-    });
+    element.addEventListener("mousedown", (event) => event.stopPropagation());
   });
-  refs.windowMinimize.addEventListener("click", () => {
-    callNativeWindow("minimize");
-  });
-  refs.windowMaximize.addEventListener("click", () => {
-    callNativeWindow("toggle_maximize");
-  });
-  refs.windowClose.addEventListener("click", () => {
-    callNativeWindow("request_close");
-  });
+  refs.windowMinimize.addEventListener("click", () => callNativeWindow("minimize"));
+  refs.windowMaximize.addEventListener("click", () => callNativeWindow("toggle_maximize"));
+  refs.windowClose.addEventListener("click", () => callNativeWindow("request_close"));
   refs.topbar.addEventListener("dblclick", (event) => {
     if (event.target.closest(".no-drag")) {
       return;
@@ -105,11 +67,8 @@
   window.addEventListener("pywebviewready", syncNativeWindowControls);
   syncNativeWindowControls();
   window.setTimeout(() => {
-    if (nativeWindowApi() === null) {
-      refs.windowControls.classList.add("no-native");
-    }
+    if (nativeWindowApi() === null) refs.windowControls.classList.add("no-native");
   }, 1500);
-
   function node(tag, className, text) {
     const element = document.createElement(tag);
     if (className) element.className = className;
@@ -117,13 +76,35 @@
     return element;
   }
 
-  function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
+  function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+  async function requestJson(path, {
+    authenticated = false, clearUnauthorized = false, ignoreHttpError = false, parse = true, ...options
+  } = {}) {
+    const headers = {...(options.headers || {})};
+    if (authenticated) headers[ACTION_HEADER] = actionToken;
+    const response = await fetch(path, {...options, headers});
+    if (response.status === 401 && (authenticated || clearUnauthorized)) clearPairing();
+    if (response.status === 401 && authenticated) return null;
+    if (!response.ok) {
+      if (ignoreHttpError) return null;
+      throw new Error(`request failed: ${response.status}`);
+    }
+    return parse ? response.json() : null;
+  }
+
+  function publicJson(path, options = {}) { return requestJson(path, {...options, authenticated: false}); }
+  function authenticatedJson(path, options = {}) { return requestJson(path, {...options, authenticated: true}); }
+  async function runOnce(key, action) {
+    if (pendingRequests.has(key)) return;
+    pendingRequests.add(key);
+    try { await action(); } finally { pendingRequests.delete(key); }
   }
 
   function stringValue(value) {
     return typeof value === "string" && value.trim() ? value.trim() : "—";
   }
+
+  function displayString(value) { return typeof value === "string" && value.trim() ? value : "2014"; }
 
   function clamp(value, minimum = 0, maximum = 1) {
     return Math.max(minimum, Math.min(maximum, value));
@@ -431,40 +412,42 @@
 
   const engine = createEngine(refs.canvas);
 
+  function activateTab(button, active, handler = null, syncHash = false) {
+    button.classList.toggle("is-active", active);
+    if (button.getAttribute("role") === "tab") {
+      button.setAttribute("aria-selected", String(active));
+      if (button.dataset.viewTarget) button.tabIndex = active ? 0 : -1;
+    }
+    if (!handler) return;
+    button.addEventListener("click", () => {
+      const target = handler();
+      if (!syncHash) return;
+      window.location.hash === `#${target}` ? selectView(target) : window.location.hash = target;
+    });
+  }
   function selectView(name) {
     const resolved = ROUTES.has(name) ? name : "live";
+    const changed = resolved !== currentView;
     currentView = resolved;
-    document.querySelectorAll("[data-view]").forEach((view) => {
-      view.hidden = view.dataset.view !== resolved;
-    });
+    document.querySelectorAll("[data-view]").forEach((view) => { view.hidden = view.dataset.view !== resolved; });
     document.querySelectorAll("[data-view-target]").forEach((button) => {
       const active = button.dataset.viewTarget === resolved;
-      button.classList.toggle("is-active", active);
-      if (button.getAttribute("role") === "tab") {
-        button.setAttribute("aria-selected", String(active));
-        button.tabIndex = active ? 0 : -1;
-      }
+      if (button.getAttribute("role") === "tab") activateTab(button, active);
+      else button.classList.toggle("is-active", active);
     });
     updateLiveActivity();
+    if (changed) updateSettingsPolling(true);
   }
 
   function routeFromHash() {
     const name = window.location.hash.slice(1).toLowerCase();
     const resolved = ROUTES.has(name) ? name : "live";
-    if (name !== resolved) {
-      history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${resolved}`);
-    }
+    if (name !== resolved) history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${resolved}`);
     selectView(resolved);
   }
-
   document.querySelectorAll("[data-view-target]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const target = button.dataset.viewTarget;
-      if (window.location.hash === `#${target}`) selectView(target);
-      else window.location.hash = target;
-    });
+    activateTab(button, false, () => button.dataset.viewTarget, true);
   });
-
   const viewTabs = [...document.querySelectorAll('.nav-button[role="tab"]')];
   viewTabs.forEach((button, index) => {
     button.addEventListener("keydown", (event) => {
@@ -476,11 +459,9 @@
       if (nextIndex === null) return;
       event.preventDefault();
       const nextTab = viewTabs[nextIndex];
-      nextTab.focus();
-      window.location.hash = nextTab.dataset.viewTarget;
+      nextTab.focus(); window.location.hash = nextTab.dataset.viewTarget;
     });
   });
-
   document.querySelector(".skip-link").addEventListener("click", (event) => {
     event.preventDefault();
     document.querySelector("#main").focus();
@@ -494,8 +475,7 @@
 
   function setEngineState(rawState) {
     const state = VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
-    refs.stateLabel.textContent = state;
-    engine.setState(state);
+    refs.stateLabel.textContent = state; engine.setState(state);
   }
 
   function renderTranscript(lines) {
@@ -545,51 +525,38 @@
     refs.audioOutputMode.textContent = output.present && output.following ? "following system default" : "";
   }
 
-  function firstString(...values) {
-    return values.find((value) => typeof value === "string" && value.trim()) || "—";
-  }
-
   function renderVoice(payload) {
-    const config = isRecord(payload.config) ? payload.config : {};
-    const wake = isRecord(payload.wake) ? payload.wake : {};
-    refs.voiceStatus.textContent = firstString(payload.voice, payload.active_voice, config.active_voice);
-    refs.wakeStatus.textContent = firstString(payload.wake_model, wake.model, config.wake_model);
+    refs.voiceStatus.textContent = displayString(payload.voice);
+    refs.wakeStatus.textContent = displayString(payload.wake_model);
   }
 
-  async function refreshState() {
-    if (stateRequestPending) return;
-    stateRequestPending = true;
-    try {
-      const response = await fetch("/state", {cache: "no-store"});
-      if (!response.ok) throw new Error("state unavailable");
-      const payload = await response.json();
-      setConnection(true);
-      setEngineState(payload.state);
-      renderTranscript(payload.transcript);
-      renderVoice(payload);
-      renderAudio(payload.audio);
-    } catch (_error) {
-      setConnection(false);
-      setEngineState("OFFLINE");
-      renderAudio(null);
-    } finally {
-      stateRequestPending = false;
-    }
+  function refreshState() {
+    return runOnce("state", async () => {
+      try {
+        const payload = await publicJson("/state", {cache: "no-store"});
+        setConnection(true);
+        setEngineState(payload.state);
+        renderTranscript(payload.transcript);
+        renderVoice(payload);
+        renderAudio(payload.audio);
+      } catch (_error) {
+        setConnection(false);
+        setEngineState("OFFLINE");
+        renderAudio(null);
+      }
+    });
   }
 
-  async function refreshSignal() {
-    if (signalRequestPending || currentView !== "live" || document.visibilityState !== "visible") return;
-    signalRequestPending = true;
-    try {
-      const response = await fetch("/signal", {cache: "no-store"});
-      if (!response.ok) return;
-      const payload = await response.json();
-      engine.setSignal(payload.energy, payload.bands);
-    } catch (_error) {
-      engine.setSignal(0);
-    } finally {
-      signalRequestPending = false;
-    }
+  function refreshSignal() {
+    if (currentView !== "live" || document.visibilityState !== "visible") return;
+    return runOnce("signal", async () => {
+      try {
+        const payload = await publicJson("/signal", {cache: "no-store", ignoreHttpError: true});
+        if (payload) engine.setSignal(payload.energy, payload.bands);
+      } catch (_error) {
+        engine.setSignal(0);
+      }
+    });
   }
 
   function updateLiveActivity() {
@@ -611,21 +578,13 @@
     if (!eventsByJob.has(jobId)) eventsByJob.set(jobId, []);
     return eventsByJob.get(jobId);
   }
-
   function removeStoredPairing() {
-    try {
-      sessionStorage.removeItem(PAIRING_STORAGE_KEY);
-    } catch (_error) {
-      return;
-    }
+    try { sessionStorage.removeItem(PAIRING_STORAGE_KEY); } catch (_error) { return; }
   }
-
   function pairedUntilText() {
     const expiry = new Date(actionExpiresAt * 1000);
-    const time = expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
-    return `paired until ${time}`;
+    return `paired until ${expiry.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
   }
-
   function renderPairingStatus() {
     const paired = Boolean(actionToken) && actionExpiresAt * 1000 > Date.now();
     refs.pairingStatus.textContent = paired ? pairedUntilText() : "Not paired";
@@ -634,12 +593,9 @@
 
   function clearPairing() {
     if (pairingExpiryTimer) window.clearTimeout(pairingExpiryTimer);
-    pairingExpiryTimer = 0;
-    actionToken = "";
-    actionExpiresAt = 0;
+    pairingExpiryTimer = 0; actionToken = ""; actionExpiresAt = 0;
     removeStoredPairing();
-    eventsByJob.clear();
-    resultsByJob.clear();
+    eventsByJob.clear(); resultsByJob.clear();
     renderPairingStatus();
     const selected = jobs.find((job) => job.id === selectedResultId);
     setResultPanel(
@@ -657,8 +613,7 @@
       return false;
     }
     if (pairingExpiryTimer) window.clearTimeout(pairingExpiryTimer);
-    actionToken = token;
-    actionExpiresAt = expiration;
+    actionToken = token; actionExpiresAt = expiration;
     try {
       sessionStorage.setItem(PAIRING_STORAGE_KEY, JSON.stringify({token, expires_at: expiration}));
     } catch (_error) {
@@ -673,11 +628,8 @@
 
   function restorePairing() {
     let stored = null;
-    try {
-      stored = JSON.parse(sessionStorage.getItem(PAIRING_STORAGE_KEY) || "null");
-    } catch (_error) {
-      removeStoredPairing();
-    }
+    try { stored = JSON.parse(sessionStorage.getItem(PAIRING_STORAGE_KEY) || "null"); }
+    catch (_error) { removeStoredPairing(); }
     if (!isRecord(stored) || !setPairing(stored.token, stored.expires_at)) clearPairing();
   }
 
@@ -686,42 +638,47 @@
     const existing = eventStore(job.id);
     const lastSequence = existing.length ? existing[existing.length - 1].sequence : 0;
     try {
-      const response = await fetch(`/jobs/${encodeURIComponent(job.id)}/events?after=${lastSequence}`, {
-        cache: "no-store",
-        headers: {[ACTION_HEADER]: actionToken},
-      });
-      if (response.status === 401) {
-        clearPairing();
-        return;
-      }
-      if (!response.ok) return;
-      const payload = await response.json();
+      const payload = await authenticatedJson(
+        `/jobs/${encodeURIComponent(job.id)}/events?after=${lastSequence}`,
+        {cache: "no-store", ignoreHttpError: true},
+      );
+      if (!payload) return;
       if (Array.isArray(payload.events)) existing.push(...payload.events);
     } catch (_error) {
       return;
     }
   }
 
-  function renderWorker(job) {
+  function jobView(job, titleTag = "", titleClass = "", statusClass = "") {
+    const active = ACTIVE_JOB_STATES.has(job.status);
+    return {
+      job, active, title: titleTag ? node(titleTag, titleClass, job.title) : null,
+      status: titleTag ? node("span", statusClass, job.status) : null,
+      summary: job.summary || job.error || (active ? "In progress" : "No summary available."),
+    };
+  }
+  function cancelButton(view, className = "", showUnpaired = false) {
+    if (!actionToken && !showUnpaired) return null;
+    const classes = ["small-button", className].filter(Boolean).join(" ");
+    const button = node("button", classes, actionToken ? "Cancel" : "Pair to cancel");
+    button.type = "button"; button.disabled = !actionToken;
+    button.addEventListener("click", () => cancelJob(view.job.id, button));
+    return button;
+  }
+  function renderWorker(view) {
     refs.workerOutput.replaceChildren();
-    if (!job) {
+    if (!view) {
       refs.workerOutput.append(node("p", "empty", "No workers are active."));
       return;
     }
-    const header = node("div", "worker-heading");
-    const title = node("div", "worker-title");
-    title.append(node("strong", "", job.title));
-    title.append(node("span", "quiet", job.status));
+    const header = node("div", "worker-heading"), title = node("div", "worker-title");
+    title.append(view.title, view.status);
     header.append(title);
-    if (actionToken) {
-      const cancel = node("button", "small-button", "Cancel");
-      cancel.type = "button";
-      cancel.addEventListener("click", () => cancelJob(job.id, cancel));
-      header.append(cancel);
-    }
+    const cancel = cancelButton(view);
+    if (cancel) header.append(cancel);
     refs.workerOutput.append(header);
     const terminal = node("div", "terminal");
-    const events = eventStore(job.id);
+    const events = eventStore(view.job.id);
     if (!actionToken) terminal.append(node("p", "quiet", "pair to view output"));
     else if (events.length === 0) terminal.append(node("p", "quiet", "Waiting for output."));
     if (actionToken) {
@@ -735,28 +692,24 @@
     }
     refs.workerOutput.append(terminal);
   }
-
   function renderWorkers() {
-    const active = jobs.filter((job) => ACTIVE_JOB_STATES.has(job.status));
+    const active = jobs.map((job) => jobView(job, "strong", "", "quiet")).filter((view) => view.active);
     refs.workerSummary.textContent = active.length ? `${active.length} active` : "idle";
     refs.workerTabs.replaceChildren();
-    if (!active.some((job) => job.id === selectedJobId)) selectedJobId = active[0]?.id || "";
-    active.forEach((job) => {
-      const button = node("button", "worker-tab", job.title);
-      const selected = job.id === selectedJobId;
+    if (!active.some((view) => view.job.id === selectedJobId)) selectedJobId = active[0]?.job.id || "";
+    active.forEach((view) => {
+      const button = node("button", "worker-tab", view.job.title);
+      const selected = view.job.id === selectedJobId;
       button.type = "button";
       button.role = "tab";
-      button.classList.toggle("is-active", selected);
-      button.setAttribute("aria-selected", String(selected));
-      button.addEventListener("click", () => {
-        selectedJobId = job.id;
+      activateTab(button, selected, () => {
+        selectedJobId = view.job.id;
         renderWorkers();
       });
       refs.workerTabs.append(button);
     });
-    renderWorker(active.find((job) => job.id === selectedJobId));
+    renderWorker(active.find((view) => view.job.id === selectedJobId));
   }
-
   function relativeTime(value) {
     const milliseconds = typeof value === "number" ? value * 1000 : Date.parse(value);
     if (!Number.isFinite(milliseconds)) return "—";
@@ -768,7 +721,6 @@
     if (elapsed < 604_800_000) return `${Math.floor(elapsed / 86_400_000)}d ago`;
     return new Date(milliseconds).toLocaleDateString();
   }
-
   function setResultPanel(title, message, result = null) {
     const hasResult = typeof result === "string";
     refs.resultTitle.textContent = title;
@@ -777,7 +729,6 @@
     refs.historyResult.hidden = !hasResult;
     refs.historyResult.textContent = hasResult ? result : "";
   }
-
   async function showResult(job) {
     selectedResultId = job.id;
     if (!actionToken) {
@@ -790,16 +741,8 @@
     }
     setResultPanel(job.title, "Loading result…");
     try {
-      const response = await fetch(`/jobs/${encodeURIComponent(job.id)}/result`, {
-        cache: "no-store",
-        headers: {[ACTION_HEADER]: actionToken},
-      });
-      if (response.status === 401) {
-        clearPairing();
-        return;
-      }
-      if (!response.ok) throw new Error("result unavailable");
-      const payload = await response.json();
+      const payload = await authenticatedJson(`/jobs/${encodeURIComponent(job.id)}/result`, {cache: "no-store"});
+      if (!payload) return;
       const result = typeof payload.result === "string" ? payload.result : "Result unavailable.";
       resultsByJob.set(job.id, result);
       if (selectedResultId === job.id) setResultPanel(job.title, "", result);
@@ -807,7 +750,6 @@
       if (selectedResultId === job.id) setResultPanel(job.title, "Result unavailable.");
     }
   }
-
   function renderHistory() {
     refs.history.replaceChildren();
     refs.historyCount.textContent = `${jobs.length} ${jobs.length === 1 ? "job" : "jobs"}`;
@@ -817,74 +759,60 @@
     }
     const ordered = [...jobs].sort((left, right) => right.updated_at - left.updated_at);
     ordered.forEach((job) => {
-      const active = ACTIVE_JOB_STATES.has(job.status);
+      const view = jobView(job, "span", "history-title", `job-state is-${job.status}`);
       const row = node("article", "history-row");
       const open = node("button", "history-open");
       open.type = "button";
-      open.disabled = active;
+      open.disabled = view.active;
       const topLine = node("div", "history-topline");
-      topLine.append(node("span", "history-title", job.title));
+      topLine.append(view.title);
       const meta = node("span", "history-meta");
-      meta.append(node("span", `job-state is-${job.status}`, job.status));
+      meta.append(view.status);
       meta.append(node("time", "history-time", relativeTime(job.updated_at)));
       topLine.append(meta);
       open.append(topLine);
-      open.append(node("p", "history-summary", job.summary || job.error || (active ? "In progress" : "No summary available.")));
-      if (!active) open.addEventListener("click", () => showResult(job));
+      open.append(node("p", "history-summary", view.summary));
+      if (!view.active) open.addEventListener("click", () => showResult(job));
       row.append(open);
-      if (active) {
-        const cancel = node("button", "small-button history-cancel", actionToken ? "Cancel" : "Pair to cancel");
-        cancel.type = "button";
-        cancel.disabled = !actionToken;
-        cancel.addEventListener("click", () => cancelJob(job.id, cancel));
-        row.append(cancel);
-      }
+      if (view.active) row.append(cancelButton(view, "history-cancel", true));
       refs.history.append(row);
     });
   }
-
   async function cancelJob(jobId, button) {
     if (!actionToken) return;
     button.disabled = true;
     button.textContent = "Cancelling…";
     try {
-      const response = await fetch(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      await authenticatedJson(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          [ACTION_HEADER]: actionToken,
         },
         body: "{}",
+        parse: false,
+        ignoreHttpError: true,
       });
-      if (response.status === 401) {
-        clearPairing();
-      }
       await refreshJobs();
     } catch (_error) {
       button.disabled = false;
       button.textContent = "Cancel";
     }
   }
-
-  async function refreshJobs() {
-    if (jobsRequestPending) return;
-    jobsRequestPending = true;
-    try {
-      const response = await fetch("/jobs", {cache: "no-store"});
-      if (!response.ok) return;
-      const payload = await response.json();
-      jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
-      const active = jobs.filter((job) => ACTIVE_JOB_STATES.has(job.status));
-      await Promise.all(active.map(refreshEvents));
-      renderWorkers();
-      renderHistory();
-    } catch (_error) {
-      return;
-    } finally {
-      jobsRequestPending = false;
-    }
+  function refreshJobs() {
+    return runOnce("jobs", async () => {
+      try {
+        const payload = await publicJson("/jobs", {cache: "no-store", ignoreHttpError: true});
+        if (!payload) return;
+        jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+        const active = jobs.map((job) => jobView(job)).filter((view) => view.active);
+        if (!document.hidden) await Promise.all(active.map((view) => refreshEvents(view.job)));
+        renderWorkers();
+        renderHistory();
+      } catch (_error) {
+        return;
+      }
+    });
   }
-
   function renderMcp(servers) {
     refs.mcpList.replaceChildren();
     if (!Array.isArray(servers) || servers.length === 0) {
@@ -901,42 +829,47 @@
       refs.mcpList.append(row);
     });
   }
-
-  async function refreshSettings() {
-    if (settingsRequestPending) return;
-    settingsRequestPending = true;
-    try {
-      const [mcpResponse, healthResponse] = await Promise.all([
-        fetch("/mcp", {cache: "no-store"}),
-        fetch("/health", {cache: "no-store"}),
-      ]);
-      if (mcpResponse.ok) renderMcp((await mcpResponse.json()).servers);
-      if (healthResponse.ok) {
-        const health = await healthResponse.json();
-        refs.claudeStatus.textContent = health.claude ? "Available" : "Unavailable";
-        refs.claudeStatus.classList.toggle("is-unavailable", !health.claude);
+  function refreshSettings() {
+    return runOnce("settings", async () => {
+      try {
+        const request = {cache: "no-store", ignoreHttpError: true};
+        const [mcp, health] = await Promise.all([publicJson("/mcp", request), publicJson("/health", request)]);
+        if (mcp) renderMcp(mcp.servers);
+        if (health) {
+          refs.claudeStatus.textContent = health.claude ? "Available" : "Unavailable";
+          refs.claudeStatus.classList.toggle("is-unavailable", !health.claude);
+        }
+      } catch (_error) {
+        refs.claudeStatus.textContent = "Unavailable";
+        refs.claudeStatus.classList.add("is-unavailable");
       }
-    } catch (_error) {
-      refs.claudeStatus.textContent = "Unavailable";
-      refs.claudeStatus.classList.add("is-unavailable");
-    } finally {
-      settingsRequestPending = false;
-    }
+    });
   }
-
+  function updateSettingsPolling(refresh = false) {
+    if (settingsTimer) window.clearInterval(settingsTimer); settingsTimer = 0;
+    if (document.hidden || currentView !== "settings") return;
+    if (refresh) refreshSettings();
+    settingsTimer = window.setInterval(refreshSettings, SETTINGS_INTERVAL_MS);
+  }
+  function updatePolling(resume = false) {
+    if (stateTimer) window.clearInterval(stateTimer); if (jobsTimer) window.clearInterval(jobsTimer);
+    const hidden = document.hidden;
+    stateTimer = window.setInterval(refreshState, hidden ? HIDDEN_INTERVAL_MS : STATE_INTERVAL_MS);
+    jobsTimer = window.setInterval(refreshJobs, hidden ? HIDDEN_INTERVAL_MS : JOBS_INTERVAL_MS);
+    if (resume && !hidden) { refreshState(); refreshJobs(); }
+    updateSettingsPolling(resume);
+    updateLiveActivity();
+  }
   async function pairWithToken(token) {
-    const response = await fetch("/pair", {
+    const payload = await publicJson("/pair", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify({token}),
+      clearUnauthorized: true,
     });
-    if (response.status === 401) clearPairing();
-    if (!response.ok) throw new Error("pairing failed");
-    const payload = await response.json();
     if (!setPairing(payload.action_token, payload.expires_at)) throw new Error("invalid pairing");
     await refreshJobs();
   }
-
   async function pairFromFragment() {
     const params = new URLSearchParams(window.location.hash.slice(1));
     const token = params.get("pair");
@@ -952,7 +885,6 @@
     }
     return true;
   }
-
   async function renewPairing() {
     if (!actionToken || actionExpiresAt * 1000 <= Date.now()) {
       clearPairing();
@@ -961,16 +893,8 @@
     refs.repairButton.disabled = true;
     refs.pairingStatus.textContent = "Re-pairing";
     try {
-      const response = await fetch("/pair/bootstrap", {
-        cache: "no-store",
-        headers: {[ACTION_HEADER]: actionToken},
-      });
-      if (response.status === 401) {
-        clearPairing();
-        return;
-      }
-      if (!response.ok) throw new Error("renewal unavailable");
-      const payload = await response.json();
+      const payload = await authenticatedJson("/pair/bootstrap", {cache: "no-store"});
+      if (!payload) return;
       if (typeof payload.token !== "string" || !payload.token) throw new Error("invalid bootstrap");
       await pairWithToken(payload.token);
     } catch (_error) {
@@ -978,22 +902,17 @@
       else renderPairingStatus();
     }
   }
-
   async function handleHashChange() {
     if (await pairFromFragment()) return;
     routeFromHash();
   }
 
-  CONFIG_PATHS.forEach((path) => refs.configList.append(node("li", "", path)));
   window.addEventListener("hashchange", handleHashChange);
-  document.addEventListener("visibilitychange", updateLiveActivity);
+  document.addEventListener("visibilitychange", () => updatePolling(!document.hidden));
   refs.repairButton.addEventListener("click", renewPairing);
   restorePairing();
   handleHashChange();
   refreshState();
   refreshJobs();
-  refreshSettings();
-  window.setInterval(refreshState, 500);
-  window.setInterval(refreshJobs, 1000);
-  window.setInterval(refreshSettings, 5000);
+  updatePolling();
 })();
