@@ -400,7 +400,7 @@ def _watch_child(
             return
         current = replacement
 
-def _capture_ui_url(stream: TextIO, result: Queue[str | None], redactions=()) -> None:
+def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
     found = False
     marker_lines = 0
     for line in stream:
@@ -461,7 +461,7 @@ def run(
         result: Queue[str | None] = Queue(maxsize=1)
         Thread(
             target=_capture_ui_url,
-            args=(proc.stdout, result, (shutdown_token,)),
+            args=(proc.stdout, result),
             daemon=True,
         ).start()
         return proc, handle, result

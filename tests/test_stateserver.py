@@ -230,7 +230,17 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     from worker import app
 
     calls = []
+    publishers = []
+    placeholder_audio = []
     build_active = False
+
+    real_publisher = app.state.StatePublisher
+
+    def make_publisher(*args, **kwargs):
+        calls.append("publisher-created")
+        publisher = real_publisher(*args, **kwargs)
+        placeholder_audio.append(publisher.snapshot()["audio"])
+        return publisher
 
     class FakeWork:
         launcher = SimpleNamespace(available=True)
@@ -276,6 +286,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
 
         async def start(self, **_kwargs):
+            calls.append("session-started")
             return None
 
         def interrupt(self):
@@ -285,6 +296,10 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         port = 4321
 
     async def start_server(*_args, **_kwargs):
+        publishers.append(_args[0])
+        snapshot = publishers[0].snapshot()
+        assert snapshot["ready"] is False
+        assert snapshot["audio"] == placeholder_audio[0]
         calls.append("server-started")
         return FakeServer()
 
@@ -292,6 +307,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         room = object()
 
         async def connect(self):
+            calls.append("livekit-connected")
             return None
 
         def add_shutdown_callback(self, _callback):
@@ -305,16 +321,31 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         "engagement_timeout_s": 30,
         "address_window_s": 10,
         "state_port": 0,
+        "wake_input_device": "Desk microphone",
     }
     monkeypatch.setattr(app, "TEXT_MODE", True)
     monkeypatch.setattr(app, "_cfg", lambda: cfg)
     monkeypatch.setattr(app.runtime, "build", build)
+    monkeypatch.setattr(app.state, "StatePublisher", make_publisher)
     monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
     monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
     monkeypatch.setattr(app.router, "Addressing", lambda *_args: object())
     monkeypatch.setattr(app.router, "vocabulary", lambda _cfg: [])
-    monkeypatch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
-    monkeypatch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
+    monkeypatch.setattr(
+        app.wakeword,
+        "resolve_input_device",
+        lambda _device: calls.append("wake-resolved") or 7,
+    )
+    monkeypatch.setattr(
+        app.wakeword,
+        "InputDeviceSwitch",
+        lambda _device: calls.append("wake-switch-created") or object(),
+    )
+    monkeypatch.setattr(
+        app.devicewatch,
+        "audio_status",
+        lambda _cfg: calls.append("audio-status") or {},
+    )
     monkeypatch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))
     monkeypatch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
     monkeypatch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
@@ -324,10 +355,253 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
     monkeypatch.setattr(app.stateserver, "start", start_server)
     monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: calls.append("ui-emitted"))
+    real_create_task = asyncio.create_task
+    scheduled = iter(("mcp-scheduled", "work-scheduled"))
+
+    def record_create_task(coro):
+        calls.append(next(scheduled))
+        return real_create_task(coro)
+
+    monkeypatch.setattr(app.asyncio, "create_task", record_create_task)
 
     asyncio.run(app.entrypoint(FakeContext()))
 
-    assert calls == ["build-returned", "server-started", "ui-emitted", "warm"]
+    assert publishers[0].snapshot()["ready"] is True
+    assert calls == [
+        "build-returned",
+        "publisher-created",
+        "server-started",
+        "ui-emitted",
+        "warm",
+        "wake-resolved",
+        "wake-switch-created",
+        "audio-status",
+        "mcp-scheduled",
+        "work-scheduled",
+        "livekit-connected",
+        "session-started",
+    ]
+
+
+def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
+    from worker import app
+
+    cleanup_failures = []
+    for failure in ("warm", "connect", "session"):
+        events = []
+        background_tasks = []
+
+        class FakeWork:
+            launcher = SimpleNamespace(available=True)
+
+            def on_terminal(self, _callback):
+                return None
+
+            async def cancel(self, _job_id):
+                return True
+
+            async def cancel_active(self, *, timeout_s):
+                events.append(("work-cancelled", timeout_s))
+
+            async def run(self, stop):
+                await stop.wait()
+
+        class FakeMcp:
+            async def connect(self, _registry):
+                await asyncio.Event().wait()
+
+            async def close(self):
+                events.append("mcp-closed")
+
+            def status(self):
+                return []
+
+        class FakeRuntime:
+            def __init__(self):
+                self.brain = SimpleNamespace(on_tool=None)
+                self.work = FakeWork()
+                self.mcp = FakeMcp()
+                self.registry = object()
+                self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+
+            def warm_model_client(self):
+                if failure == "warm":
+                    raise RuntimeError("warm failed")
+
+        class FakeSession:
+            input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
+
+            async def start(self, **_kwargs):
+                if failure == "session":
+                    raise RuntimeError("session failed")
+
+            def interrupt(self):
+                events.append("session-interrupted")
+
+        class FakeServer:
+            port = 4321
+
+        class FakeContext:
+            room = object()
+
+            async def connect(self):
+                if failure == "connect":
+                    raise RuntimeError("connect failed")
+
+            def add_shutdown_callback(self, _callback):
+                events.append("shutdown-registered")
+
+            def shutdown(self, _reason):
+                return None
+
+        async def stop_server(_store, _server):
+            events.append("server-stopped")
+
+        async def start_server(*_args, **_kwargs):
+            return FakeServer()
+
+        real_create_task = asyncio.create_task
+
+        def record_create_task(coro):
+            task = real_create_task(coro)
+            background_tasks.append(task)
+            return task
+
+        cfg = {
+            "active_voice": "mars",
+            "engagement_timeout_s": 30,
+            "address_window_s": 10,
+            "state_port": 0,
+        }
+        with monkeypatch.context() as patch:
+            patch.setattr(app, "TEXT_MODE", True)
+            patch.setattr(app, "_cfg", lambda: cfg)
+            patch.setattr(app.runtime, "build", lambda *_args, **_kwargs: FakeRuntime())
+            patch.setattr(app.jobobject, "assign_current_process", lambda: None)
+            patch.setattr(app.envload, "load_private_environment", lambda: None)
+            patch.setattr(app.router, "Addressing", lambda *_args: object())
+            patch.setattr(app.router, "vocabulary", lambda _cfg: [])
+            patch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
+            patch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
+            patch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))
+            patch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+            patch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
+            patch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
+            patch.setattr(app, "_build_tts", lambda _cfg: object())
+            patch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
+            patch.setattr(app.silero.VAD, "load", lambda: object())
+            patch.setattr(app.stateserver, "start", start_server)
+            patch.setattr(app, "_emit_ui_url", lambda *_args: None)
+            patch.setattr(app, "_flush_store_and_stop_state_server", stop_server)
+            patch.setattr(app.asyncio, "create_task", record_create_task)
+
+            async def scenario():
+                try:
+                    await app.entrypoint(FakeContext())
+                except RuntimeError as exc:
+                    assert str(exc) == f"{failure} failed"
+                else:
+                    raise AssertionError("startup failure did not propagate")
+
+                assert "server-stopped" in events
+                assert all(task.done() for task in background_tasks)
+
+            try:
+                asyncio.run(scenario())
+            except AssertionError as exc:
+                cleanup_failures.append(f"{failure}: {exc}")
+            finally:
+                app.wakeword.shutting_down.clear()
+
+    assert cleanup_failures == []
+
+
+def test_entrypoint_early_shutdown_is_registered_and_idempotent(monkeypatch):
+    from worker import app
+
+    events = []
+    callback_box = {}
+    shutdown_tasks = []
+
+    class FakeWork:
+        launcher = SimpleNamespace(available=True)
+
+        def on_terminal(self, _callback):
+            return None
+
+        async def cancel(self, _job_id):
+            return True
+
+        async def cancel_active(self, *, timeout_s):
+            events.append(("work-cancelled", timeout_s))
+
+    class FakeMcp:
+        async def close(self):
+            events.append("mcp-closed")
+
+        def status(self):
+            return []
+
+    class FakeRuntime:
+        def __init__(self):
+            self.brain = SimpleNamespace(on_tool=None)
+            self.work = FakeWork()
+            self.mcp = FakeMcp()
+            self.registry = object()
+            self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+
+    class FakeServer:
+        port = 4321
+
+    class FakeContext:
+        def add_shutdown_callback(self, callback):
+            callback_box["callback"] = callback
+
+        def shutdown(self, _reason):
+            return None
+
+    async def stop_server(_store, _server):
+        events.append("server-stopped")
+        await asyncio.sleep(0)
+
+    async def start_server(*_args, **_kwargs):
+        return FakeServer()
+
+    def emit_ui(*_args):
+        callback = callback_box["callback"]
+        shutdown_tasks.append(asyncio.create_task(callback()))
+        raise RuntimeError("ui failed")
+
+    cfg = {
+        "active_voice": "mars",
+        "engagement_timeout_s": 30,
+        "address_window_s": 10,
+        "state_port": 0,
+    }
+    monkeypatch.setattr(app, "_cfg", lambda: cfg)
+    monkeypatch.setattr(app.runtime, "build", lambda *_args, **_kwargs: FakeRuntime())
+    monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
+    monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
+    monkeypatch.setattr(app.router, "Addressing", lambda *_args: object())
+    monkeypatch.setattr(app.router, "vocabulary", lambda _cfg: [])
+    monkeypatch.setattr(app.stateserver, "start", start_server)
+    monkeypatch.setattr(app, "_emit_ui_url", emit_ui)
+    monkeypatch.setattr(app, "_flush_store_and_stop_state_server", stop_server)
+
+    async def scenario():
+        try:
+            await app.entrypoint(FakeContext())
+        except RuntimeError as exc:
+            assert str(exc) == "ui failed"
+        else:
+            raise AssertionError("startup failure did not propagate")
+        await asyncio.gather(*shutdown_tasks)
+
+    asyncio.run(scenario())
+
+    assert events.count("server-stopped") == 1
+    assert events.count("mcp-closed") == 1
+    app.wakeword.shutting_down.clear()
 
 
 def test_pairing_protects_job_events_private_results_and_cancellation():

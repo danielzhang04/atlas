@@ -432,105 +432,74 @@ async def entrypoint(ctx: JobContext) -> None:
     envload.load_private_environment()
     cfg = _cfg()
     authorizer = stateserver.PairingAuthorizer()
-    server_box: dict[str, stateserver.StateServer] = {}
+    server: stateserver.StateServer | None = None
 
     def _paired_url() -> str | None:
-        server = server_box.get("server")
         if server is None:
             return None
         return stateserver.pairing_url(authorizer, server.port)
 
     services = runtime.build(cfg, paired_url=_paired_url)
     publisher = state.StatePublisher(voice=cfg.get("active_voice"))
-    engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
-    addressing = router.Addressing(
-        float(cfg["address_window_s"]),
-        router.vocabulary(cfg),
-    )
-    turn_ownership = TurnOwnership()
-    wake_device = cfg.get("wake_input_device")
-    initial_wake_device = None
-    if wake_device and wake_device != FOLLOW_SENTINEL:
-        initial_wake_device = wakeword.resolve_input_device(wake_device)
-    wake_switch = wakeword.InputDeviceSwitch(initial_wake_device)
-    audio_watcher = None
-    publisher.set_audio(devicewatch.audio_status(cfg))
-
-    services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
     loop = asyncio.get_running_loop()
-    restart_coalescer = devicewatch.AudioRestartCoalescer(
-        lambda reason: _restart_worker(reason, ctx.shutdown),
-        loop=loop,
-    )
-    audio_failure = devicewatch.audio_failure_callback(
-        publisher,
-        "input",
-        restart_coalescer.request,
-    )
-    session_box: dict[str, Any] = {}
-    pending_terminal = []
-
-    def _deliver_terminal(job) -> None:
-        current_session = session_box.get("session")
-        if current_session is None:
-            pending_terminal.append(job)
-            return
-        _announce_terminal(job, publisher, current_session, engagement, addressing)
-
-    services.work.on_terminal(
-        lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
-    )
+    session: Any | None = None
+    mcp_task: asyncio.Task | None = None
+    work_task: asyncio.Task | None = None
+    engagement: engagement_mod.Engagement | None = None
+    turn_ownership: TurnOwnership | None = None
+    wake_switch: Any | None = None
+    audio_watcher: Any | None = None
+    restart_coalescer: devicewatch.AudioRestartCoalescer | None = None
+    audio_failure = None
     stop_work = asyncio.Event()
     sleep_task: asyncio.Task | None = None
     shutdown_jobs_requested = False
-    mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
-    work_task = asyncio.create_task(services.work.run(stop_work))
-    _BG_TASKS.update((mcp_task, work_task))
-    mcp_task.add_done_callback(_BG_TASKS.discard)
-    work_task.add_done_callback(_BG_TASKS.discard)
-
-    await ctx.connect()
-    stt_kwargs: dict[str, Any] = {"model": "flux-general-en"}
-    keyterms = _stt_keyterms(cfg)
-    if keyterms:
-        stt_kwargs["keyterm"] = keyterms
-    session = AgentSession(
-        stt=deepgram.STTv2(**stt_kwargs),
-        vad=silero.VAD.load(),
-        llm=None,
-        tts=_build_tts(cfg),
-        turn_detection="stt",
-    )
-    agent = AtlasAgent(
-        instructions="Atlas voice I/O is host controlled.",
-        llm=None,
-        tools=[],
-    )
-    await session.start(agent=agent, room=ctx.room)
-    session_box["session"] = session
-    for terminal_job in pending_terminal:
-        _announce_terminal(terminal_job, publisher, session, engagement, addressing)
-    pending_terminal.clear()
-
-    async def _submit(text: str) -> None:
-        await turn_ownership.run(lambda: _submit_voice_turn(
-            text,
-            brain=services.brain,
-            session=session,
-            publisher=publisher,
-            engagement=engagement,
-        ))
-
-    agent.turn_handler = _submit
+    shutdown_started = False
+    shutdown_done = asyncio.Event()
 
     async def _request_shutdown() -> None:
         nonlocal shutdown_jobs_requested
         shutdown_jobs_requested = True
-        engagement.dismiss()
-        session.interrupt()
-        turn_ownership.cancel()
+        if engagement is not None:
+            engagement.dismiss()
+        if session is not None:
+            session.interrupt()
+        if turn_ownership is not None:
+            turn_ownership.cancel()
         await services.work.cancel_active(timeout_s=15.0)
         loop.call_later(0.05, ctx.shutdown, "desktop requested shutdown")
+
+    async def _shutdown() -> None:
+        nonlocal shutdown_started
+        if shutdown_started:
+            await shutdown_done.wait()
+            return
+        shutdown_started = True
+        try:
+            wakeword.shutting_down.set()
+            if audio_watcher is not None:
+                audio_watcher.stop()
+            if session is not None:
+                session.interrupt()
+            if turn_ownership is not None:
+                turn_ownership.cancel()
+            if sleep_task is not None:
+                sleep_task.cancel()
+                await asyncio.gather(sleep_task, return_exceptions=True)
+            if _should_cancel_active_jobs(shutdown_jobs_requested):
+                await services.work.cancel_active(timeout_s=15.0)
+            stop_work.set()
+            if mcp_task is not None:
+                mcp_task.cancel()
+            if work_task is not None:
+                await asyncio.gather(work_task, return_exceptions=True)
+            if mcp_task is not None:
+                await asyncio.gather(mcp_task, return_exceptions=True)
+            await services.mcp.close()
+            if server is not None:
+                await _flush_store_and_stop_state_server(services.store, server)
+        finally:
+            shutdown_done.set()
 
     server = await stateserver.start(
         publisher,
@@ -544,107 +513,165 @@ async def entrypoint(ctx: JobContext) -> None:
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
     )
-    server_box["server"] = server
-    _emit_ui_url(authorizer, server.port)
-    services.warm_model_client()
+    try:
+        ctx.add_shutdown_callback(_shutdown)
+        _emit_ui_url(authorizer, server.port)
+        services.warm_model_client()
 
-    async def _shutdown() -> None:
-        wakeword.shutting_down.set()
-        if audio_watcher is not None:
-            audio_watcher.stop()
-        session.interrupt()
-        turn_ownership.cancel()
-        if sleep_task is not None:
-            sleep_task.cancel()
-            await asyncio.gather(sleep_task, return_exceptions=True)
-        if _should_cancel_active_jobs(shutdown_jobs_requested):
-            await services.work.cancel_active(timeout_s=15.0)
-        stop_work.set()
-        mcp_task.cancel()
-        await asyncio.gather(work_task, return_exceptions=True)
-        await asyncio.gather(mcp_task, return_exceptions=True)
-        await services.mcp.close()
-        await _flush_store_and_stop_state_server(services.store, server)
-
-    ctx.add_shutdown_callback(_shutdown)
-    if TEXT_MODE:
-        return
-
-    audio_watcher = devicewatch.start_audio_follow(
-        cfg,
-        publisher,
-        wake_switch,
-        request_restart=restart_coalescer.request,
-    )
-    session.input.set_audio_enabled(False)
-
-    def _sleep(announce: bool = True) -> bool:
-        return _sleep_session(session, publisher, announce=announce)
-
-    def _engage() -> None:
-        already = engagement.state == engagement_mod.ENGAGED
-        engagement.wake()
-        addressing.mark_activity()
-        session.input.set_audio_enabled(True)
-        if not already:
-            publisher.start_session()
-            publisher.set_state(state.LISTENING)
-            session.say(WAKE_LINE, add_to_chat_ctx=False)
-            publisher.add_line("atlas", WAKE_LINE)
-
-    @session.on("agent_state_changed")
-    def _on_agent_state(event) -> None:
-        _apply_agent_state(engagement, publisher, event.new_state)
-
-    def _on_wake() -> None:
-        loop.call_soon_threadsafe(_engage)
-
-    def _on_audio_signal(value: float, bands: list[float]) -> None:
-        loop.call_soon_threadsafe(publisher.set_audio_signal, value, bands)
-
-    intents = _load_intents()
-
-    async def _audio_turn(text: str) -> None:
-        await _handle_audio_turn(
-            text,
-            intents=intents,
-            brain=services.brain,
-            session=session,
-            publisher=publisher,
-            engagement=engagement,
-            addressing=addressing,
-            sleep=_sleep,
-            turn_ownership=turn_ownership,
+        engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
+        addressing = router.Addressing(
+            float(cfg["address_window_s"]),
+            router.vocabulary(cfg),
+        )
+        turn_ownership = TurnOwnership()
+        wake_device = cfg.get("wake_input_device")
+        initial_wake_device = None
+        if wake_device and wake_device != FOLLOW_SENTINEL:
+            initial_wake_device = wakeword.resolve_input_device(wake_device)
+        wake_switch = wakeword.InputDeviceSwitch(initial_wake_device)
+        publisher.set_audio(devicewatch.audio_status(cfg))
+        restart_coalescer = devicewatch.AudioRestartCoalescer(
+            lambda reason: _restart_worker(reason, ctx.shutdown),
+            loop=loop,
+        )
+        audio_failure = devicewatch.audio_failure_callback(
+            publisher,
+            "input",
+            restart_coalescer.request,
         )
 
-    agent.turn_handler = _audio_turn
-    sleep_task = asyncio.create_task(_sleep_watch(
-        engagement,
-        _sleep,
-        turn_ownership=turn_ownership,
-    ))
-    _BG_TASKS.add(sleep_task)
-    sleep_task.add_done_callback(_BG_TASKS.discard)
+        services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
+        pending_terminal = []
 
-    async def _quiet_shutdown() -> None:
-        wakeword.shutting_down.set()
+        def _deliver_terminal(job) -> None:
+            if session is None:
+                pending_terminal.append(job)
+                return
+            _announce_terminal(job, publisher, session, engagement, addressing)
 
-    ctx.add_shutdown_callback(_quiet_shutdown)
-    threading.Thread(
-        target=wakeword.listen,
-        args=(_on_wake, cfg["wake_model"]),
-        kwargs={
-            "device": cfg.get("wake_input_device"),
-            "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
-            "patience": cfg.get("wake_patience", wakeword.PATIENCE),
-            "on_signal": _on_audio_signal,
-            "bands_enabled": lambda: publisher.state != state.ASLEEP,
-            "device_switch": wake_switch,
-            "on_failure": audio_failure,
-            "on_model": _wake_model_callback(publisher, loop),
-        },
-        daemon=True,
-    ).start()
+        services.work.on_terminal(
+            lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
+        )
+
+        mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
+        work_task = asyncio.create_task(services.work.run(stop_work))
+        _BG_TASKS.update((mcp_task, work_task))
+        mcp_task.add_done_callback(_BG_TASKS.discard)
+        work_task.add_done_callback(_BG_TASKS.discard)
+
+        await ctx.connect()
+        stt_kwargs: dict[str, Any] = {"model": "flux-general-en"}
+        keyterms = _stt_keyterms(cfg)
+        if keyterms:
+            stt_kwargs["keyterm"] = keyterms
+        session = AgentSession(
+            stt=deepgram.STTv2(**stt_kwargs),
+            vad=silero.VAD.load(),
+            llm=None,
+            tts=_build_tts(cfg),
+            turn_detection="stt",
+        )
+        agent = AtlasAgent(
+            instructions="Atlas voice I/O is host controlled.",
+            llm=None,
+            tools=[],
+        )
+        await session.start(agent=agent, room=ctx.room)
+        publisher.ready = True
+        for terminal_job in pending_terminal:
+            _announce_terminal(terminal_job, publisher, session, engagement, addressing)
+        pending_terminal.clear()
+
+        async def _submit(text: str) -> None:
+            await turn_ownership.run(lambda: _submit_voice_turn(
+                text,
+                brain=services.brain,
+                session=session,
+                publisher=publisher,
+                engagement=engagement,
+            ))
+
+        agent.turn_handler = _submit
+
+        if TEXT_MODE:
+            return
+
+        audio_watcher = devicewatch.start_audio_follow(
+            cfg,
+            publisher,
+            wake_switch,
+            request_restart=restart_coalescer.request,
+        )
+        session.input.set_audio_enabled(False)
+
+        def _sleep(announce: bool = True) -> bool:
+            return _sleep_session(session, publisher, announce=announce)
+
+        def _engage() -> None:
+            already = engagement.state == engagement_mod.ENGAGED
+            engagement.wake()
+            addressing.mark_activity()
+            session.input.set_audio_enabled(True)
+            if not already:
+                publisher.start_session()
+                publisher.set_state(state.LISTENING)
+                session.say(WAKE_LINE, add_to_chat_ctx=False)
+                publisher.add_line("atlas", WAKE_LINE)
+
+        @session.on("agent_state_changed")
+        def _on_agent_state(event) -> None:
+            _apply_agent_state(engagement, publisher, event.new_state)
+
+        def _on_wake() -> None:
+            loop.call_soon_threadsafe(_engage)
+
+        def _on_audio_signal(value: float, bands: list[float]) -> None:
+            loop.call_soon_threadsafe(publisher.set_audio_signal, value, bands)
+
+        intents = _load_intents()
+
+        async def _audio_turn(text: str) -> None:
+            await _handle_audio_turn(
+                text,
+                intents=intents,
+                brain=services.brain,
+                session=session,
+                publisher=publisher,
+                engagement=engagement,
+                addressing=addressing,
+                sleep=_sleep,
+                turn_ownership=turn_ownership,
+            )
+
+        agent.turn_handler = _audio_turn
+        sleep_task = asyncio.create_task(_sleep_watch(
+            engagement,
+            _sleep,
+            turn_ownership=turn_ownership,
+        ))
+        _BG_TASKS.add(sleep_task)
+        sleep_task.add_done_callback(_BG_TASKS.discard)
+
+        threading.Thread(
+            target=wakeword.listen,
+            args=(_on_wake, cfg["wake_model"]),
+            kwargs={
+                "device": cfg.get("wake_input_device"),
+                "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
+                "patience": cfg.get("wake_patience", wakeword.PATIENCE),
+                "on_signal": _on_audio_signal,
+                "bands_enabled": lambda: publisher.state != state.ASLEEP,
+                "device_switch": wake_switch,
+                "on_failure": audio_failure,
+                "on_model": _wake_model_callback(publisher, loop),
+            },
+            daemon=True,
+        ).start()
+    except BaseException:
+        try:
+            await asyncio.shield(_shutdown())
+        finally:
+            raise
 
 
 def _console_output_args(
