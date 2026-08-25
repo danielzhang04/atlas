@@ -4,9 +4,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from worker import addressing as addressing_mod
-from worker import app
-from worker.addressing import Addressing
+from worker import app, router
+from worker.router import Addressing
 from worker.engagement import ENGAGED, Engagement
 from worker.jobstore import JobState
 from worker.state import LISTENING, StatePublisher
@@ -695,7 +694,7 @@ def test_address_vocabulary_uses_only_explicit_configuration():
         "apps": {"mail": {"words": ["email", "inbox"]}},
     }
 
-    assert addressing_mod.vocabulary(cfg) == ["research", "draft"]
+    assert router.vocabulary(cfg) == ["research", "draft"]
 
 
 def test_production_listening_config_matches_wave_two_defaults():

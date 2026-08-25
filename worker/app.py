@@ -15,11 +15,10 @@ import yaml
 from livekit.agents import Agent, AgentSession, JobContext, StopResponse, WorkerOptions, cli
 from livekit.plugins import deepgram, silero
 
-from worker import addressing as addressing_mod
 from worker import brain as brain_mod
 from worker import devicewatch
 from worker import engagement as engagement_mod
-from worker import envload, jobobject, mcp_client as mcp_client_mod, router, runtime, sanitize, state, stateserver
+from worker import envload, jobobject, router, runtime, sanitize, state, stateserver
 from worker import tools as tools_mod
 from worker import wakeword, work as work_mod
 from worker.jobstore import JobState
@@ -31,7 +30,6 @@ logger = logging.getLogger("atlas.app")
 
 TTS_VOICE = "aura-2-andromeda-en"
 FOLLOW_SENTINEL = devicewatch.FOLLOW_SENTINEL
-_audio_status = devicewatch.audio_status
 TEXT_MODE = "--text" in sys.argv
 DEFAULT_DISMISS = ["that's all", "go to sleep"]
 WAKE_LINE = "Hey boss. What can I do for you?"
@@ -216,7 +214,7 @@ def _last_atlas_line(publisher: state.StatePublisher) -> str | None:
     return None
 
 
-def _address_window_open(addressing: addressing_mod.Addressing) -> bool:
+def _address_window_open(addressing: router.Addressing) -> bool:
     """Probe only the activity window; an empty utterance cannot hit vocabulary."""
     return addressing.is_addressed("")
 
@@ -259,7 +257,7 @@ async def _handle_audio_turn(
     session,
     publisher: state.StatePublisher,
     engagement: engagement_mod.Engagement,
-    addressing: addressing_mod.Addressing,
+    addressing: router.Addressing,
     sleep,
     turn_ownership: TurnOwnership | None = None,
 ) -> str:
@@ -445,9 +443,9 @@ async def entrypoint(ctx: JobContext) -> None:
     services = runtime.build(cfg, paired_url=_paired_url)
     publisher = state.StatePublisher(voice=cfg.get("active_voice"))
     engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
-    addressing = addressing_mod.Addressing(
+    addressing = router.Addressing(
         float(cfg["address_window_s"]),
-        addressing_mod.vocabulary(cfg),
+        router.vocabulary(cfg),
     )
     turn_ownership = TurnOwnership()
     wake_device = cfg.get("wake_input_device")

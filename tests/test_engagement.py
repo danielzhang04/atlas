@@ -171,8 +171,8 @@ def test_apply_agent_state_is_noop_while_asleep():
 # --- Audio device status surfaced in /state -----------------------------------------------------
 
 def test_audio_status_reports_unconfigured_and_unresolved_pins():
-    from worker.app import _audio_status
-    status = _audio_status(
+    from worker.devicewatch import audio_status
+    status = audio_status(
         {"wake_input_device": "Ghost"},
         resolve_input=lambda _value: None,
         resolve_output=lambda _value: None,

@@ -44,7 +44,8 @@ def _imports(path: Path) -> set[str]:
 
 def test_voice_worker_imports_new_lanes_and_removed_modules_are_absent():
     imports = _imports(ROOT / "worker" / "app.py")
-    assert {"brain", "mcp_client", "tools", "work"} <= imports
+    assert {"brain", "tools", "work"} <= imports
+    assert "mcp_client" not in imports
     assert all(not (ROOT / "worker" / f"{name}.py").exists() for name in REMOVED)
     assert not (ROOT / "browser_bridge").exists()
 

@@ -1,12 +1,15 @@
-"""Match configured exact voice reflexes before a conversational model turn."""
+"""Normalize and route utterances before a conversational model turn."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 import re
+import time
+from typing import Callable
 
 import yaml
 
-__all__ = ["filler_variants", "load_intents", "normalize", "route"]
+__all__ = ["Addressing", "filler_variants", "load_intents", "normalize", "route", "vocabulary"]
 
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]")
 _LEGACY_STRIP = re.compile(r"[^a-z0-9\s]")
@@ -25,6 +28,56 @@ def normalize(value: str) -> str:
 
 def _legacy_normalize(value: str) -> str:
     return _WS.sub(" ", _LEGACY_STRIP.sub("", value.casefold())).strip()
+
+
+def vocabulary(cfg: dict) -> list[str]:
+    """Return only the explicit, reviewed addressed-speech vocabulary."""
+    configured = cfg.get("address_vocab")
+    if not isinstance(configured, list):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    if not all(isinstance(word, str) and word.strip() for word in configured):
+        raise ValueError("invalid Atlas configuration: address_vocab")
+    return list(configured)
+
+
+def _vocab_forms(raw: str) -> set[str]:
+    joined = normalize(raw)
+    spoken = normalize(raw.replace("-", " ").replace("_", " "))
+    return {value for value in (joined, spoken) if value}
+
+
+class Addressing:
+    def __init__(
+        self,
+        window_s: float,
+        vocab: Iterable[str],
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window = float(window_s)
+        self._clock = clock
+        self._last: float | None = None
+        self._tokens: set[str] = set()
+        self._phrases: list[str] = []
+        for raw in vocab:
+            for form in _vocab_forms(raw):
+                if " " in form:
+                    self._phrases.append(form)
+                else:
+                    self._tokens.add(form)
+
+    def mark_activity(self) -> None:
+        self._last = self._clock()
+
+    def is_addressed(self, normalized_utterance: str) -> bool:
+        if self._last is not None:
+            elapsed = self._clock() - self._last
+            if elapsed <= self._window:
+                return True
+        tokens = set(normalized_utterance.split())
+        if "atlas" in tokens or tokens & self._tokens:
+            return True
+        padded = f" {normalized_utterance} "
+        return any(f" {phrase} " in padded for phrase in self._phrases)
 
 
 def filler_variants(normalized: str) -> list[str]:
