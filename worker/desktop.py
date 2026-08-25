@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import suppress
 from ctypes import wintypes
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -21,14 +23,8 @@ import webview
 
 from worker import jobobject
 
-
 __all__ = [
-    "ATLAS",
-    "confirm_close",
-    "main",
-    "read_ui_url",
-    "run",
-    "stop_child",
+    "ATLAS", "confirm_close", "main", "read_ui_url", "run", "stop_child",
 ]
 
 ATLAS = Path(__file__).resolve().parents[1]
@@ -40,39 +36,59 @@ RESTART_EXIT_CODE = 21
 RESTART_INTERVAL_S = 30.0
 RESTART_BURST_WINDOW_S = 10.0 * 60.0
 MAX_RESTARTS_PER_BURST = 3
-STOPPED_HTML = """<!doctype html>
+
+def _status_html(title: str, message: str, *, heading: str | None = None) -> str:
+    return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Atlas stopped</title>
+  <title>{title}</title>
   <style>
-    body { background: #101319; color: #edf2f7; display: grid; font: 18px system-ui;
-      margin: 0; min-height: 100vh; place-items: center; }
-    main { max-width: 36rem; padding: 3rem; text-align: center; }
-    h1 { font-size: 2rem; margin-bottom: .5rem; }
-    p { color: #aeb8c5; line-height: 1.5; }
+    body {{ background: #101319; color: #edf2f7; display: grid; font: 18px system-ui;
+      margin: 0; min-height: 100vh; place-items: center; }}
+    main {{ max-width: 36rem; padding: 3rem; text-align: center; }}
+    h1 {{ font-size: 2rem; margin-bottom: .5rem; }}
+    p {{ color: #aeb8c5; line-height: 1.5; }}
   </style>
 </head>
-<body><main><h1>Atlas stopped</h1><p>Close this window and open Atlas again to restart it.</p></main></body>
-</html>"""
-RECONNECTING_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Atlas reconnecting audio</title>
-  <style>
-    body { background: #101319; color: #edf2f7; display: grid; font: 18px system-ui;
-      margin: 0; min-height: 100vh; place-items: center; }
-    main { max-width: 36rem; padding: 3rem; text-align: center; }
-    h1 { font-size: 2rem; margin-bottom: .5rem; }
-    p { color: #aeb8c5; line-height: 1.5; }
-  </style>
-</head>
-<body><main><h1>reconnecting audio…</h1><p>Atlas is following your new system audio device.</p></main></body>
+<body><main><h1>{heading or title}</h1><p>{message}</p></main></body>
 </html>"""
 
+STOPPED_HTML = _status_html("Atlas stopped", "Close this window and open Atlas again to restart it.")
+RECONNECTING_HTML = _status_html(
+    "Atlas reconnecting audio", "Atlas is following your new system audio device.",
+    heading="reconnecting audio\u2026",
+)
+
+def _configure_file_logging(local_app_data=None):
+    root = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
+    if not root:
+        return None
+    try:
+        path = Path(root) / "Atlas" / "logs" / "desktop.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=256 * 1024, backupCount=2, encoding="utf-8")
+    except Exception:
+        return None
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    handler._atlas_desktop_file_handler = True
+    for existing in list(logger.handlers):
+        if getattr(existing, "_atlas_desktop_file_handler", False):
+            logger.removeHandler(existing)
+            existing.close()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return handler
+
+def _log_worker_marker(line: str, count: int) -> bool:
+    marker = next((item for item in ("Traceback", "Error", "Exception")
+                   if line.startswith(item)), None)
+    if marker is None:
+        return False
+    logger.error("worker marker category=%s count=%s", marker.casefold(), count)
+    return True
 
 class WindowApi:
     """Expose native window controls to the frameless Atlas page."""
@@ -145,7 +161,6 @@ class WindowApi:
         if self._window is not None:
             self._window.destroy()
 
-
 def _kernel32_functions():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -156,7 +171,6 @@ def _kernel32_functions():
     kernel32.CloseHandle.restype = wintypes.BOOL
     return kernel32
 
-
 def _close_handle(handle, *, close_handle=None) -> None:
     if not handle or os.name != "nt":
         return
@@ -166,12 +180,8 @@ def _close_handle(handle, *, close_handle=None) -> None:
     except Exception:
         logger.warning("could not close a Windows launcher handle")
 
-
 def _create_instance_mutex(
-    *,
-    platform: str = os.name,
-    create_mutex=None,
-    get_last_error=None,
+    *, platform: str = os.name, create_mutex=None, get_last_error=None,
 ):
     if platform != "nt":
         return None, False
@@ -188,7 +198,6 @@ def _create_instance_mutex(
         logger.warning("could not create the Atlas single-instance mutex")
         return None, False
 
-
 def _show_already_running() -> None:
     message = "Atlas is already running"
     try:
@@ -196,7 +205,6 @@ def _show_already_running() -> None:
         user32.MessageBoxW(None, message, "Atlas", 0x40)
     except Exception:
         logger.warning(message)
-
 
 def _is_ui_url(value: str) -> bool:
     try:
@@ -216,18 +224,18 @@ def _is_ui_url(value: str) -> bool:
         )
     except ValueError:
         return False
-
-
+def _parse_ui_url_line(line: str) -> str | None:
+    if not line.startswith("ATLAS_UI "):
+        return None
+    value = line.removeprefix("ATLAS_UI ").strip()
+    return value if _is_ui_url(value) else None
 def read_ui_url(stream: TextIO) -> str | None:
     """Read until the worker emits a valid Atlas loopback bootstrap URL."""
     for line in stream:
-        if not line.startswith("ATLAS_UI "):
-            continue
-        value = line.removeprefix("ATLAS_UI ").strip()
-        if _is_ui_url(value):
+        value = _parse_ui_url_line(line)
+        if value is not None:
             return value
     return None
-
 
 def _jobs_url(ui_url: str) -> str:
     parsed = urlsplit(ui_url)
@@ -235,22 +243,25 @@ def _jobs_url(ui_url: str) -> str:
         raise ValueError("invalid Atlas UI URL")
     return urlunsplit((parsed.scheme, parsed.netloc, "/jobs", "", ""))
 
-
 def _shutdown_url(ui_url: str) -> str:
     parsed = urlsplit(ui_url)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
         raise ValueError("invalid Atlas UI URL")
     return urlunsplit((parsed.scheme, parsed.netloc, "/shutdown", "", ""))
 
+def _loopback_request(
+    url: str, *, method: str, headers: dict, body: bytes | None, timeout: float,
+    max_bytes: int, opener: Callable,
+) -> bytes:
+    request = Request(url, data=body, method=method, headers=headers)
+    with opener(request, timeout=timeout) as response:
+        payload = response.read(max_bytes + 1)
+    return payload
 
-def _active_job_titles(
-    ui_url: str,
-    *,
-    opener: Callable = urlopen,
-) -> list[str]:
-    request = Request(_jobs_url(ui_url), headers={"accept": "application/json"})
-    with opener(request, timeout=2.0) as response:
-        body = response.read(65_537)
+def _active_job_titles(ui_url: str, *, opener: Callable = urlopen) -> list[str]:
+    body = _loopback_request(
+        _jobs_url(ui_url), method="GET", headers={"accept": "application/json"},
+        body=None, timeout=2.0, max_bytes=65_536, opener=opener)
     if len(body) > 65_536:
         raise ValueError("Atlas jobs response is too large")
     payload = json.loads(body.decode("utf-8"))
@@ -266,13 +277,8 @@ def _active_job_titles(
             titles.append(" ".join(title.split())[:200])
     return titles
 
-
-def confirm_close(
-    window,
-    ui_url: str,
-    *,
-    jobs_reader: Callable[[str], list[str]] = _active_job_titles,
-) -> bool:
+def confirm_close(window, ui_url: str, *,
+                  jobs_reader: Callable[[str], list[str]] = _active_job_titles) -> bool:
     """Allow close immediately when idle, otherwise ask once with active job titles."""
     try:
         titles = jobs_reader(ui_url)
@@ -291,17 +297,10 @@ def confirm_close(
     )
     return bool(window.create_confirmation_dialog("Close Atlas?", message))
 
-
 def _confirm_window_close(proc, window, ui_url: str) -> bool:
     if proc.poll() is not None:
         return True
     return confirm_close(window, ui_url)
-
-
-def _taskkill(command: list[str], *, check: bool) -> subprocess.CompletedProcess:
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(command, check=check, creationflags=creationflags)
-
 
 def _request_shutdown(
     ui_url: str,
@@ -309,28 +308,21 @@ def _request_shutdown(
     *,
     opener: Callable = urlopen,
 ) -> None:
-    request = Request(
-        _shutdown_url(ui_url),
-        data=b"",
-        method="POST",
-        headers={"X-Atlas-Shutdown": shutdown_token},
-    )
-    with opener(request, timeout=16.0) as response:
-        response.read(65_537)
-
+    _loopback_request(
+        _shutdown_url(ui_url), method="POST",
+        headers={"X-Atlas-Shutdown": shutdown_token}, body=b"",
+        timeout=16.0, max_bytes=65_536, opener=opener)
 
 def stop_child(
-    proc,
-    ui_url: str | None = None,
-    shutdown_token: str | None = None,
-    *,
+    proc, ui_url: str | None = None, shutdown_token: str | None = None, *,
     shutdown_request: Callable[[str, str], None] = _request_shutdown,
-    killer: Callable = _taskkill,
+    killer: Callable = jobobject.kill_process_tree,
 ) -> None:
     """Request shutdown, then escalate through tree kill and force after bounded waits."""
     if proc.poll() is not None:
         return
     if ui_url and shutdown_token:
+        logger.info("shutdown requested")
         try:
             shutdown_request(ui_url, shutdown_token)
         except Exception:
@@ -338,26 +330,21 @@ def stop_child(
     try:
         proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        command = ["taskkill", "/T", "/PID", str(proc.pid)]
-        try:
-            killer(command, check=False)
-        except OSError:
-            pass
+        logger.warning("shutdown escalated")
+        with suppress(OSError):
+            killer(proc.pid, check=False, force=False)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            try:
-                killer([*command, "/F"], check=False)
-            except OSError:
-                pass
-
+            logger.warning("forced kill")
+            with suppress(OSError):
+                killer(proc.pid, check=False, force=True)
 
 def _worker_python() -> str:
     executable = Path(sys.executable)
     if executable.name.lower() == "pythonw.exe":
         return str(executable.with_name("python.exe"))
     return str(executable)
-
 
 def _watch_child(
     proc,
@@ -376,11 +363,13 @@ def _watch_child(
     wait_for_delay = wait or closing.wait
     while True:
         exit_code = current.wait()
+        logger.info("child exit code=%s", exit_code)
         if closing.is_set():
             return
         if exit_code != RESTART_EXIT_CODE or restart is None:
             window.load_html(STOPPED_HTML)
             return
+        logger.info("restart requested")
         now = clock()
         restart_requests = [
             requested_at
@@ -389,13 +378,13 @@ def _watch_child(
         ]
         restart_requests.append(now)
         if len(restart_requests) >= MAX_RESTARTS_PER_BURST:
-            logger.critical("audio reconnect restart burst limit reached")
+            logger.critical("restart burst-limit reached")
             window.load_html(STOPPED_HTML)
             return
         window.load_html(RECONNECTING_HTML)
         if last_restart_at is not None and now - last_restart_at < restart_interval_s:
             delay = restart_interval_s - (now - last_restart_at)
-            logger.warning("deferring audio reconnect restart for %.1f seconds", delay)
+            logger.warning("restart deferred for %.1f seconds", delay)
             if wait_for_delay(delay):
                 return
             last_restart_at += restart_interval_s
@@ -404,21 +393,26 @@ def _watch_child(
         try:
             replacement = restart(current)
         except Exception:
-            logger.exception("could not restart Atlas after an audio device change")
+            logger.error("restart failed")
             replacement = None
         if replacement is None:
             window.load_html(STOPPED_HTML)
             return
         current = replacement
 
-
-def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
-    url = read_ui_url(stream)
-    result.put(url)
-    if url is not None:
-        for _line in stream:
-            pass
-
+def _capture_ui_url(stream: TextIO, result: Queue[str | None], redactions=()) -> None:
+    found = False
+    marker_lines = 0
+    for line in stream:
+        value = _parse_ui_url_line(line) if not found else None
+        if value is not None:
+            found = True
+            result.put(value)
+            continue
+        if marker_lines < 200 and _log_worker_marker(line, marker_lines + 1):
+            marker_lines += 1
+    if not found:
+        result.put(None)
 
 def run(
     *,
@@ -460,24 +454,29 @@ def run(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=child_env,
         )
+        logger.info("spawn child pid=%s", proc.pid)
         handle = assign_job(proc)
         if proc.stdout is None:
             return proc, handle, None
         result: Queue[str | None] = Queue(maxsize=1)
         Thread(
             target=_capture_ui_url,
-            args=(proc.stdout, result),
+            args=(proc.stdout, result, (shutdown_token,)),
             daemon=True,
         ).start()
         return proc, handle, result
 
     def _wait_for_ui_url(result) -> str | None:
         if result is None:
+            logger.info("ui url received=false")
             return None
         try:
-            return result.get(timeout=wait_url_timeout_s)
+            url = result.get(timeout=wait_url_timeout_s)
         except Empty:
-            return None
+            logger.warning("ui url wait timeout")
+            url = None
+        logger.info("ui url received=%s", str(url is not None).lower())
+        return url
 
     try:
         proc, job_handle, url_result = _spawn_child()
@@ -521,6 +520,7 @@ def run(
         if window is None:
             return 1
         window_api._window = window
+        logger.info("window created")
 
         def _confirm_close_current() -> bool:
             with child_lock:
@@ -573,8 +573,8 @@ def run(
         close_handle(current_handle)
         close_handle(mutex_handle)
 
-
 def main() -> int:
+    _configure_file_logging()
     return run()
 
 

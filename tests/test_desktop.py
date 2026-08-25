@@ -3,10 +3,15 @@ from __future__ import annotations
 
 from io import StringIO
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from queue import Queue
 import subprocess
 from threading import Event
 from types import SimpleNamespace
+
+import pytest
 
 from worker import app, desktop
 from worker.stateserver import PairingAuthorizer
@@ -119,6 +124,20 @@ def _pywebview_api_walk(obj, seen=None, visits=None):
     return len(visits)
 
 
+@pytest.fixture
+def desktop_log():
+    output = StringIO()
+    handler = logging.StreamHandler(output)
+    old_level = desktop.logger.level
+    desktop.logger.addHandler(handler)
+    desktop.logger.setLevel(logging.INFO)
+    try:
+        yield output
+    finally:
+        desktop.logger.removeHandler(handler)
+        desktop.logger.setLevel(old_level)
+
+
 def test_window_api_exposes_only_methods():
     api = desktop.WindowApi()
     api._window = RecursiveAttributeGraph()
@@ -187,7 +206,7 @@ def test_app_emits_the_bootstrap_url_for_the_desktop_launcher(capsys):
     assert capsys.readouterr().out == f"ATLAS_UI {result}\n"
 
 
-def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
+def test_run_spawns_console_worker_opens_exact_window_and_stops_once(desktop_log):
     process = FakeProcess("ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n")
     spawn_calls = []
     window_calls = []
@@ -259,6 +278,9 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once():
     )]
     assert closed_handles == [222, 111]
     assert result == 0
+    assert "spawn child pid=4321" in desktop_log.getvalue()
+    assert "ui url received=true" in desktop_log.getvalue()
+    assert "window created" in desktop_log.getvalue()
 
 
 def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch):
@@ -363,7 +385,7 @@ def test_run_replaces_exit_21_child_and_loads_new_worker_url_in_same_window():
 
     assert result == 0
     assert assigned == [first, second]
-    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "reconnecting audio\u2026" in window.loaded_html[0]
     assert "Atlas stopped" in window.loaded_html[1]
     assert window.loaded_urls == ["http://127.0.0.1:4361/#pair=second"]
     assert terminated == [(
@@ -441,7 +463,7 @@ def test_close_after_child_death_needs_no_confirmation():
     assert window.dialogs == []
 
 
-def test_unexpected_child_death_replaces_the_window_with_stopped_page():
+def test_unexpected_child_death_replaces_the_window_with_stopped_page(desktop_log):
     process = FakeProcess(running=True)
     window = FakeWindow()
     closing = Event()
@@ -450,6 +472,7 @@ def test_unexpected_child_death_replaces_the_window_with_stopped_page():
 
     assert len(window.loaded_html) == 1
     assert "Atlas stopped" in window.loaded_html[0]
+    assert "child exit code=0" in desktop_log.getvalue()
 
 
 def test_audio_restart_exit_restarts_in_place_with_reconnecting_page():
@@ -466,7 +489,7 @@ def test_audio_restart_exit_restarts_in_place_with_reconnecting_page():
     desktop._watch_child(process, window, closing, restart)
 
     assert restarts == [process]
-    assert "reconnecting audio…" in window.loaded_html[0]
+    assert "reconnecting audio\u2026" in window.loaded_html[0]
     assert "Atlas stopped" in window.loaded_html[1]
 
 
@@ -497,8 +520,8 @@ def test_second_audio_restart_inside_thirty_seconds_is_deferred_not_stopped():
     assert restarts == [process, replacement]
     assert waits == [10.0]
     assert len(window.loaded_html) == 3
-    assert "reconnecting audio…" in window.loaded_html[0]
-    assert "reconnecting audio…" in window.loaded_html[1]
+    assert "reconnecting audio\u2026" in window.loaded_html[0]
+    assert "reconnecting audio\u2026" in window.loaded_html[1]
     assert "Atlas stopped" in window.loaded_html[2]
 
 
@@ -526,8 +549,8 @@ def test_audio_restart_is_allowed_again_after_thirty_seconds():
 
     assert restarts == [first, second]
     assert len(window.loaded_html) == 3
-    assert "reconnecting audio…" in window.loaded_html[0]
-    assert "reconnecting audio…" in window.loaded_html[1]
+    assert "reconnecting audio\u2026" in window.loaded_html[0]
+    assert "reconnecting audio\u2026" in window.loaded_html[1]
     assert "Atlas stopped" in window.loaded_html[2]
 
 
@@ -626,6 +649,159 @@ def test_shutdown_request_uses_token_header_and_never_sends_pairing_fragment():
     assert requests[1] == ("read", 65_537)
 
 
+def test_status_pages_preserve_visible_text():
+    assert "<title>Atlas stopped</title>" in desktop.STOPPED_HTML
+    assert "<h1>Atlas stopped</h1>" in desktop.STOPPED_HTML
+    assert (
+        "<p>Close this window and open Atlas again to restart it.</p>"
+        in desktop.STOPPED_HTML
+    )
+    assert "<title>Atlas reconnecting audio</title>" in desktop.RECONNECTING_HTML
+    assert "<h1>reconnecting audio\u2026</h1>" in desktop.RECONNECTING_HTML
+    assert (
+        "<p>Atlas is following your new system audio device.</p>"
+        in desktop.RECONNECTING_HTML
+    )
+
+
+def test_desktop_file_log_is_bounded_and_rotating(tmp_path):
+    handler = desktop._configure_file_logging(tmp_path)
+    try:
+        assert isinstance(handler, RotatingFileHandler)
+        assert handler.maxBytes == 256 * 1024
+        assert handler.backupCount == 2
+        assert handler.level == logging.INFO
+        assert Path(handler.baseFilename) == tmp_path / "Atlas" / "logs" / "desktop.log"
+    finally:
+        desktop.logger.removeHandler(handler)
+        handler.close()
+
+
+def test_desktop_file_log_handler_permission_failure_continues_without_file(
+    tmp_path, monkeypatch,
+):
+    def deny_handler(*_args, **_kwargs):
+        raise PermissionError("logging denied")
+
+    monkeypatch.setattr(desktop, "RotatingFileHandler", deny_handler)
+    monkeypatch.setattr(desktop, "run", lambda: 17)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert desktop.main() == 17
+    assert not list(tmp_path.rglob("desktop.log"))
+
+
+def test_desktop_file_logging_replaces_existing_atlas_handler(tmp_path):
+    first = desktop._configure_file_logging(tmp_path)
+    second = desktop._configure_file_logging(tmp_path)
+    try:
+        tagged = [
+            handler for handler in desktop.logger.handlers
+            if getattr(handler, "_atlas_desktop_file_handler", False)
+        ]
+        assert tagged == [second]
+        assert first.stream is None
+    finally:
+        desktop.logger.removeHandler(second)
+        second.close()
+
+
+def test_worker_marker_log_persists_only_host_shaped_category_and_count(tmp_path):
+    opaque_environment = "PRIVATE_SETTING=opaque-environment-value"
+    prompt = "prompt: reveal the operator's private request"
+    boundary_token = "boundary-spanning-secret"
+    handler = desktop._configure_file_logging(tmp_path)
+    result = Queue(maxsize=1)
+    try:
+        desktop._capture_ui_url(
+            StringIO(
+                "ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n"
+                f"Traceback {opaque_environment}\n"
+                f"Error {prompt}\n"
+                f"Exception {'x' * 385}{boundary_token}\n"
+            ),
+            result,
+        )
+        handler.flush()
+        payload = Path(handler.baseFilename).read_bytes()
+    finally:
+        desktop.logger.removeHandler(handler)
+        handler.close()
+
+    assert result.get_nowait() is not None
+    assert b"worker marker category=traceback count=1" in payload
+    assert b"worker marker category=error count=2" in payload
+    assert b"worker marker category=exception count=3" in payload
+    assert opaque_environment.encode("ascii") not in payload
+    assert prompt.encode("ascii") not in payload
+    assert boundary_token.encode("ascii") not in payload
+    assert b"x" * 385 not in payload
+
+
+def test_worker_marker_log_caps_each_child_at_two_hundred_lines(desktop_log):
+    result = Queue(maxsize=1)
+    desktop._capture_ui_url(
+        StringIO(
+            "ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n"
+            + "".join(f"Error diagnostic {number}\n" for number in range(205))
+        ),
+        result,
+    )
+
+    assert result.get_nowait() is not None
+    assert desktop_log.getvalue().count("worker marker category=error") == 200
+    assert "count=200" in desktop_log.getvalue()
+    assert "count=201" not in desktop_log.getvalue()
+
+
+def test_bootstrap_line_parser_is_shared_by_stream_readers(monkeypatch):
+    ui_url = "http://127.0.0.1:4360/#pair=one-use"
+    calls = []
+
+    def parse(line):
+        calls.append(line)
+        return ui_url
+
+    monkeypatch.setattr(desktop, "_parse_ui_url_line", parse)
+    assert desktop.read_ui_url(StringIO("candidate\n")) == ui_url
+
+    result = Queue(maxsize=1)
+    desktop._capture_ui_url(StringIO("candidate\n"), result)
+    assert result.get_nowait() == ui_url
+    assert calls == ["candidate\n", "candidate\n"]
+
+
+def test_run_logs_ui_url_wait_timeout_without_worker_output(desktop_log):
+    release = Event()
+
+    class BlockingStream:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            release.wait(1)
+            raise StopIteration
+
+    process = FakeProcess(pid=9191)
+    process.stdout = BlockingStream()
+    try:
+        result = desktop.run(
+            spawn=lambda _command, **_kwargs: process,
+            terminate=lambda *_args: None,
+            create_mutex=lambda: (111, False),
+            assign_job=lambda _child: 222,
+            close_handle=lambda _handle: None,
+            wait_url_timeout_s=0,
+        )
+    finally:
+        release.set()
+
+    assert result == 1
+    assert "spawn child pid=9191" in desktop_log.getvalue()
+    assert "ui url received=false" in desktop_log.getvalue()
+    assert "ui url wait timeout" in desktop_log.getvalue()
+
+
 def test_stop_child_requests_shutdown_then_waits_up_to_twenty_seconds():
     process = FakeProcess(pid=77)
     shutdown_calls = []
@@ -661,11 +837,11 @@ def test_stop_child_uses_tree_kill_after_graceful_timeout():
 
     desktop.stop_child(
         process,
-        killer=lambda command, **kwargs: calls.append((command, kwargs)),
+        killer=lambda pid, **kwargs: calls.append((pid, kwargs)),
     )
 
     assert calls == [
-        (["taskkill", "/T", "/PID", "88"], {"check": False}),
+        (88, {"check": False, "force": False}),
     ]
     assert process.waits == [20, 10]
 
@@ -681,12 +857,12 @@ def test_stop_child_forces_tree_after_another_ten_seconds():
 
     desktop.stop_child(
         process,
-        killer=lambda command, **kwargs: calls.append((command, kwargs)),
+        killer=lambda pid, **kwargs: calls.append((pid, kwargs)),
     )
 
     assert calls == [
-        (["taskkill", "/T", "/PID", "99"], {"check": False}),
-        (["taskkill", "/T", "/PID", "99", "/F"], {"check": False}),
+        (99, {"check": False, "force": False}),
+        (99, {"check": False, "force": True}),
     ]
     assert process.waits == [20, 10]
 

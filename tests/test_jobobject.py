@@ -36,6 +36,27 @@ def test_kill_process_tree_uses_trusted_absolute_taskkill(monkeypatch):
     )]
 
 
+def test_kill_process_tree_can_request_non_forcing_taskkill(monkeypatch):
+    calls = []
+    system_root = Path(r"C:\TrustedWindows")
+    monkeypatch.setenv("SystemRoot", str(system_root))
+
+    jobobject.kill_process_tree(
+        4321,
+        check=False,
+        force=False,
+        runner=lambda argv, **kwargs: calls.append((argv, kwargs)),
+    )
+
+    assert calls == [(
+        [str(system_root / "System32" / "taskkill.exe"), "/PID", "4321", "/T"],
+        {
+            "check": False,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        },
+    )]
+
+
 def _fakes(calls):
     def set_information(handle, info_class, pointer, size):
         information = ctypes.cast(
