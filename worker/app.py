@@ -82,6 +82,15 @@ def _stt_keyterms(cfg: dict) -> list[str]:
     return terms[:64] or ["Atlas"]
 
 
+def _addressing_from_config(cfg: dict, *, clock=None) -> router.Addressing:
+    kwargs = {} if clock is None else {"clock": clock}
+    return router.Addressing(
+        float(cfg.get("addressed_window_s", 90)),
+        router.vocabulary(cfg),
+        **kwargs,
+    )
+
+
 def _apply_agent_state(engagement, publisher, agent_state: str) -> None:
     if engagement.state != engagement_mod.ENGAGED:
         return
@@ -184,6 +193,7 @@ async def _submit_voice_turn(
     session,
     publisher: state.StatePublisher,
     engagement: engagement_mod.Engagement,
+    context: str | None = None,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
@@ -192,7 +202,8 @@ async def _submit_voice_turn(
     spoken: list[str] = []
 
     async def _tee():
-        async for chunk in brain.respond(text):
+        response = brain.respond(text, context=context) if context is not None else brain.respond(text)
+        async for chunk in response:
             spoken.append(chunk)
             yield chunk
 
@@ -325,12 +336,14 @@ async def _handle_audio_turn(
         ))
         return ""
     async def _respond() -> str:
+        context = publisher.ambient_context(text)
         response = await _submit_voice_turn(
             text,
             brain=brain,
             session=session,
             publisher=publisher,
             engagement=engagement,
+            context=context,
         )
         if response and engagement.state == engagement_mod.ENGAGED:
             engagement.interacted()
@@ -543,10 +556,7 @@ async def entrypoint(ctx: JobContext) -> None:
         services.warm_model_client()
 
         engagement = engagement_mod.Engagement(float(cfg["engagement_timeout_s"]))
-        addressing = router.Addressing(
-            float(cfg["address_window_s"]),
-            router.vocabulary(cfg),
-        )
+        addressing = _addressing_from_config(cfg)
         turn_ownership = TurnOwnership()
         wake_device = cfg.get("wake_input_device")
         initial_wake_device = None

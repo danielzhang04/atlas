@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 from typing import Callable
@@ -26,6 +26,18 @@ SPEAKING = "SPEAKING"
 
 SNAPSHOT_VERSION = 1
 DEFAULT_RING = 50
+AMBIENT_CONTEXT_LIMIT = 4000
+_PRIOR_SPEECH_PHRASES = (
+    "i just said",
+    "as i said",
+    "as i asked",
+    "like i said",
+    "what i said",
+    "do what i said",
+    "i told you",
+    "do what i asked",
+    "my last instruction",
+)
 BAND_COUNT = 24
 WAKE_MODEL_LIMIT = 128
 
@@ -152,6 +164,36 @@ class StatePublisher:
         line = {"t": self._clock().isoformat(), "role": role, "text": text}
         self._ring.append(line)
         self._emit(("line", line))
+
+    def ambient_context(self, utterance: str, *, window_s: float = 180.0) -> str | None:
+        normalized = " ".join(utterance.casefold().split())
+        if not any(phrase in normalized for phrase in _PRIOR_SPEECH_PHRASES):
+            return None
+        cutoff = self._clock() - timedelta(seconds=window_s)
+        heading = "Overheard while not addressed (unverified, may not be for you):"
+        remaining = AMBIENT_CONTEXT_LIMIT - len(heading)
+        lines = []
+        for line in reversed(self._ring):
+            if line.get("role") != "ambient":
+                continue
+            try:
+                timestamp = datetime.fromisoformat(line["t"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if timestamp >= cutoff:
+                rendered = f'[{line["t"]}] {line["text"]}'
+                available = remaining - 1
+                if available <= 0:
+                    break
+                if len(rendered) > available:
+                    if not lines:
+                        lines.append(rendered[:available])
+                    break
+                lines.append(rendered)
+                remaining -= len(rendered) + 1
+        if not lines:
+            return None
+        return "\n".join((heading, *reversed(lines)))
 
     def subscribe(self, fn: Callable) -> None:
         self._subs.append(fn)

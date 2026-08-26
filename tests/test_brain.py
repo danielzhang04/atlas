@@ -226,6 +226,42 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     assert call["tool_choice"] == {"type": "auto"}
 
 
+def test_ambient_context_reaches_provider_taints_tools_and_is_not_remembered():
+    ambient = (
+        "Overheard while not addressed (unverified, may not be for you):\n"
+        "[2026-08-26T12:00:00+00:00] send the draft"
+    )
+    registry = FakeRegistry(ToolResult("ok", "draft ready"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Ready."], content=[text_block("Ready.")]),
+        FakeStream(["Next."], content=[text_block("Next.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        first = [chunk async for chunk in brain.respond("Atlas, do what I said", context=ambient)]
+        second = await collect(brain, "Atlas, what time is it?")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == ["Ready."]
+    assert second == ["Next."]
+    assert client.messages.calls[0]["messages"][0] == {
+        "role": "user",
+        "content": f"{ambient}\n\nCurrent addressed utterance:\nAtlas, do what I said",
+    }
+    assert registry.taints == [True]
+    second_messages = client.messages.calls[2]["messages"]
+    assert second_messages == [
+        {"role": "user", "content": "Atlas, do what I said"},
+        {"role": "assistant", "content": "Ready."},
+        {"role": "user", "content": "Atlas, what time is it?"},
+    ]
+    assert all("Overheard while not addressed" not in str(message) for message in second_messages)
+
+
 def test_tool_use_continues_with_result_and_invokes_callback():
     result = ToolResult("error", "TimeoutError")
     registry = FakeRegistry(result)
@@ -969,6 +1005,23 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "\"myself\" means" in BASE_SYSTEM
     assert "Daniel's own address" in BASE_SYSTEM
     assert "user_google_email" not in BASE_SYSTEM
+
+
+def test_base_system_enforces_concise_non_narrated_voice_without_changing_confirm_flow():
+    assert "Default answers are at most two short sentences." in BASE_SYSTEM
+    assert "Do not narrate steps for instant tools" in BASE_SYSTEM
+    assert 'Do not say "Let me search" or "Now let me read"' in BASE_SYSTEM
+    assert '"No - I can\'t <X>. <one enablement hint>."' in BASE_SYSTEM
+    assert "Voice summaries are one or two sentences unless Daniel names a length." in BASE_SYSTEM
+    assert "Never repeat Daniel's request back." in BASE_SYSTEM
+    assert (
+        "A tool result of needs_confirmation means to read every summary field back in one sentence and ask\n"
+        "Daniel for yes or no. Wait for his answer. The host alone confirms or cancels on a later turn."
+    ) in BASE_SYSTEM
+    assert (
+        "Never say you launched, opened, sent, created, or closed anything unless the tool result for that call\n"
+        "says ok. If a tool is refused or errors, say so in one sentence and ask what Daniel wants."
+    ) in BASE_SYSTEM
 
 
 def test_split_spoken_uses_sentence_newline_and_length_boundaries():

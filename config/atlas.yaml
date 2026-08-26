@@ -4,7 +4,7 @@ turn_timeout_s: 12.0
 turn_ceiling_s: 30.0
 max_tokens: 400
 engagement_timeout_s: 120
-address_window_s: 30
+addressed_window_s: 90
 address_vocab: [gmail, inbox, unread, calendar, youtube, notion, github, spotify, workers]
 
 job_store_path: "%LOCALAPPDATA%/Atlas/jobs.sqlite3"
