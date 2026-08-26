@@ -114,13 +114,29 @@
     const BAR_COUNT = 96;
     const UNIQUE_BANDS = 48;
     const INPUT_BANDS = 24;
+    const PARTICLE_COUNT = 42;
     const TAU = Math.PI * 2;
     const palettes = {
-      ASLEEP: {bar: [117, 119, 130], core: [137, 133, 155]},
-      LISTENING: {bar: [124, 92, 255], core: [124, 92, 255]},
-      THINKING: {bar: [168, 153, 255], core: [124, 92, 255]},
-      SPEAKING: {bar: [244, 242, 255], core: [244, 242, 255]},
-      OFFLINE: {bar: [148, 67, 76], core: [148, 67, 76]},
+      ASLEEP: {
+        primary: [105, 119, 137], secondary: [139, 151, 166], core: [114, 130, 148],
+        motion: [.08, .05, .03, .12, 0, 0],
+      },
+      LISTENING: {
+        primary: [110, 72, 255], secondary: [66, 226, 255], core: [143, 104, 255],
+        motion: [.46, .62, .52, .78, .08, 0],
+      },
+      THINKING: {
+        primary: [255, 165, 55], secondary: [255, 222, 111], core: [255, 184, 71],
+        motion: [.92, 1, .68, .64, 1, 0],
+      },
+      SPEAKING: {
+        primary: [255, 113, 72], secondary: [255, 236, 184], core: [255, 244, 220],
+        motion: [.62, .82, .86, 1, .12, 1],
+      },
+      OFFLINE: {
+        primary: [102, 57, 65], secondary: [131, 77, 84], core: [112, 62, 70],
+        motion: [0, 0, 0, .05, 0, 0],
+      },
     };
     const context = canvas.getContext("2d", {alpha: false, desynchronized: true});
     const inputBands = new Float32Array(INPUT_BANDS);
@@ -128,33 +144,59 @@
     const barValues = new Float32Array(BAR_COUNT);
     const cosine = new Float32Array(BAR_COUNT);
     const sine = new Float32Array(BAR_COUNT);
-    const barStartX = new Float32Array(BAR_COUNT);
-    const barStartY = new Float32Array(BAR_COUNT);
-    const arcPaths = new Array(3);
-    const arcDirections = [1, -1, 1];
-    const barColor = new Float32Array(3);
+    const particleAngle = new Float32Array(PARTICLE_COUNT);
+    const particleRadius = new Float32Array(PARTICLE_COUNT);
+    const particleSpeed = new Float32Array(PARTICLE_COUNT);
+    const particlePhase = new Float32Array(PARTICLE_COUNT);
+    const primaryColor = new Float32Array(3);
+    const secondaryColor = new Float32Array(3);
     const coreColor = new Float32Array(3);
-    const fromBarColor = new Float32Array(palettes.OFFLINE.bar);
+    const fromPrimaryColor = new Float32Array(palettes.OFFLINE.primary);
+    const fromSecondaryColor = new Float32Array(palettes.OFFLINE.secondary);
     const fromCoreColor = new Float32Array(palettes.OFFLINE.core);
-    const toBarColor = new Float32Array(palettes.OFFLINE.bar);
+    const toPrimaryColor = new Float32Array(palettes.OFFLINE.primary);
+    const toSecondaryColor = new Float32Array(palettes.OFFLINE.secondary);
     const toCoreColor = new Float32Array(palettes.OFFLINE.core);
+    const motion = new Float32Array(palettes.OFFLINE.motion);
+    const fromMotion = new Float32Array(palettes.OFFLINE.motion);
+    const toMotion = new Float32Array(palettes.OFFLINE.motion);
+    const backdropSprite = document.createElement("canvas");
     const glowSprite = document.createElement("canvas");
-    const metrics = {samples: 0, lastMs: 0, averageMs: 0, maxMs: 0};
-    let state = "OFFLINE";
+    const particleSprite = document.createElement("canvas");
+    const metrics = {samples: 0, lastMs: 0, averageMs: 0, maxMs: 0, running: false};
+    let realState = "OFFLINE";
+    let visualState = "OFFLINE";
     let energy = 0;
+    let frameEnergy = 0;
     let width = 0;
     let height = 0;
     let scale = 1;
     let centerX = .5;
     let centerY = .5;
+    let pixelRatio = 1;
     let transitionAt = performance.now();
+    let layerPresence = 0;
+    let fromLayerPresence = 0;
+    let toLayerPresence = 0;
     let animationFrame = 0;
     let running = false;
+    let coreDashPattern = [];
+    let majorTickPath = new Path2D();
+    let minorTickPath = new Path2D();
+    let innerSegmentPath = new Path2D();
+    let outerSegmentPath = new Path2D();
 
     for (let index = 0; index < BAR_COUNT; index += 1) {
       const angle = -Math.PI / 2 + index * TAU / BAR_COUNT;
       cosine[index] = Math.cos(angle);
       sine[index] = Math.sin(angle);
+    }
+    for (let index = 0; index < PARTICLE_COUNT; index += 1) {
+      const seed = (index * 47) % PARTICLE_COUNT;
+      particleAngle[index] = seed / PARTICLE_COUNT * TAU;
+      particleRadius[index] = .265 + ((index * 29) % 17) / 17 * .13;
+      particleSpeed[index] = .18 + ((index * 13) % 11) / 11 * .52;
+      particlePhase[index] = ((index * 31) % 23) / 23 * TAU;
     }
 
     glowSprite.width = 256;
@@ -168,18 +210,33 @@
     glowContext.fillStyle = glow;
     glowContext.fillRect(0, 0, 256, 256);
 
-    function copyColor(target, source) {
-      target[0] = source[0];
-      target[1] = source[1];
-      target[2] = source[2];
+    particleSprite.width = 32;
+    particleSprite.height = 32;
+    const particleContext = particleSprite.getContext("2d");
+    const particleGlow = particleContext.createRadialGradient(16, 16, 0, 16, 16, 16);
+    particleGlow.addColorStop(0, "rgb(255 255 255 / 0.95)");
+    particleGlow.addColorStop(.16, "rgb(255 255 255 / 0.5)");
+    particleGlow.addColorStop(.52, "rgb(255 255 255 / 0.1)");
+    particleGlow.addColorStop(1, "rgb(255 255 255 / 0)");
+    particleContext.fillStyle = particleGlow;
+    particleContext.fillRect(0, 0, 32, 32);
+
+    function copyValues(target, source) {
+      for (let index = 0; index < target.length; index += 1) target[index] = source[index];
     }
 
     function mixColors(now) {
-      const progress = clamp((now - transitionAt) / 300);
+      const linearProgress = clamp((now - transitionAt) / 420);
+      const progress = linearProgress * linearProgress * (3 - 2 * linearProgress);
       for (let channel = 0; channel < 3; channel += 1) {
-        barColor[channel] = fromBarColor[channel] + (toBarColor[channel] - fromBarColor[channel]) * progress;
+        primaryColor[channel] = fromPrimaryColor[channel] + (toPrimaryColor[channel] - fromPrimaryColor[channel]) * progress;
+        secondaryColor[channel] = fromSecondaryColor[channel] + (toSecondaryColor[channel] - fromSecondaryColor[channel]) * progress;
         coreColor[channel] = fromCoreColor[channel] + (toCoreColor[channel] - fromCoreColor[channel]) * progress;
       }
+      for (let index = 0; index < motion.length; index += 1) {
+        motion[index] = fromMotion[index] + (toMotion[index] - fromMotion[index]) * progress;
+      }
+      layerPresence = fromLayerPresence + (toLayerPresence - fromLayerPresence) * progress;
     }
 
     function colorString(color, alpha = 1) {
@@ -190,35 +247,88 @@
       const bounds = canvas.getBoundingClientRect();
       const nextWidth = Math.max(1, Math.round(bounds.width));
       const nextHeight = Math.max(1, Math.round(bounds.height));
-      const pixelRatio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+      const nextPixelRatio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
       if (
         nextWidth === width
         && nextHeight === height
-        && canvas.width === Math.round(nextWidth * pixelRatio)
+        && canvas.width === Math.round(nextWidth * nextPixelRatio)
       ) return;
       width = nextWidth;
       height = nextHeight;
       scale = Math.min(width, height);
       centerX = width / 2;
       centerY = height / 2;
-      const baseRadius = .34 * scale;
-      for (let index = 0; index < BAR_COUNT; index += 1) {
-        barStartX[index] = centerX + cosine[index] * baseRadius;
-        barStartY[index] = centerY + sine[index] * baseRadius;
-      }
-      const radii = [.415, .452, .486];
-      const starts = [-1.3, 1.04, 2.72];
-      const lengths = [.82, 1.1, .62];
-      for (let index = 0; index < arcPaths.length; index += 1) {
-        const path = new Path2D();
-        const end = starts[index] + lengths[index] * arcDirections[index];
-        path.arc(0, 0, radii[index] * scale, starts[index], end, arcDirections[index] < 0);
-        arcPaths[index] = path;
-      }
+      pixelRatio = nextPixelRatio;
+      coreDashPattern = [.025 * scale, .014 * scale, .006 * scale, .018 * scale];
       canvas.width = Math.round(width * pixelRatio);
       canvas.height = Math.round(height * pixelRatio);
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       context.imageSmoothingEnabled = true;
+
+      majorTickPath = new Path2D();
+      minorTickPath = new Path2D();
+      for (let index = 0; index < 120; index += 1) {
+        const angle = index / 120 * TAU;
+        const isMajor = index % 10 === 0;
+        const outer = .475 * scale;
+        const inner = (isMajor ? .448 : index % 5 === 0 ? .458 : .465) * scale;
+        const path = isMajor ? majorTickPath : minorTickPath;
+        path.moveTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
+        path.lineTo(Math.cos(angle) * outer, Math.sin(angle) * outer);
+      }
+
+      innerSegmentPath = new Path2D();
+      outerSegmentPath = new Path2D();
+      const segmentSets = [
+        {path: innerSegmentPath, radius: .295, count: 18, fill: .62},
+        {path: outerSegmentPath, radius: .417, count: 14, fill: .48},
+      ];
+      segmentSets.forEach(({path, radius, count, fill}) => {
+        for (let index = 0; index < count; index += 1) {
+          const start = index / count * TAU;
+          const length = TAU / count * (fill + (index % 3) * .08);
+          path.moveTo(Math.cos(start) * radius * scale, Math.sin(start) * radius * scale);
+          path.arc(0, 0, radius * scale, start, start + length);
+        }
+      });
+
+      const spriteSize = Math.max(256, Math.ceil(scale * 1.08));
+      backdropSprite.width = spriteSize;
+      backdropSprite.height = spriteSize;
+      const backdrop = backdropSprite.getContext("2d");
+      const middle = spriteSize / 2;
+      const unit = spriteSize / 12;
+      backdrop.clearRect(0, 0, spriteSize, spriteSize);
+      backdrop.strokeStyle = "rgb(80 134 155 / 0.075)";
+      backdrop.lineWidth = 1;
+      const hexPath = new Path2D();
+      for (let row = -1; row < 15; row += 1) {
+        for (let column = -1; column < 8; column += 1) {
+          const x = column * unit * 1.5 + (row % 2 ? unit * .75 : 0);
+          const y = row * unit * .866;
+          for (let side = 0; side <= 6; side += 1) {
+            const angle = side * TAU / 6;
+            const pointX = x + Math.cos(angle) * unit;
+            const pointY = y + Math.sin(angle) * unit;
+            if (side === 0) hexPath.moveTo(pointX, pointY); else hexPath.lineTo(pointX, pointY);
+          }
+        }
+      }
+      backdrop.save();
+      backdrop.translate(unit * .2, unit * .35);
+      backdrop.stroke(hexPath);
+      backdrop.restore();
+      backdrop.strokeStyle = "rgb(106 190 216 / 0.085)";
+      backdrop.beginPath();
+      for (let index = 1; index <= 4; index += 1) {
+        backdrop.moveTo(middle + index * spriteSize * .095, middle);
+        backdrop.arc(middle, middle, index * spriteSize * .095, 0, TAU);
+      }
+      backdrop.moveTo(middle, spriteSize * .07);
+      backdrop.lineTo(middle, spriteSize * .93);
+      backdrop.moveTo(spriteSize * .07, middle);
+      backdrop.lineTo(spriteSize * .93, middle);
+      backdrop.stroke();
     }
 
     function expandBands() {
@@ -241,6 +351,29 @@
       expandBands();
     }
 
+    function prepareFrameSignal(now, previewState) {
+      frameEnergy = energy;
+      if (!previewState) {
+        expandBands();
+        return;
+      }
+      if (previewState !== "LISTENING" && previewState !== "SPEAKING") {
+        frameEnergy = previewState === "THINKING" ? .08 : 0;
+        return;
+      }
+      const seconds = now / 1000;
+      const speaking = previewState === "SPEAKING";
+      const pulse = .5 + .5 * Math.sin(seconds * (speaking ? 3.4 : 1.7));
+      frameEnergy = speaking ? .28 + pulse * .18 : .12 + pulse * .08;
+      for (let index = 0; index < UNIQUE_BANDS; index += 1) {
+        const pinkShape = 1 / Math.sqrt(1 + index * .1);
+        const ripple = .68
+          + .2 * Math.sin(seconds * (speaking ? 5.2 : 2.2) + index * .43)
+          + .12 * Math.sin(seconds * 1.3 + index * 1.71);
+        expandedBands[index] = clamp(frameEnergy * pinkShape * ripple * (speaking ? 1.45 : 1.2));
+      }
+    }
+
     function setSignal(rawEnergy, bands) {
       energy = Number.isFinite(rawEnergy) ? clamp(rawEnergy) : 0;
       if (!Array.isArray(bands) || bands.length === 0) {
@@ -260,84 +393,173 @@
       expandBands();
     }
 
-    function setState(nextState) {
-      const resolved = VOICE_STATES.has(nextState) ? nextState : "OFFLINE";
-      if (resolved === state) return;
+    function setVisualState(nextState) {
+      if (nextState === visualState) return;
       const now = performance.now();
       mixColors(now);
-      copyColor(fromBarColor, barColor);
-      copyColor(fromCoreColor, coreColor);
-      copyColor(toBarColor, palettes[resolved].bar);
-      copyColor(toCoreColor, palettes[resolved].core);
+      copyValues(fromPrimaryColor, primaryColor);
+      copyValues(fromSecondaryColor, secondaryColor);
+      copyValues(fromCoreColor, coreColor);
+      copyValues(fromMotion, motion);
+      fromLayerPresence = layerPresence;
+      copyValues(toPrimaryColor, palettes[nextState].primary);
+      copyValues(toSecondaryColor, palettes[nextState].secondary);
+      copyValues(toCoreColor, palettes[nextState].core);
+      copyValues(toMotion, palettes[nextState].motion);
+      toLayerPresence = nextState === "OFFLINE" ? 0 : 1;
       transitionAt = now;
-      state = resolved;
-      canvas.setAttribute("aria-label", `Atlas engine ${state.toLowerCase()}`);
+      visualState = nextState;
     }
 
-    function drawArcs(now) {
-      if (state === "OFFLINE") return;
-      const rotation = state === "THINKING" ? now * .00022 : 0;
-      context.lineWidth = Math.max(.55, scale * .0023);
+    function setState(nextState) {
+      realState = VOICE_STATES.has(nextState) ? nextState : "OFFLINE";
+      canvas.setAttribute("aria-label", `Atlas engine ${realState.toLowerCase()}`);
+      if (!VOICE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
+    }
+
+    function drawBackdrop() {
+      const size = scale * 1.08;
+      context.globalAlpha = .36 + motion[1] * .22;
+      context.drawImage(backdropSprite, centerX - size / 2, centerY - size / 2, size, size);
+      context.globalAlpha = 1;
+    }
+
+    function drawTickRing(now) {
+      const visibility = visualState === "OFFLINE" ? .18 : 1;
+      context.save();
+      context.translate(centerX, centerY);
+      context.rotate(now * .000018 * (1 + motion[0]));
+      context.lineCap = "butt";
+      context.lineWidth = Math.max(.45, scale * .0012);
+      context.strokeStyle = colorString(primaryColor, (.15 + motion[1] * .1) * visibility);
+      context.stroke(minorTickPath);
+      context.lineWidth = Math.max(.7, scale * .0021);
+      context.strokeStyle = colorString(secondaryColor, (.35 + motion[1] * .2) * visibility);
+      context.stroke(majorTickPath);
+      context.restore();
+    }
+
+    function drawSegmentRings(now) {
+      const speed = .000035 + motion[0] * .00016;
+      const visibility = visualState === "OFFLINE" ? .16 : 1;
       context.lineCap = "round";
-      context.strokeStyle = colorString(barColor, state === "THINKING" ? .28 : .1);
-      for (let index = 0; index < arcPaths.length; index += 1) {
-        context.save();
-        context.translate(centerX, centerY);
-        context.rotate(rotation * arcDirections[index]);
-        context.stroke(arcPaths[index]);
-        context.restore();
-      }
+      context.save();
+      context.translate(centerX, centerY);
+      context.rotate(now * speed);
+      context.lineWidth = Math.max(.75, scale * .0032);
+      context.strokeStyle = colorString(primaryColor, (.22 + motion[1] * .3) * visibility);
+      context.stroke(outerSegmentPath);
+      context.restore();
+
+      context.save();
+      context.translate(centerX, centerY);
+      context.rotate(-now * speed * 1.32);
+      context.lineWidth = Math.max(.65, scale * .0022);
+      context.strokeStyle = colorString(secondaryColor, (.22 + motion[1] * .42) * visibility);
+      context.stroke(innerSegmentPath);
+      context.restore();
     }
 
-    function drawBars(now) {
-      const baseRadius = .34 * scale;
-      const minimumLength = .02 * scale;
-      const lengthRange = .14 * scale;
-      const breathing = 1 + .03 * Math.sin(now * .001 * TAU * .2);
+    function drawScanner(now) {
+      if (motion[4] < .04) return;
+      const rotation = now * (.00018 + motion[4] * .00034);
+      const radius = .44 * scale;
+      context.save();
+      context.translate(centerX, centerY);
+      context.rotate(rotation);
+      const sweep = context.createLinearGradient(0, 0, radius, 0);
+      sweep.addColorStop(0, colorString(primaryColor, 0));
+      sweep.addColorStop(.72, colorString(primaryColor, .02 + motion[4] * .09));
+      sweep.addColorStop(1, colorString(secondaryColor, .08 + motion[4] * .38));
+      context.fillStyle = sweep;
+      context.beginPath();
+      context.moveTo(0, 0);
+      context.arc(0, 0, radius, -.11, .11);
+      context.closePath();
+      context.fill();
+      context.beginPath();
+      context.arc(0, 0, radius, -.08, .08);
+      context.lineWidth = Math.max(.7, scale * .002);
+      context.strokeStyle = colorString(secondaryColor, .08 + motion[4] * .54);
+      context.stroke();
+      context.restore();
+    }
+
+    function drawParticles(now) {
+      if (layerPresence <= 0) return;
+      const seconds = now / 1000;
+      const drift = .025 + motion[2] * .14 + frameEnergy * .2;
+      const particleEnergy = .25 + motion[2] * .45 + frameEnergy * .45;
+      context.save();
+      context.globalCompositeOperation = "screen";
+      for (let index = 0; index < PARTICLE_COUNT; index += 1) {
+        const orbit = particleAngle[index] + seconds * particleSpeed[index] * drift;
+        const tremor = Math.sin(seconds * (1 + particleSpeed[index]) + particlePhase[index]) * (.003 + frameEnergy * .006);
+        const radius = (particleRadius[index] + tremor) * scale;
+        const size = (2.2 + index % 3 * 1.35) * (1 + frameEnergy * .4);
+        context.globalAlpha = layerPresence * particleEnergy * (.18 + .22 * Math.sin(particlePhase[index] + seconds * .7) ** 2);
+        context.drawImage(
+          particleSprite,
+          centerX + Math.cos(orbit) * radius - size,
+          centerY + Math.sin(orbit) * radius - size,
+          size * 2,
+          size * 2,
+        );
+      }
+      context.restore();
+    }
+
+    function drawWaveform(now) {
+      const baseRadius = .323 * scale;
+      const inwardRange = .018 * scale;
+      const outwardRange = .092 * scale;
+      const breathing = .5 + .5 * Math.sin(now * .00115);
       const barPath = new Path2D();
+      const tipPath = new Path2D();
       for (let index = 0; index < BAR_COUNT; index += 1) {
         const mirroredIndex = index < UNIQUE_BANDS ? index : BAR_COUNT - 1 - index;
-        let target = 0;
-        if (state === "LISTENING") target = clamp(expandedBands[mirroredIndex] * 1.3);
-        if (state === "SPEAKING") target = expandedBands[mirroredIndex];
-        if (state === "THINKING") {
-          target = .16 + .09 * (.5 + .5 * Math.sin(index * .31 + now * .0014));
-        }
+        let target = .025 + breathing * .02;
+        if (visualState === "LISTENING") target = clamp(expandedBands[mirroredIndex] * 1.35 + .045);
+        if (visualState === "SPEAKING") target = clamp(expandedBands[mirroredIndex] * 1.08 + frameEnergy * .22 + .06);
+        if (visualState === "THINKING") target = .17 + .11 * (.5 + .5 * Math.sin(index * .31 + now * .002));
+        if (visualState === "OFFLINE") target = 0;
         const current = barValues[index];
-        barValues[index] += (target - current) * (target > current ? .5 : .12);
-        if (state === "OFFLINE") continue;
-        const length = state === "ASLEEP"
-          ? minimumLength * breathing
-          : minimumLength + lengthRange * barValues[index];
-        const innerX = barStartX[index];
-        const innerY = barStartY[index];
+        barValues[index] += (target - current) * (target > current ? .32 : .1);
+        const value = barValues[index];
+        const innerRadius = baseRadius - inwardRange * value;
+        const outerRadius = baseRadius + .008 * scale + outwardRange * value;
+        const innerX = centerX + cosine[index] * innerRadius;
+        const innerY = centerY + sine[index] * innerRadius;
+        const outerX = centerX + cosine[index] * outerRadius;
+        const outerY = centerY + sine[index] * outerRadius;
         barPath.moveTo(innerX, innerY);
-        barPath.lineTo(innerX + cosine[index] * length, innerY + sine[index] * length);
+        barPath.lineTo(outerX, outerY);
+        tipPath.moveTo(outerX + Math.max(1, scale * .0026), outerY);
+        tipPath.arc(outerX, outerY, Math.max(.8, scale * .0026), 0, TAU);
       }
-      if (state === "OFFLINE") return;
-      context.lineWidth = Math.max(1.5, TAU * baseRadius / BAR_COUNT * .6);
+      if (layerPresence <= 0) return;
+      context.save();
+      context.globalAlpha = layerPresence;
       context.lineCap = "round";
-      if (state === "THINKING" && typeof context.createConicGradient === "function") {
-        const sweep = context.createConicGradient(now * .001, centerX, centerY);
-        sweep.addColorStop(0, colorString(barColor, .24));
-        sweep.addColorStop(.55, colorString(barColor, .42));
-        sweep.addColorStop(.82, "rgb(244 242 255 / 0.96)");
-        sweep.addColorStop(1, colorString(barColor, .24));
-        context.strokeStyle = sweep;
-      } else {
-        const alpha = state === "ASLEEP" ? .34 : .88;
-        context.strokeStyle = colorString(barColor, alpha);
-      }
+      context.lineWidth = Math.max(3, scale * .009);
+      context.strokeStyle = colorString(primaryColor, .05 + motion[1] * .11);
       context.stroke(barPath);
+      context.lineWidth = Math.max(1.15, scale * .0035);
+      context.strokeStyle = colorString(secondaryColor, .34 + motion[3] * .56);
+      context.stroke(barPath);
+      context.fillStyle = colorString(secondaryColor, .28 + motion[3] * .62);
+      context.fill(tipPath);
+      context.restore();
     }
 
     function drawCore(now) {
-      const speakingPulse = state === "SPEAKING" ? 1 + energy * .1 * Math.sin(now * .018) : 1;
-      const coreRadius = .18 * scale * speakingPulse;
-      const glowRadius = coreRadius * (state === "ASLEEP" || state === "OFFLINE" ? 2.5 : 3.15);
+      const breathing = .5 + .5 * Math.sin(now * .00115);
+      const speakingPulse = frameEnergy * motion[5] * (.055 + .035 * Math.sin(now * .019));
+      const coreRadius = (.142 + breathing * .006 + speakingPulse) * scale;
+      const glowRadius = coreRadius * (2.45 + motion[3] * .75);
       context.save();
       context.globalCompositeOperation = "screen";
-      context.globalAlpha = state === "OFFLINE" ? .06 : state === "ASLEEP" ? .1 : .25 + energy * .12;
+      context.globalAlpha = .04 + motion[3] * .24 + frameEnergy * .12;
       context.drawImage(
         glowSprite,
         centerX - glowRadius,
@@ -347,29 +569,56 @@
       );
       context.restore();
 
+      const coreGradient = context.createRadialGradient(
+        centerX - coreRadius * .22, centerY - coreRadius * .25, coreRadius * .04,
+        centerX, centerY, coreRadius,
+      );
+      coreGradient.addColorStop(0, colorString(secondaryColor, .7 + motion[3] * .25));
+      coreGradient.addColorStop(.28, colorString(coreColor, .22 + motion[3] * .24));
+      coreGradient.addColorStop(.72, colorString(primaryColor, .08 + motion[3] * .1));
+      coreGradient.addColorStop(1, colorString(primaryColor, .015));
       context.beginPath();
       context.arc(centerX, centerY, coreRadius, 0, TAU);
-      context.fillStyle = colorString(coreColor, state === "OFFLINE" ? .055 : state === "ASLEEP" ? .09 : .18);
+      context.fillStyle = coreGradient;
       context.fill();
-      context.lineWidth = Math.max(.8, scale * .003);
-      context.strokeStyle = state === "SPEAKING"
-        ? "rgb(124 92 255 / 0.82)"
-        : colorString(coreColor, state === "OFFLINE" ? .2 : .5);
+      context.lineWidth = Math.max(.8, scale * .0028);
+      context.strokeStyle = colorString(secondaryColor, .24 + motion[3] * .58);
       context.stroke();
 
       context.beginPath();
-      context.arc(centerX, centerY, .30 * scale, 0, TAU);
-      context.lineWidth = Math.max(.65, scale * .0022);
-      context.strokeStyle = colorString(barColor, state === "OFFLINE" ? .34 : .24);
+      context.arc(centerX, centerY, coreRadius * .74, 0, TAU);
+      context.lineWidth = Math.max(.55, scale * .0015);
+      context.strokeStyle = colorString(coreColor, .18 + motion[3] * .24);
       context.stroke();
+
+      context.save();
+      context.translate(centerX, centerY);
+      context.rotate(-now * (.000025 + motion[0] * .00014));
+      context.setLineDash(coreDashPattern);
+      context.beginPath();
+      context.arc(0, 0, .19 * scale, 0, TAU);
+      context.lineWidth = Math.max(.6, scale * .0018);
+      context.strokeStyle = colorString(primaryColor, .16 + motion[1] * .24);
+      context.stroke();
+      context.restore();
     }
 
     function draw(now) {
+      // boss-authorized preview override for headless review; visuals only
+      const previewState = VOICE_STATES.has(window.__atlasEnginePreview)
+        ? window.__atlasEnginePreview
+        : null;
+      setVisualState(previewState || realState);
+      prepareFrameSignal(now, previewState);
       mixColors(now);
-      context.fillStyle = "#0b0c10";
+      context.fillStyle = "#070a10";
       context.fillRect(0, 0, width, height);
-      drawArcs(now);
-      drawBars(now);
+      drawBackdrop();
+      drawTickRing(now);
+      drawSegmentRings(now);
+      drawScanner(now);
+      drawParticles(now);
+      drawWaveform(now);
       drawCore(now);
     }
 
@@ -380,8 +629,12 @@
       const elapsed = performance.now() - started;
       metrics.samples += 1;
       metrics.lastMs = elapsed;
-      metrics.averageMs += (elapsed - metrics.averageMs) / metrics.samples;
+      metrics.averageMs += (elapsed - metrics.averageMs) * (metrics.samples < 60 ? 1 / metrics.samples : .035);
       metrics.maxMs = Math.max(metrics.maxMs, elapsed);
+      if (metrics.samples % 30 === 0) {
+        canvas.setAttribute("data-frame-cost-ms", metrics.averageMs.toFixed(3));
+        canvas.dataset.frameMaxMs = metrics.maxMs.toFixed(3);
+      }
       animationFrame = requestAnimationFrame(frame);
     }
 
@@ -389,11 +642,15 @@
       if (running || document.visibilityState !== "visible") return;
       resize();
       running = true;
+      metrics.running = true;
+      canvas.dataset.animation = "running";
       animationFrame = requestAnimationFrame(frame);
     }
 
     function stop() {
       running = false;
+      metrics.running = false;
+      canvas.dataset.animation = "paused";
       if (animationFrame) cancelAnimationFrame(animationFrame);
       animationFrame = 0;
     }
@@ -406,6 +663,9 @@
     }
     resize();
     draw(performance.now());
+    canvas.dataset.frameCostMs = "0.000";
+    canvas.dataset.frameMaxMs = "0.000";
+    canvas.dataset.animation = "paused";
     window.__atlasEngineMetrics = metrics;
     return {setSignal, setState, start, stop};
   }
