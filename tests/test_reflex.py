@@ -106,6 +106,18 @@ def test_activity_window_is_inclusive_and_checks_do_not_rearm_it():
     assert not gate.is_addressed(router.normalize("room conversation"))
 
 
+def test_addressed_window_and_late_vocab_routing():
+    clock = FakeClock()
+    gate = router.Addressing(90, ("atlas",), clock=clock)
+    gate.mark_activity()
+
+    clock.value = 34
+    assert gate.is_addressed(router.normalize("ordinary follow up"))
+    clock.value = 100
+    assert not gate.is_addressed(router.normalize("ordinary room conversation"))
+    assert gate.is_addressed(router.normalize("could you atlas check my calendar"))
+
+
 def test_mark_activity_rearms_the_window():
     clock = FakeClock()
     gate = router.Addressing(5, (), clock=clock)

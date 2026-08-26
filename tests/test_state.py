@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from worker.state import ASLEEP, LISTENING, SPEAKING, STATE_FROM_AGENT, THINKING, StatePublisher
 
 
@@ -107,6 +109,43 @@ def test_custom_ring_subscriptions_and_unsubscribe():
     assert [line["text"] for line in publisher.snapshot()["transcript"]] == ["two", "three"]
     assert len([event for event in events if event[0] == "line"]) == 3
     assert not any(event[0] == "state" for event in events)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "i just said",
+        "as i said",
+        "as i asked",
+        "like i said",
+        "what i said",
+        "do what i said",
+        "i told you",
+        "do what i asked",
+        "my last instruction",
+    ],
+)
+def test_every_prior_speech_trigger_recalls_ambient_context(phrase):
+    publisher = StatePublisher(clock=lambda: _dt(0))
+    publisher.add_line("ambient", "quietly schedule the review")
+
+    context = publisher.ambient_context(f"Atlas, {phrase} please")
+
+    assert context is not None
+    assert "quietly schedule the review" in context
+
+
+def test_ambient_context_budget_keeps_newest_lines():
+    publisher = StatePublisher(clock=lambda: _dt(0))
+    for index in range(30):
+        publisher.add_line("ambient", f"line-{index:02d} " + ("x" * 180))
+
+    context = publisher.ambient_context("Atlas, as I said")
+
+    assert context is not None
+    assert len(context) <= 4000
+    assert "line-29" in context
+    assert "line-00" not in context
 
 
 def test_bad_subscriber_does_not_block_other_subscribers():

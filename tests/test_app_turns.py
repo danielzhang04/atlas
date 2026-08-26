@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from worker import app, router
@@ -15,9 +16,11 @@ class FakeBrain:
     def __init__(self, chunks=("First sentence. ", "Second sentence.")) -> None:
         self.chunks = chunks
         self.calls = []
+        self.contexts = []
 
-    async def respond(self, text):
+    async def respond(self, text, *, context=None):
         self.calls.append(text)
+        self.contexts.append(context)
         for chunk in self.chunks:
             yield chunk
 
@@ -248,6 +251,62 @@ def test_ambient_turn_is_recorded_without_model_speech_or_clock_refresh():
     ]
     clock.value = 120.01
     assert engagement.tick() == "ASLEEP"
+
+
+def test_prior_speech_reference_injects_only_recent_ambient_lines():
+    routing_clock = FakeClock()
+    now = [datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)]
+    publisher = StatePublisher(clock=lambda: now[0])
+    publisher.add_line("ambient", "old room instruction")
+    now[0] += timedelta(seconds=181)
+    publisher.add_line("user", "visible user line")
+    publisher.add_line("ambient", "recent room instruction")
+    publisher.add_line("assistant", "visible assistant line")
+    brain = FakeBrain(chunks=("Understood.",))
+    engagement = Engagement(120, clock=routing_clock)
+    addressing = Addressing(90, ("atlas",), clock=routing_clock)
+    engagement.wake()
+    addressing.mark_activity()
+
+    asyncio.run(app._handle_audio_turn(
+        "Atlas, I just said do what I asked",
+        intents={},
+        brain=brain,
+        session=FakeSession(),
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert brain.calls == ["Atlas, I just said do what I asked"]
+    assert brain.contexts == [
+        "Overheard while not addressed (unverified, may not be for you):\n"
+        "[2026-08-26T12:03:01+00:00] recent room instruction"
+    ]
+
+
+def test_ambient_context_is_absent_without_prior_speech_reference():
+    publisher = StatePublisher()
+    publisher.add_line("ambient", "recent room instruction")
+    brain = FakeBrain(chunks=("Okay.",))
+    engagement = Engagement(120)
+    addressing = Addressing(90, ("atlas",))
+    engagement.wake()
+    addressing.mark_activity()
+
+    asyncio.run(app._handle_audio_turn(
+        "Atlas, check my calendar",
+        intents={},
+        brain=brain,
+        session=FakeSession(),
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert brain.contexts == [None]
 
 
 def test_blank_audio_turn_does_not_refresh_clocks_or_record_a_line():
@@ -709,8 +768,22 @@ def test_production_listening_config_matches_wave_two_defaults():
     cfg = app._cfg()
 
     assert cfg["engagement_timeout_s"] == 120
-    assert cfg["address_window_s"] == 30
+    assert cfg["addressed_window_s"] == 90
     assert cfg["address_vocab"] == ["gmail", "inbox", "unread", "calendar", "youtube", "notion", "github", "spotify", "workers"]
+
+
+def test_addressing_factory_reads_non_default_addressed_window():
+    clock = FakeClock()
+    addressing = app._addressing_from_config(
+        {"addressed_window_s": 7, "address_vocab": []},
+        clock=clock,
+    )
+    addressing.mark_activity()
+
+    clock.value = 7
+    assert addressing.is_addressed("ordinary follow up")
+    clock.value = 7.01
+    assert not addressing.is_addressed("ordinary follow up")
 
 
 def test_cancelled_completion_is_bounded():
