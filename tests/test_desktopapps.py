@@ -7,12 +7,15 @@ from worker.desktopapps import DesktopAppError, DesktopApps, native_launcher
 
 
 def test_default_profiles_match_configured_signed_desktop_apps():
-    assert set(desktopapps.DEFAULT_PROFILES) == {"vscode", "wt", "chrome", "notepad"}
+    assert set(desktopapps.DEFAULT_PROFILES) == {
+        "vscode", "wt", "chrome", "notepad", "spotify",
+    }
     assert desktopapps.DEFAULT_PROFILES["vscode"].executable == "Code.exe"
     assert desktopapps.DEFAULT_PROFILES["wt"].executable == "wt.exe"
     assert desktopapps.DEFAULT_PROFILES["wt"].close_executable == "WindowsTerminal.exe"
     assert desktopapps.DEFAULT_PROFILES["chrome"].executable == "chrome.exe"
     assert desktopapps.DEFAULT_PROFILES["notepad"].executable == "notepad.exe"
+    assert desktopapps.DEFAULT_PROFILES["spotify"].executable == "Spotify.exe"
 
 
 def test_open_and_focus_delegate_only_allowlisted_profiles():
@@ -214,6 +217,58 @@ def test_windows_terminal_resolver_uses_windows_apps_and_checks_publisher(
 
     assert desktopapps._resolve_executable("wt.exe") == str(candidate.resolve())
     assert calls == [(candidate.resolve(), "Microsoft Corporation")]
+
+
+def test_spotify_resolver_uses_signed_windows_app_alias(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    candidate = local / "Microsoft/WindowsApps/Spotify.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("test executable", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(desktopapps.os, "name", "nt")
+    monkeypatch.setattr(desktopapps, "_known_folder_path", lambda _name: local)
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: calls.append((path, publisher)) or True,
+    )
+
+    assert desktopapps._resolve_executable("Spotify.exe") == str(candidate.resolve())
+    assert calls == [(candidate.resolve(), "Spotify AB")]
+
+
+def test_private_folder_launcher_uses_signed_explorer_profile(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        desktopapps,
+        "native_launcher",
+        lambda executable, target: calls.append((executable, target)) or "opened",
+    )
+
+    assert "open_folder" not in desktopapps.__all__
+    assert not hasattr(desktopapps, "open_folder")
+    assert desktopapps._launch_folder("C:/allowed/folder") == "opened"
+    assert calls == [("explorer.exe", "C:/allowed/folder")]
+
+
+def test_explorer_resolver_uses_signed_system32_executable(tmp_path, monkeypatch):
+    windows = tmp_path / "windows"
+    candidate = windows / "System32/explorer.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("test executable", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(desktopapps.os, "name", "nt")
+    monkeypatch.setattr(desktopapps, "_windows_directory", lambda: windows)
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: calls.append((path, publisher)) or True,
+    )
+
+    assert desktopapps._resolve_executable("explorer.exe") == str(candidate.resolve())
+    assert calls == [(candidate.resolve(), "Microsoft Windows")]
 
 
 def test_resolver_fails_closed_when_expected_publisher_does_not_match(

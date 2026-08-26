@@ -5,6 +5,11 @@ servers:
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
               search_drive_files, list_drive_items, get_drive_file_content]
+  chrome-devtools:
+    from_claude_config: chrome-devtools
+    blocked: [get_network_request, list_network_requests]
+    instant: [list_pages, list_console_messages, get_console_message,
+              take_snapshot, take_screenshot]
 defaults:
   instant_prefixes: [get_, list_, search_, query_, read_, check_]
   call_timeout_s: 8

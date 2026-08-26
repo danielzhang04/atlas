@@ -39,6 +39,7 @@ DEFAULT_PROFILES = {
     "wt": AppProfile("wt", "wt.exe", "WindowsTerminal.exe"),
     "chrome": AppProfile("chrome", "chrome.exe"),
     "notepad": AppProfile("notepad", "notepad.exe"),
+    "spotify": AppProfile("spotify", "Spotify.exe"),
 }
 
 # These identifiers are resolved through SHGetKnownFolderPath instead of inherited
@@ -92,6 +93,8 @@ _EXPECTED_PUBLISHERS = {
     "WindowsTerminal.exe": "Microsoft Corporation",
     "chrome.exe": "Google LLC",
     "notepad.exe": "Microsoft Windows",
+    "Spotify.exe": "Spotify AB",
+    "explorer.exe": "Microsoft Windows",
 }
 
 
@@ -154,6 +157,11 @@ def open_profile(app_id: str, url: str | None = None) -> object:
 def focus_profile(app_id: str) -> object:
     apps = DesktopApps(profiles=DEFAULT_PROFILES, launcher=native_launcher)
     return apps.focus(app_id)
+
+
+def _launch_folder(path: str) -> object:
+    """Open a host-validated directory with the signed system Explorer profile."""
+    return native_launcher("explorer.exe", path)
 
 
 def close_profile(app_id: str, *, killer: Callable[..., object] = subprocess.run
@@ -234,6 +242,8 @@ def _resolve_executable(executable: str) -> str:
         ],
         "wt.exe": [("local_app_data", "Microsoft/WindowsApps/wt.exe")],
         "notepad.exe": [("windows", "System32/notepad.exe")],
+        "Spotify.exe": [("local_app_data", "Microsoft/WindowsApps/Spotify.exe")],
+        "explorer.exe": [("windows", "System32/explorer.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
             ("program_files_x86", "Google/Chrome/Application/chrome.exe"),
