@@ -181,32 +181,60 @@ def test_set_app_user_model_id_calls_shell_once_and_swallows_failure(desktop_log
         "could not set the Atlas Windows application identity") == 2
 
 
-def test_set_window_icon_uses_atlas_icon_and_swallows_failure(desktop_log):
-    paths = []
-    native = SimpleNamespace(Icon=None)
-    expected_icon = object()
-
-    desktop._set_window_icon(
-        SimpleNamespace(native=native),
-        icon_factory=lambda path: paths.append(path) or expected_icon,
+def test_set_window_icon_loads_and_sends_small_and_big_icons(desktop_log):
+    calls = []
+    native = SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 456))
+    user32 = SimpleNamespace(
+        GetSystemMetrics=lambda metric: calls.append(("metric", metric)) or metric + 1,
+        LoadImageW=lambda *args: calls.append(("load", *args)) or 1000 + len(calls),
+        SendMessageW=lambda *args: calls.append(("send", *args)),
     )
 
-    assert paths == [str(desktop.ATLAS / "ui" / "atlas.ico")]
-    assert native.Icon is expected_icon
-    desktop._set_window_icon(SimpleNamespace(), icon_factory=lambda _path: object())
-    assert "could not set the Atlas Windows window icon" in desktop_log.getvalue()
+    desktop._set_window_icon(SimpleNamespace(native=native), user32=user32)
+
+    loads = [call for call in calls if call[0] == "load"]
+    sends = [call for call in calls if call[0] == "send"]
+    assert [call[2] for call in loads] == [str(desktop.ATLAS_ICON)] * 2
+    assert [call[3:] for call in loads] == [
+        (desktop.IMAGE_ICON, desktop.SM_CXSMICON + 1, desktop.SM_CYSMICON + 1,
+         desktop.LR_LOADFROMFILE | desktop.LR_DEFAULTSIZE),
+        (desktop.IMAGE_ICON, desktop.SM_CXICON + 1, desktop.SM_CYICON + 1,
+         desktop.LR_LOADFROMFILE | desktop.LR_DEFAULTSIZE),
+    ]
+    assert [(call[1], call[2], call[3]) for call in sends] == [
+        (456, desktop.WM_SETICON, desktop.ICON_SMALL),
+        (456, desktop.WM_SETICON, desktop.ICON_BIG),
+    ]
+    assert "window icon set" in desktop_log.getvalue()
 
 
-def test_configure_native_window_sets_style_before_refreshing_frame():
+def test_set_window_icon_logs_bounded_exception_detail(desktop_log):
+    native = SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 456))
+    user32 = SimpleNamespace(
+        GetSystemMetrics=lambda _metric: 16,
+        LoadImageW=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("icon load exploded" + "x" * 300)),
+    )
+
+    desktop._set_window_icon(SimpleNamespace(native=native), user32=user32)
+
+    message = desktop_log.getvalue()
+    assert "RuntimeError: icon load exploded" in message
+    assert "x" * 201 not in message
+
+
+def test_configure_native_window_sets_style_before_refreshing_frame(desktop_log):
     desktop._native_window_hooks.clear()
     calls = []
+    error = [99]
     handle = SimpleNamespace(ToInt64=lambda: 456)
     native = SimpleNamespace(Handle=handle)
     old_style = desktop.WS_CAPTION | 0x08000000
     user32 = SimpleNamespace(
-        GetWindowLongW=lambda hwnd, index: calls.append(("get", hwnd, index)) or old_style,
+        GetWindowLongW=lambda hwnd, index: calls.append(("get", hwnd, index)) or
+        error.__setitem__(0, 5) or old_style,
         SetWindowLongW=lambda hwnd, index, style: calls.append(
-            ("set", hwnd, index, style)) or old_style,
+            ("set", hwnd, index, style)) or error.__setitem__(0, 6) or old_style,
         SetWindowPos=lambda *args: calls.append(("position", *args)) or True,
     )
     hook = object()
@@ -216,6 +244,8 @@ def test_configure_native_window_sets_style_before_refreshing_frame():
         user32=user32,
         hook_factory=lambda form, functions: calls.append(
             ("hook", form, functions)) or hook,
+        set_last_error=lambda value: error.__setitem__(0, value),
+        get_last_error=lambda: error[0],
     )
 
     expected_style = desktop._frameless_window_style(old_style)
@@ -227,6 +257,71 @@ def test_configure_native_window_sets_style_before_refreshing_frame():
     assert calls[3][0:7] == ("position", 456, None, 0, 0, 0, 0)
     assert calls[3][7] & desktop.SWP_FRAMECHANGED
     assert desktop._native_window_hooks.pop(456) is hook
+    assert f"native window configured style={expected_style:#010x}" in desktop_log.getvalue()
+
+
+def test_configure_native_window_invokes_style_and_hook_on_ui_thread(monkeypatch):
+    desktop._native_window_hooks.clear()
+    calls = []
+
+    class Native:
+        invoking = False
+        Handle = SimpleNamespace(ToInt64=lambda: 456)
+
+        @property
+        def InvokeRequired(self):
+            return not self.invoking
+
+        def Invoke(self, action):
+            calls.append("invoke")
+            self.invoking = True
+            try:
+                action()
+            finally:
+                self.invoking = False
+
+    native = Native()
+
+    def on_ui_thread(name, result):
+        def call(*_args):
+            assert native.invoking
+            calls.append(name)
+            return result
+        return call
+
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda action: action))
+    user32 = SimpleNamespace(
+        GetWindowLongW=on_ui_thread("get", desktop.WS_CAPTION),
+        SetWindowLongW=on_ui_thread("set", desktop.WS_CAPTION),
+        SetWindowPos=on_ui_thread("position", True),
+    )
+    hook = object()
+
+    desktop._configure_native_window(
+        SimpleNamespace(native=native), user32=user32,
+        hook_factory=lambda *_args: on_ui_thread("hook", hook)(),
+    )
+
+    assert calls == ["invoke", "get", "set", "hook", "position"]
+    assert desktop._native_window_hooks.pop(456) is hook
+
+
+def test_configure_native_window_logs_assign_handle_exception_detail(desktop_log):
+    user32 = SimpleNamespace(
+        GetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowPos=lambda *_args: True,
+    )
+
+    desktop._configure_native_window(
+        SimpleNamespace(native=SimpleNamespace(
+            Handle=SimpleNamespace(ToInt64=lambda: 456))),
+        user32=user32,
+        hook_factory=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("AssignHandle failed live")),
+    )
+
+    assert "RuntimeError: AssignHandle failed live" in desktop_log.getvalue()
 
 
 @pytest.mark.parametrize("failing_call", ["get", "set"])
@@ -428,27 +523,73 @@ def test_configure_native_window_replaces_the_existing_hook_for_an_hwnd():
     assert desktop._native_window_hooks.pop(456) is second
 
 
-def test_window_shown_sets_icon_before_watching(monkeypatch):
+def test_window_shown_configures_native_window_on_ui_thread_before_watching(monkeypatch):
     calls = []
-    monkeypatch.setattr(desktop, "_set_window_icon", lambda window: calls.append(("icon", window)))
+
+    class Native:
+        invoking = False
+
+        def Invoke(self, action):
+            calls.append(("invoke", window))
+            self.invoking = True
+            try:
+                action()
+            finally:
+                self.invoking = False
+
+    window = SimpleNamespace(native=None)
+
+    class Shown:
+        def wait(self, *, timeout):
+            calls.append(("wait", timeout))
+            window.native = Native()
+            return True
+
+    window.events = SimpleNamespace(shown=Shown())
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda action: action))
+    monkeypatch.setattr(
+        desktop, "_set_window_icon",
+        lambda value: calls.append(("icon", value, value.native.invoking)))
     monkeypatch.setattr(
         desktop, "_configure_native_window",
-        lambda window: calls.append(("native", window)),
+        lambda value: calls.append(("native", value, value.native.invoking)),
     )
     monkeypatch.setattr(
         desktop, "_watch_child",
         lambda proc, window, closing, restart: calls.append(
             ("watch", proc, window, closing, restart)),
     )
-    proc, window, closing, restart = object(), object(), object(), object()
+    proc, closing, restart = object(), object(), object()
 
     desktop._on_window_shown(proc, window, closing, restart)
 
     assert calls == [
-        ("icon", window),
-        ("native", window),
+        ("wait", 30),
+        ("invoke", window),
+        ("icon", window, True),
+        ("native", window, True),
         ("watch", proc, window, closing, restart),
     ]
+
+
+def test_window_shown_timeout_logs_once_and_still_watches_child(monkeypatch, desktop_log):
+    calls = []
+    shown = SimpleNamespace(wait=lambda *, timeout: calls.append(("wait", timeout)) or False)
+    window = SimpleNamespace(native=None, events=SimpleNamespace(shown=shown))
+    monkeypatch.setattr(
+        desktop, "_watch_child",
+        lambda proc, window, closing, restart: calls.append(
+            ("watch", proc, window, closing, restart)),
+    )
+    proc, closing, restart = object(), object(), object()
+
+    desktop._on_window_shown(proc, window, closing, restart)
+
+    assert calls == [
+        ("wait", 30),
+        ("watch", proc, window, closing, restart),
+    ]
+    assert desktop_log.getvalue().count("could not configure the Atlas native window") == 1
 
 
 def test_main_sets_identity_before_run(monkeypatch):

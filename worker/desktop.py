@@ -36,6 +36,9 @@ MAX_RESTARTS_PER_BURST = 3
 APP_USER_MODEL_ID = "Atlas.Desktop"
 ATLAS_ICON = ATLAS / "ui" / "atlas.ico"
 GWL_STYLE = -16
+IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE, WM_SETICON = 1, 0x0010, 0x0040, 0x0080
+ICON_SMALL, ICON_BIG = 0, 1
+SM_CXICON, SM_CYICON, SM_CXSMICON, SM_CYSMICON = 11, 12, 49, 50
 WS_CAPTION, WS_THICKFRAME = 0x00C00000, 0x00040000
 WS_MINIMIZEBOX, WS_MAXIMIZEBOX = 0x00020000, 0x00010000
 WM_NCCALCSIZE, WM_NCHITTEST, WM_NCDESTROY = 0x0083, 0x0084, 0x0082
@@ -70,6 +73,19 @@ def _window_long(call, args, set_last_error, get_last_error):
     set_last_error(0); result = call(*args); error = get_last_error()
     if result == 0 and error: raise OSError(error, "Windows window-style call failed")
     return result
+def _exception_detail(error: Exception) -> str: return f"{type(error).__name__}: {' '.join(str(error).split())}"[:200]
+def _user32_functions():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowLongW.argtypes, user32.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
+    user32.SetWindowLongW.argtypes, user32.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
+    user32.SetWindowPos.argtypes, user32.SetWindowPos.restype = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL
+    user32.GetWindowRect.argtypes, user32.GetWindowRect.restype = [wintypes.HWND, ctypes.POINTER(_WindowRect)], wintypes.BOOL
+    user32.MonitorFromWindow.argtypes, user32.MonitorFromWindow.restype = [wintypes.HWND, wintypes.DWORD], wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes, user32.GetMonitorInfoW.restype = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)], wintypes.BOOL
+    user32.GetSystemMetrics.argtypes, user32.GetSystemMetrics.restype = [ctypes.c_int], ctypes.c_int
+    user32.LoadImageW.argtypes, user32.LoadImageW.restype = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.HANDLE
+    user32.SendMessageW.argtypes, user32.SendMessageW.restype = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.LPARAM
+    return user32
 def _set_app_user_model_id(*, shell32=None) -> None:
     try:
         if (shell32 or ctypes.windll.shell32).SetCurrentProcessExplicitAppUserModelID(
@@ -77,17 +93,32 @@ def _set_app_user_model_id(*, shell32=None) -> None:
             raise OSError("SetCurrentProcessExplicitAppUserModelID failed")
     except Exception:
         logger.warning("could not set the Atlas Windows application identity")
-def _set_window_icon(window, *, icon_factory=None) -> None:
+def _set_window_icon(window, *, user32=None, get_last_error=None) -> None:
     try:
-        icon_factory = icon_factory or getattr(
-            __import__("System.Drawing", fromlist=["Icon"]), "Icon")
-        window.native.Icon = icon_factory(str(ATLAS_ICON))
-    except Exception:
-        logger.warning("could not set the Atlas Windows window icon")
+        native = window.native
+        if getattr(native, "InvokeRequired", False):
+            from System import Action
+            native.Invoke(Action(lambda: _set_window_icon(
+                window, user32=user32, get_last_error=get_last_error)))
+            return
+        hwnd = int(native.Handle.ToInt64())
+        user32 = user32 or _user32_functions()
+        dimensions = ((ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+                      (ICON_BIG, SM_CXICON, SM_CYICON))
+        for icon_size, width_metric, height_metric in dimensions:
+            width, height = user32.GetSystemMetrics(width_metric), user32.GetSystemMetrics(height_metric)
+            hicon = user32.LoadImageW(None, str(ATLAS_ICON), IMAGE_ICON, width, height,
+                                      LR_LOADFROMFILE | LR_DEFAULTSIZE)
+            if not hicon:
+                raise OSError((get_last_error or ctypes.get_last_error)(), "LoadImageW failed")
+            user32.SendMessageW(hwnd, WM_SETICON, icon_size, hicon)
+        logger.info("window icon set")
+    except Exception as error:
+        logger.warning("could not set the Atlas Windows window icon: %s", _exception_detail(error))
 def _native_window_hook(native, user32):
     from System import IntPtr
     from System.Windows.Forms import FormWindowState, NativeWindow
-    hwnd = native.Handle.ToInt64()
+    hwnd = int(native.Handle.ToInt64())
     class AtlasNativeWindow(NativeWindow):
         def WndProc(self, message):
             if message.Msg == WM_NCCALCSIZE:
@@ -129,20 +160,14 @@ def _configure_native_window(window, *, user32=None, hook_factory=_native_window
         native = window.native
         if getattr(native, "InvokeRequired", False):
             from System import Action
-            native.Invoke(Action(lambda: _configure_native_window(window, user32=user32,
-                                                                  hook_factory=hook_factory)))
+            native.Invoke(Action(lambda: _configure_native_window(
+                window, user32=user32, hook_factory=hook_factory,
+                                                                  set_last_error=set_last_error,
+                                                                  get_last_error=get_last_error)))
             return
-        hwnd = native.Handle.ToInt64()
+        hwnd = int(native.Handle.ToInt64())
         if user32 is None:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            user32.GetWindowLongW.argtypes, user32.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
-            user32.SetWindowLongW.argtypes, user32.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
-            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                                            ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-            user32.SetWindowPos.restype = wintypes.BOOL
-            user32.GetWindowRect.argtypes, user32.GetWindowRect.restype = [wintypes.HWND, ctypes.POINTER(_WindowRect)], wintypes.BOOL
-            user32.MonitorFromWindow.argtypes, user32.MonitorFromWindow.restype = [wintypes.HWND, wintypes.DWORD], wintypes.HANDLE
-            user32.GetMonitorInfoW.argtypes, user32.GetMonitorInfoW.restype = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)], wintypes.BOOL
+            user32 = _user32_functions()
         set_error, get_error = set_last_error or ctypes.set_last_error, get_last_error or ctypes.get_last_error
         style = _frameless_window_style(_window_long(user32.GetWindowLongW, (hwnd, GWL_STYLE), set_error, get_error))
         _window_long(user32.SetWindowLongW, (hwnd, GWL_STYLE, style), set_error, get_error)
@@ -153,10 +178,11 @@ def _configure_native_window(window, *, user32=None, hook_factory=_native_window
         previous = _native_window_hooks.get(hwnd)
         if previous is not None and previous is not hook: previous.ReleaseHandle()
         _native_window_hooks[hwnd] = hook
-    except Exception:
+        logger.info("native window configured style=%#010x", style & 0xffffffff)
+    except Exception as error:
         if hook is not None and _native_window_hooks.get(hwnd) is not hook:
             with suppress(Exception): hook.ReleaseHandle()
-        logger.warning("could not configure the Atlas frameless Windows window")
+        logger.warning("could not configure the Atlas frameless Windows window: %s", _exception_detail(error))
 def _status_html(title: str, message: str, *, heading: str | None = None) -> str:
     return f"""<!doctype html>
 <html lang="en">
@@ -233,7 +259,6 @@ class WindowApi:
     def request_close(self) -> None:
         if self._window is not None:
             self._window.destroy()
-
 def _kernel32_functions():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -243,7 +268,6 @@ def _kernel32_functions():
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     return kernel32
-
 def _close_handle(handle, *, close_handle=None) -> None:
     if not handle or os.name != "nt":
         return
@@ -252,7 +276,6 @@ def _close_handle(handle, *, close_handle=None) -> None:
         closer(handle)
     except Exception:
         logger.warning("could not close a Windows launcher handle")
-
 def _create_instance_mutex(
     *, platform: str = os.name, create_mutex=None, get_last_error=None,
 ):
@@ -270,7 +293,6 @@ def _create_instance_mutex(
     except Exception:
         logger.warning("could not create the Atlas single-instance mutex")
         return None, False
-
 def _show_already_running() -> None:
     message = "Atlas is already running"
     try:
@@ -278,7 +300,6 @@ def _show_already_running() -> None:
         user32.MessageBoxW(None, message, "Atlas", 0x40)
     except Exception:
         logger.warning(message)
-
 def _is_ui_url(value: str) -> bool:
     try:
         parsed = urlsplit(value)
@@ -309,19 +330,16 @@ def read_ui_url(stream: TextIO) -> str | None:
         if value is not None:
             return value
     return None
-
 def _jobs_url(ui_url: str) -> str:
     parsed = urlsplit(ui_url)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
         raise ValueError("invalid Atlas UI URL")
     return urlunsplit((parsed.scheme, parsed.netloc, "/jobs", "", ""))
-
 def _shutdown_url(ui_url: str) -> str:
     parsed = urlsplit(ui_url)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
         raise ValueError("invalid Atlas UI URL")
     return urlunsplit((parsed.scheme, parsed.netloc, "/shutdown", "", ""))
-
 def _loopback_request(
     url: str, *, method: str, headers: dict, body: bytes | None, timeout: float,
     max_bytes: int, opener: Callable,
@@ -330,7 +348,6 @@ def _loopback_request(
     with opener(request, timeout=timeout) as response:
         payload = response.read(max_bytes + 1)
     return payload
-
 def _active_job_titles(ui_url: str, *, opener: Callable = urlopen) -> list[str]:
     body = _loopback_request(
         _jobs_url(ui_url), method="GET", headers={"accept": "application/json"},
@@ -349,7 +366,6 @@ def _active_job_titles(ui_url: str, *, opener: Callable = urlopen) -> list[str]:
         if isinstance(title, str) and title.strip():
             titles.append(" ".join(title.split())[:200])
     return titles
-
 def confirm_close(window, ui_url: str, *,
                   jobs_reader: Callable[[str], list[str]] = _active_job_titles) -> bool:
     """Allow close immediately when idle, otherwise ask once with active job titles."""
@@ -369,12 +385,10 @@ def confirm_close(window, ui_url: str, *,
         "These jobs will be cancelled.\n\nClose Atlas?"
     )
     return bool(window.create_confirmation_dialog("Close Atlas?", message))
-
 def _confirm_window_close(proc, window, ui_url: str) -> bool:
     if proc.poll() is not None:
         return True
     return confirm_close(window, ui_url)
-
 def _request_shutdown(
     ui_url: str,
     shutdown_token: str,
@@ -385,7 +399,6 @@ def _request_shutdown(
         _shutdown_url(ui_url), method="POST",
         headers={"X-Atlas-Shutdown": shutdown_token}, body=b"",
         timeout=16.0, max_bytes=65_536, opener=opener)
-
 def stop_child(
     proc, ui_url: str | None = None, shutdown_token: str | None = None, *,
     shutdown_request: Callable[[str, str], None] = _request_shutdown,
@@ -488,8 +501,26 @@ def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
         result.put(None)
 
 def _on_window_shown(proc, window, closing, restart) -> None:
-    _set_window_icon(window)
-    _configure_native_window(window)
+    try:
+        shown = window.events.shown.wait(timeout=30)
+    except Exception as error:
+        logger.warning("could not configure the Atlas native window: %s", _exception_detail(error))
+    else:
+        if not shown or window.native is None:
+            logger.warning(
+                "could not configure the Atlas native window: "
+                "native window unavailable after waiting 30 seconds")
+        else:
+            try:
+                from System import Action
+                def configure():
+                    _set_window_icon(window)
+                    _configure_native_window(window)
+                window.native.Invoke(Action(configure))
+            except Exception as error:
+                detail = _exception_detail(error)
+                logger.warning("could not set the Atlas Windows window icon: %s", detail)
+                logger.warning("could not configure the Atlas frameless Windows window: %s", detail)
     _watch_child(proc, window, closing, restart)
 def run(
     *,
