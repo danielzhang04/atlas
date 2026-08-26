@@ -22,10 +22,7 @@ from urllib.request import Request, urlopen
 import webview
 
 from worker import jobobject
-
-__all__ = [
-    "ATLAS", "confirm_close", "main", "read_ui_url", "run", "stop_child",
-]
+__all__ = ["ATLAS", "confirm_close", "main", "read_ui_url", "run", "stop_child"]
 
 ATLAS = Path(__file__).resolve().parents[1]
 logger = logging.getLogger("atlas.desktop")
@@ -36,7 +33,22 @@ RESTART_EXIT_CODE = 21
 RESTART_INTERVAL_S = 30.0
 RESTART_BURST_WINDOW_S = 10.0 * 60.0
 MAX_RESTARTS_PER_BURST = 3
-
+APP_USER_MODEL_ID = "Atlas.Desktop"
+ATLAS_ICON = ATLAS / "ui" / "atlas.ico"
+def _set_app_user_model_id(*, shell32=None) -> None:
+    try:
+        if (shell32 or ctypes.windll.shell32).SetCurrentProcessExplicitAppUserModelID(
+                APP_USER_MODEL_ID) not in (None, 0):
+            raise OSError("SetCurrentProcessExplicitAppUserModelID failed")
+    except Exception:
+        logger.warning("could not set the Atlas Windows application identity")
+def _set_window_icon(window, *, icon_factory=None) -> None:
+    try:
+        icon_factory = icon_factory or getattr(
+            __import__("System.Drawing", fromlist=["Icon"]), "Icon")
+        window.native.Icon = icon_factory(str(ATLAS_ICON))
+    except Exception:
+        logger.warning("could not set the Atlas Windows window icon")
 def _status_html(title: str, message: str, *, heading: str | None = None) -> str:
     return f"""<!doctype html>
 <html lang="en">
@@ -54,13 +66,8 @@ def _status_html(title: str, message: str, *, heading: str | None = None) -> str
 </head>
 <body><main><h1>{heading or title}</h1><p>{message}</p></main></body>
 </html>"""
-
 STOPPED_HTML = _status_html("Atlas stopped", "Close this window and open Atlas again to restart it.")
-RECONNECTING_HTML = _status_html(
-    "Atlas reconnecting audio", "Atlas is following your new system audio device.",
-    heading="reconnecting audio\u2026",
-)
-
+RECONNECTING_HTML = _status_html("Atlas reconnecting audio", "Atlas is following your new system audio device.", heading="reconnecting audio\u2026")
 def _configure_file_logging(local_app_data=None):
     root = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
     if not root:
@@ -81,7 +88,6 @@ def _configure_file_logging(local_app_data=None):
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return handler
-
 def _log_worker_marker(line: str, count: int) -> bool:
     marker = next((item for item in ("Traceback", "Error", "Exception")
                    if line.startswith(item)), None)
@@ -89,7 +95,6 @@ def _log_worker_marker(line: str, count: int) -> bool:
         return False
     logger.error("worker marker category=%s count=%s", marker.casefold(), count)
     return True
-
 class WindowApi:
     """Expose native window controls to the frameless Atlas page."""
 
@@ -414,6 +419,9 @@ def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
     if not found:
         result.put(None)
 
+def _on_window_shown(proc, window, closing, restart) -> None:
+    _set_window_icon(window)
+    _watch_child(proc, window, closing, restart)
 def run(
     *,
     spawn: Callable = subprocess.Popen,
@@ -557,7 +565,7 @@ def run(
 
         window.events.closing += _confirm_close_current
         window.events.closed += _stop_once
-        start(_watch_child, (proc, window, closing, _restart_child))
+        start(_on_window_shown, (proc, window, closing, _restart_child))
         return 0
     finally:
         if stop_once is not None:
@@ -575,8 +583,8 @@ def run(
 
 def main() -> int:
     _configure_file_logging()
+    _set_app_user_model_id()
     return run()
-
 
 if __name__ == "__main__":
     sys.exit(main())
