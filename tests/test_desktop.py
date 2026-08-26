@@ -156,6 +156,74 @@ def test_pywebview_injection_walk_terminates():
     assert _pywebview_api_walk(api) < 200
 
 
+def test_set_app_user_model_id_calls_shell_once_and_swallows_failure(desktop_log):
+    calls = []
+    shell32 = SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=calls.append,
+    )
+
+    desktop._set_app_user_model_id(shell32=shell32)
+
+    assert calls == ["Atlas.Desktop"]
+
+    def fail(_app_id):
+        raise OSError("shell unavailable")
+
+    desktop._set_app_user_model_id(
+        shell32=SimpleNamespace(SetCurrentProcessExplicitAppUserModelID=fail),
+    )
+    desktop._set_app_user_model_id(shell32=SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=lambda _app_id: -1,
+    ))
+
+    assert desktop_log.getvalue().count(
+        "could not set the Atlas Windows application identity") == 2
+
+
+def test_set_window_icon_uses_atlas_icon_and_swallows_failure(desktop_log):
+    paths = []
+    native = SimpleNamespace(Icon=None)
+    expected_icon = object()
+
+    desktop._set_window_icon(
+        SimpleNamespace(native=native),
+        icon_factory=lambda path: paths.append(path) or expected_icon,
+    )
+
+    assert paths == [str(desktop.ATLAS / "ui" / "atlas.ico")]
+    assert native.Icon is expected_icon
+    desktop._set_window_icon(SimpleNamespace(), icon_factory=lambda _path: object())
+    assert "could not set the Atlas Windows window icon" in desktop_log.getvalue()
+
+
+def test_window_shown_sets_icon_before_watching(monkeypatch):
+    calls = []
+    monkeypatch.setattr(desktop, "_set_window_icon", lambda window: calls.append(("icon", window)))
+    monkeypatch.setattr(
+        desktop, "_watch_child",
+        lambda proc, window, closing, restart: calls.append(
+            ("watch", proc, window, closing, restart)),
+    )
+    proc, window, closing, restart = object(), object(), object(), object()
+
+    desktop._on_window_shown(proc, window, closing, restart)
+
+    assert calls == [
+        ("icon", window),
+        ("watch", proc, window, closing, restart),
+    ]
+
+
+def test_main_sets_identity_before_run(monkeypatch):
+    calls = []
+    monkeypatch.setattr(desktop, "_configure_file_logging", lambda: calls.append("logging"))
+    monkeypatch.setattr(desktop, "_set_app_user_model_id", lambda: calls.append("identity"))
+    monkeypatch.setattr(desktop, "run", lambda: calls.append("run") or 17)
+
+    assert desktop.main() == 17
+    assert calls == ["logging", "identity", "run"]
+
+
 def test_read_ui_url_ignores_noise_and_accepts_only_a_loopback_fragment_url():
     stream = StringIO(
         "worker starting\n"
@@ -266,7 +334,7 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once(desktop_log
     assert len(window.events.closed.handlers) == 1
     assert len(start_calls) == 1
     watch_function, watch_args = start_calls[0]
-    assert watch_function is desktop._watch_child
+    assert watch_function is desktop._on_window_shown
     assert watch_args[:2] == (process, window)
     assert isinstance(watch_args[2], Event)
     assert callable(watch_args[3])
@@ -884,4 +952,8 @@ def test_shortcut_installer_targets_pythonw_desktop_module():
     assert "Atlas.lnk" in script
     assert 'GetFolderPath("Desktop")' in script
     assert "IconLocation" in script
+    assert "System.AppUserModel.ID" in script
+    assert 'SetAppUserModelId($shortcutPath, "Atlas.Desktop")' in script
+    assert 'new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")' in script
+    assert "PropertyId = 5" in script
     assert "WindowStyle = 7" in script
