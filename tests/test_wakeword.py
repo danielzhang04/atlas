@@ -331,6 +331,25 @@ def test_listen_retries_failed_open_or_read_three_times_then_reports_failure(
     assert failures == ["wake input unavailable"]
 
 
+def test_configured_wake_model_success_publishes_configured_name():
+    sd = FakeSoundDevice()
+    model = FakeWakeModel(key="hey_atlas")
+    published = []
+
+    wakeword.listen(
+        lambda: None,
+        "hey_atlas",
+        device="follow",
+        sd_module=sd,
+        model_loader=lambda _name: (model, "hey_atlas"),
+        max_frames=1,
+        on_model=published.append,
+    )
+
+    assert published == ["hey_atlas"]
+    assert len(model.frames) == 1
+
+
 def test_configured_wake_model_failure_uses_hey_jarvis_and_publishes_fallback():
     sd = FakeSoundDevice()
     fallback = FakeWakeModel(key="hey_jarvis")

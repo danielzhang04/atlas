@@ -96,6 +96,9 @@ class StatePublisher:
         self._since = self._clock()
         self._emit(("state", value))
 
+    def set_wake_model(self, value: str | None) -> None:
+        self.wake_model = _bounded_wake_model(value)
+
     def set_audio(self, status: dict) -> None:
         for direction in ("input", "output"):
             value = status.get(direction) if isinstance(status, dict) else None

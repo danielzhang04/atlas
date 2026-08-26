@@ -58,6 +58,14 @@ class FakeClock:
         return self.value
 
 
+def test_wake_model_callback_publishes_runtime_model():
+    publisher = StatePublisher()
+
+    app._wake_model_callback(publisher)("hey_atlas_v2")
+
+    assert publisher.snapshot()["wake_model"] == "hey_atlas_v2"
+
+
 def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
     brain = FakeBrain()
     session = FakeSession()

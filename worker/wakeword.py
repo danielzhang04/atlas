@@ -319,6 +319,12 @@ def listen(
                 on_model(fallback_name)
             except Exception:
                 logger.exception("wake-model state observer failed")
+    else:
+        if on_model is not None:
+            try:
+                on_model(model_name)
+            except Exception:
+                logger.exception("wake-model state observer failed")
 
     initial_device = resolve_input_device(device)
     switch = device_switch or InputDeviceSwitch(initial_device)

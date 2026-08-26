@@ -39,6 +39,16 @@ def test_wake_model_is_trimmed_and_bounded_in_the_public_snapshot():
     assert publisher.snapshot()["wake_model"] == ("wake" * 40)[:128]
 
 
+def test_wake_model_is_runtime_settable_bounded_and_clearable():
+    publisher = StatePublisher(clock=lambda: _dt(0))
+
+    publisher.set_wake_model(f"  {'wake' * 40}  ")
+    assert publisher.snapshot()["wake_model"] == ("wake" * 40)[:128]
+
+    publisher.set_wake_model(None)
+    assert publisher.snapshot()["wake_model"] is None
+
+
 def test_state_transitions_stamp_changes_and_ignore_noops():
     now = [_dt(0)]
     events = []

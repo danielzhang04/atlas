@@ -426,6 +426,29 @@ def _emit_ui_url(authorizer: stateserver.PairingAuthorizer, port: int) -> str:
     return url
 
 
+def _engage_wake(
+    session: Any | None,
+    *,
+    session_started: bool,
+    publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
+    addressing: router.Addressing,
+) -> None:
+    """Publish a wake immediately; use session audio only once it is ready."""
+    already = engagement.state == engagement_mod.ENGAGED
+    engagement.wake()
+    addressing.mark_activity()
+    if not already:
+        publisher.start_session()
+        publisher.set_state(state.LISTENING)
+        publisher.add_line("atlas", WAKE_LINE)
+    if not session_started or session is None:
+        return
+    session.input.set_audio_enabled(True)
+    if not already:
+        session.say(WAKE_LINE, add_to_chat_ctx=False)
+
+
 async def entrypoint(ctx: JobContext) -> None:
     jobobject.assign_current_process()
     wakeword.shutting_down.clear()
@@ -443,6 +466,7 @@ async def entrypoint(ctx: JobContext) -> None:
     publisher = state.StatePublisher(voice=cfg.get("active_voice"))
     loop = asyncio.get_running_loop()
     session: Any | None = None
+    session_started = False
     mcp_task: asyncio.Task | None = None
     work_task: asyncio.Task | None = None
     engagement: engagement_mod.Engagement | None = None
@@ -540,6 +564,37 @@ async def entrypoint(ctx: JobContext) -> None:
             restart_coalescer.request,
         )
 
+        def _engage() -> None:
+            _engage_wake(
+                session,
+                session_started=session_started,
+                publisher=publisher,
+                engagement=engagement,
+                addressing=addressing,
+            )
+
+        def _on_wake() -> None:
+            loop.call_soon_threadsafe(_engage)
+
+        def _on_audio_signal(value: float, bands: list[float]) -> None:
+            loop.call_soon_threadsafe(publisher.set_audio_signal, value, bands)
+
+        threading.Thread(
+            target=wakeword.listen,
+            args=(_on_wake, cfg["wake_model"]),
+            kwargs={
+                "device": cfg.get("wake_input_device"),
+                "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
+                "patience": cfg.get("wake_patience", wakeword.PATIENCE),
+                "on_signal": _on_audio_signal,
+                "bands_enabled": lambda: publisher.state != state.ASLEEP,
+                "device_switch": wake_switch,
+                "on_failure": audio_failure,
+                "on_model": _wake_model_callback(publisher, loop),
+            },
+            daemon=True,
+        ).start()
+
         services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
         pending_terminal = []
 
@@ -577,6 +632,7 @@ async def entrypoint(ctx: JobContext) -> None:
             tools=[],
         )
         await session.start(agent=agent, room=ctx.room)
+        session_started = True
         publisher.ready = True
         for terminal_job in pending_terminal:
             _announce_terminal(terminal_job, publisher, session, engagement, addressing)
@@ -607,26 +663,9 @@ async def entrypoint(ctx: JobContext) -> None:
         def _sleep(announce: bool = True) -> bool:
             return _sleep_session(session, publisher, announce=announce)
 
-        def _engage() -> None:
-            already = engagement.state == engagement_mod.ENGAGED
-            engagement.wake()
-            addressing.mark_activity()
-            session.input.set_audio_enabled(True)
-            if not already:
-                publisher.start_session()
-                publisher.set_state(state.LISTENING)
-                session.say(WAKE_LINE, add_to_chat_ctx=False)
-                publisher.add_line("atlas", WAKE_LINE)
-
         @session.on("agent_state_changed")
         def _on_agent_state(event) -> None:
             _apply_agent_state(engagement, publisher, event.new_state)
-
-        def _on_wake() -> None:
-            loop.call_soon_threadsafe(_engage)
-
-        def _on_audio_signal(value: float, bands: list[float]) -> None:
-            loop.call_soon_threadsafe(publisher.set_audio_signal, value, bands)
 
         intents = _load_intents()
 
@@ -652,21 +691,6 @@ async def entrypoint(ctx: JobContext) -> None:
         _BG_TASKS.add(sleep_task)
         sleep_task.add_done_callback(_BG_TASKS.discard)
 
-        threading.Thread(
-            target=wakeword.listen,
-            args=(_on_wake, cfg["wake_model"]),
-            kwargs={
-                "device": cfg.get("wake_input_device"),
-                "threshold": cfg.get("wake_threshold", wakeword.THRESHOLD),
-                "patience": cfg.get("wake_patience", wakeword.PATIENCE),
-                "on_signal": _on_audio_signal,
-                "bands_enabled": lambda: publisher.state != state.ASLEEP,
-                "device_switch": wake_switch,
-                "on_failure": audio_failure,
-                "on_model": _wake_model_callback(publisher, loop),
-            },
-            daemon=True,
-        ).start()
     except BaseException:
         try:
             await asyncio.shield(_shutdown())

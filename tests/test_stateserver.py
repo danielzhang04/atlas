@@ -322,6 +322,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         "address_window_s": 10,
         "state_port": 0,
         "wake_input_device": "Desk microphone",
+        "wake_model": "hey_atlas",
     }
     monkeypatch.setattr(app, "TEXT_MODE", True)
     monkeypatch.setattr(app, "_cfg", lambda: cfg)
@@ -348,6 +349,13 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     )
     monkeypatch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))
     monkeypatch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+    monkeypatch.setattr(
+        app.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(
+            start=lambda: calls.append("wake-listener-started")
+        ),
+    )
     monkeypatch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
     monkeypatch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
     monkeypatch.setattr(app, "_build_tts", lambda _cfg: object())
@@ -376,10 +384,40 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         "wake-resolved",
         "wake-switch-created",
         "audio-status",
+        "wake-listener-started",
         "mcp-scheduled",
         "work-scheduled",
         "livekit-connected",
         "session-started",
+    ]
+
+
+def test_wake_before_session_exists_publishes_listening_without_speaking():
+    from worker import app
+
+    events = []
+    publisher = SimpleNamespace(
+        start_session=lambda: events.append("session-started"),
+        set_state=lambda value: events.append(("state", value)),
+        add_line=lambda role, text: events.append(("line", role, text)),
+    )
+    engagement = app.engagement_mod.Engagement(30)
+    addressing = SimpleNamespace(mark_activity=lambda: events.append("activity"))
+
+    app._engage_wake(
+        None,
+        session_started=False,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+    )
+
+    assert engagement.state == app.engagement_mod.ENGAGED
+    assert events == [
+        "activity",
+        "session-started",
+        ("state", app.state.LISTENING),
+        ("line", "atlas", app.WAKE_LINE),
     ]
 
 
@@ -472,6 +510,7 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
             "engagement_timeout_s": 30,
             "address_window_s": 10,
             "state_port": 0,
+            "wake_model": "hey_atlas",
         }
         with monkeypatch.context() as patch:
             patch.setattr(app, "TEXT_MODE", True)
@@ -485,6 +524,11 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
             patch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
             patch.setattr(app.devicewatch, "AudioRestartCoalescer", lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None))
             patch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+            patch.setattr(
+                app.threading,
+                "Thread",
+                lambda **_kwargs: SimpleNamespace(start=lambda: None),
+            )
             patch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
             patch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
             patch.setattr(app, "_build_tts", lambda _cfg: object())
