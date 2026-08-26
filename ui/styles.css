@@ -260,12 +260,14 @@ main {
 }
 
 .engine-card {
+  --engine-field: #070a10;
   position: relative;
   display: grid;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) 42px;
   overflow: hidden;
-  background: var(--field);
+  background: radial-gradient(circle at 50% 44%, rgb(30 52 67 / 28%), transparent 55%), var(--engine-field);
+  box-shadow: inset 0 0 42px rgb(66 226 255 / 3%);
 }
 
 .panel-label {
