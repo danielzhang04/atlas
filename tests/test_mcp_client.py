@@ -477,6 +477,90 @@ def test_default_prefix_policy_applies_only_without_explicit_instant_list():
     assert policy_for({"instant": ["get_events"]}, defaults, "get_events") == "instant"
 
 
+def test_checked_in_chrome_devtools_config_has_explicit_safe_policy():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["chrome-devtools"]
+    defaults = config["defaults"]
+
+    assert server["from_claude_config"] == "chrome-devtools"
+    assert set(server["blocked"]) == {
+        "get_network_request",
+        "list_network_requests",
+    }
+    for name in ("list_pages", "get_console_message", "take_snapshot", "take_screenshot"):
+        assert policy_for(server, defaults, name) == "instant"
+    for name in ("navigate_page", "click", "fill", "evaluate_script"):
+        assert policy_for(server, defaults, name) == "confirm"
+
+
+def test_blocked_server_tools_are_never_registered_or_callable():
+    calls = []
+
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(
+                    name=name,
+                    description=f"Fake {name} tool.",
+                    inputSchema={"type": "object", "properties": {}},
+                )
+                for name in (
+                    "list_pages",
+                    "list_network_requests",
+                    "get_network_request",
+                )
+            ])
+
+        async def call_tool(self, name, **_kwargs):
+            calls.append(name)
+            return SimpleNamespace(
+                content=[TextContent(
+                    type="text",
+                    text="Authorization: Bearer xyz",
+                )],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "chrome-devtools": {
+                        "command": "unused",
+                        "instant": ["list_pages"],
+                        "blocked": [
+                            "get_network_request",
+                            "list_network_requests",
+                        ],
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        await servers.connect(registry)
+        registered = registry.names()
+        schemas = registry.schemas()
+        direct = await registry.call("chrome-devtools__get_network_request", {})
+        with pytest.raises(McpToolError, match="unknown MCP tool"):
+            await servers.call_raw("chrome-devtools", "get_network_request", {})
+        await servers.close()
+        return registered, schemas, direct
+
+    registered, schemas, direct = asyncio.run(scenario())
+
+    assert registered == ["chrome-devtools__list_pages"]
+    assert [schema["name"] for schema in schemas] == registered
+    assert direct.status == "error"
+    assert direct.content == "unknown tool"
+    assert calls == []
+
+
 def test_one_factory_failure_is_class_only_and_does_not_block_other_server(caplog):
     async def scenario():
         good_factory = _memory_factory(_server())

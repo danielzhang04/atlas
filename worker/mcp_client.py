@@ -83,6 +83,15 @@ def policy_for(server_cfg: Mapping, defaults: Mapping, tool_name: str) -> Policy
     return "instant" if any(tool_name.startswith(prefix) for prefix in prefixes) else "confirm"
 
 
+def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
+    blocked = server_cfg.get("blocked", ())
+    if not isinstance(blocked, (list, tuple)) or not all(
+        isinstance(name, str) and name for name in blocked
+    ):
+        raise ValueError("invalid MCP blocked tool list")
+    return frozenset(blocked)
+
+
 @asynccontextmanager
 async def _stdio_session(
     _server_name: str,
@@ -191,9 +200,11 @@ class McpServers:
                 spec = self._resolve_spec(server_cfg)
                 session = await stack.enter_async_context(self._session_factory(name, spec))
                 listed = await session.list_tools()
+                blocked = _blocked_tools(server_cfg)
                 mirrored = [
                     self._mirror_tool(name, server_cfg, defaults, session, tool)
                     for tool in listed.tools
+                    if tool.name not in blocked
                 ]
                 for tool in mirrored:
                     registry.register(tool)
@@ -290,6 +301,8 @@ class McpServers:
         tool: str,
         arguments: Mapping[str, Any],
     ) -> str:
+        if tool in _blocked_tools(server_cfg):
+            raise McpToolError("unknown MCP tool")
         call_arguments = dict(arguments)
         account_param = server_cfg.get("account_param")
         if account_param is not None:

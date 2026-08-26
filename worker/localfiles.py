@@ -12,7 +12,7 @@ import stat
 import time
 from typing import Callable, Mapping, Sequence
 
-from .desktopapps import known_folder_path
+from .desktopapps import _launch_folder, known_folder_path
 
 __all__ = ["LocalFiles"]
 logger = logging.getLogger("atlas.localfiles")
@@ -108,6 +108,7 @@ class LocalFiles:
         self, roots: Sequence[Path | str], *,
         clock: Callable[[], float] = time.monotonic,
         opener: Callable[[str], object] = os.startfile,
+        folder_opener: Callable[[str], object] = _launch_folder,
         known_folder_resolver: Callable[[str], Path] = known_folder_path,
     ) -> None:
         if not roots:
@@ -118,6 +119,7 @@ class LocalFiles:
         )
         self._clock = clock
         self._opener = opener
+        self._folder_opener = folder_opener
 
     @property
     def folders(self) -> Mapping[str, Path]:
@@ -305,6 +307,13 @@ class LocalFiles:
         if not resolved.is_file() or resolved.suffix.casefold() not in _OPENABLE_EXTENSIONS:
             raise ValueError("not an openable document")
         self._opener(str(resolved))
+        return {"opened": str(resolved)}
+
+    def open_folder(self, path: str | Path) -> dict:
+        resolved = self.resolve(path)
+        if not resolved.is_dir():
+            raise ValueError("not a directory")
+        self._folder_opener(str(resolved))
         return {"opened": str(resolved)}
 
     def read(self, path: str | Path, max_bytes: int = _READ_CAP_BYTES) -> dict:

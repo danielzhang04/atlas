@@ -262,6 +262,49 @@ def test_open_exe_and_focus_use_signed_profiles():
     assert result.status == "error" and result.content == "unknown app"
 
 
+def test_open_prefers_spotify_desktop_profile_and_falls_back_to_web():
+    from worker.desktopapps import DesktopAppError
+
+    opened = []
+    profiles = []
+    apps = {
+        "spotify": AppEntry(
+            exe="spotify",
+            url="https://open.spotify.com/",
+            words=("spotify", "music"),
+        ),
+    }
+
+    registry = ToolRegistry()
+    builtin(
+        registry,
+        apps,
+        _FakeWork(),
+        opener=opened.append,
+        profile_opener=lambda app_id, url: profiles.append((app_id, url)),
+    )
+    result = _call(registry, "open", {"target": "spotify"})
+    assert json.loads(result.content) == {"opened": "spotify"}
+    assert profiles == [("spotify", None)]
+    assert opened == []
+
+    registry = ToolRegistry()
+
+    def unavailable(_app_id, _url):
+        raise DesktopAppError("unavailable")
+
+    builtin(
+        registry,
+        apps,
+        _FakeWork(),
+        opener=opened.append,
+        profile_opener=unavailable,
+    )
+    result = _call(registry, "open", {"target": "spotify"})
+    assert json.loads(result.content) == {"opened": "spotify"}
+    assert opened == ["https://open.spotify.com/"]
+
+
 def test_file_and_close_builtins_delegate_to_confined_services():
     calls = []
 
@@ -272,6 +315,10 @@ def test_file_and_close_builtins_delegate_to_confined_services():
 
         def open(self, path):
             calls.append(("open_file", path))
+            return {"opened": path}
+
+        def open_folder(self, path):
+            calls.append(("open_folder", path))
             return {"opened": path}
 
         async def read_file(self, path):
@@ -293,18 +340,21 @@ def test_file_and_close_builtins_delegate_to_confined_services():
 
     found = _call(registry, "find_file", {"query": "report"})
     opened = _call(registry, "open_file", {"path": "C:/Desk/report.csv"})
+    opened_folder = _call(registry, "open_folder", {"path": "C:/Desk"})
     read = _call(registry, "read_file", {"path": "C:/Desk/report.csv"})
     closed = _call(registry, "close", {"app": "editor"})
     url_close = _call(registry, "close", {"app": "gmail"})
 
     assert json.loads(found.content)[0]["path"] == "C:/Desk/report.csv"
     assert json.loads(opened.content) == {"opened": "C:/Desk/report.csv"}
+    assert json.loads(opened_folder.content) == {"opened": "C:/Desk"}
     assert json.loads(read.content)["text"] == "abc"
     assert json.loads(closed.content) == {"closed": "vscode"}
     assert url_close == ToolResult("error", "I can close apps, not browser tabs")
     assert calls == [
         ("find", "report"),
         ("open_file", "C:/Desk/report.csv"),
+        ("open_folder", "C:/Desk"),
         ("read_file", "C:/Desk/report.csv"),
         ("close", "vscode"),
     ]
@@ -350,7 +400,9 @@ def test_file_builtins_are_absent_without_configured_roots():
 
     builtin(registry, {}, _FakeWork())
 
-    assert not {"find_file", "open_file", "read_file"}.intersection(registry.names())
+    assert not {"find_file", "open_file", "open_folder", "read_file"}.intersection(
+        registry.names()
+    )
     assert "close" in registry.names()
 
 
@@ -405,6 +457,7 @@ def test_open_atlas_uses_the_static_alias_without_a_paired_url():
         ("close", {"app": "editor"}),
         ("focus", {"app": "editor"}),
         ("open_file", {"path": "C:/Desk/report.txt"}),
+        ("open_folder", {"path": "C:/Desk"}),
         ("cancel_work", {"job_id": "job-1"}),
         ("open", {"target": "https://example.com/"}),
     ],
@@ -555,6 +608,44 @@ def test_load_apps_reads_the_teachable_alias_config(tmp_path):
 
     assert apps["gmail"] == AppEntry(url="https://mail.google.com/", words=("gmail", "email"))
     assert apps["vscode"] == AppEntry(exe="vscode", words=("vs code", "editor"))
+
+
+def test_checked_in_spotify_app_has_desktop_profile_and_web_fallback():
+    from pathlib import Path
+
+    apps = load_apps(Path(__file__).parents[1] / "config" / "apps.yaml")
+
+    assert apps["spotify"] == AppEntry(
+        exe="spotify",
+        url="https://open.spotify.com/",
+        words=("spotify", "music"),
+    )
+
+
+def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "kb"
+    allowed = root / "notes"
+    outside = tmp_path / "outside"
+    document = root / "notes.txt"
+    allowed.mkdir(parents=True)
+    outside.mkdir()
+    document.write_text("notes", encoding="utf-8")
+    launched = []
+    files = LocalFiles([root], folder_opener=launched.append)
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=files)
+
+    for accepted in (root, allowed):
+        result = _call(registry, "open_folder", {"path": str(accepted)})
+        assert json.loads(result.content) == {"opened": str(accepted.resolve())}
+    assert launched == [str(root.resolve()), str(allowed.resolve())]
+
+    for refused in (outside, document):
+        result = _call(registry, "open_folder", {"path": str(refused)})
+        assert result == ToolResult("error", "ValueError")
+    assert launched == [str(root.resolve()), str(allowed.resolve())]
 
 
 def test_count_mail_sums_pages_and_accepts_both_token_shapes():

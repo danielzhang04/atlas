@@ -212,6 +212,7 @@ class ToolRegistry:
             "close",
             "focus",
             "open_file",
+            "open_folder",
             "cancel_work",
         }:
             return True
@@ -261,7 +262,7 @@ def load_apps(path: Path) -> dict[str, AppEntry]:
             raise ValueError("invalid app entry")
         words = raw.get("words")
         url, exe = raw.get("url"), raw.get("exe")
-        if (url is None) == (exe is None) or not isinstance(words, list) or not words:
+        if (url is None and exe is None) or not isinstance(words, list) or not words:
             raise ValueError(f"invalid app entry: {name}")
         if not all(isinstance(word, str) and word.strip() for word in words):
             raise ValueError(f"invalid app words: {name}")
@@ -293,11 +294,18 @@ def builtin(
         entry = aliases.get(target.casefold())
         if entry is not None:
             name, app = entry
-            if app.url is not None:
+            if app.exe is not None:
+                try:
+                    profile_opener(app.exe, None)
+                except desktopapps.DesktopAppError:
+                    if app.url is None:
+                        raise
+                    opener(app.url)
+            elif app.url is not None:
                 dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
                 opener(dynamic_url or app.url)
             else:
-                profile_opener(app.exe or "", None)
+                return ToolResult("error", "unknown app")
             return {"opened": name}
         if _direct_https(target):
             opener(target)
@@ -352,6 +360,10 @@ def builtin(
         path = _text_argument(arguments, "path", maximum=2048)
         return files.open(path)
 
+    async def open_folder(arguments: dict) -> dict:
+        path = _text_argument(arguments, "path", maximum=2048)
+        return files.open_folder(path)
+
     async def read_file(arguments: dict) -> dict:
         path = _text_argument(arguments, "path", maximum=2048)
         return await files.read_file(path)
@@ -376,6 +388,9 @@ def builtin(
             ("open_file", "Open an inert document or media file under configured roots.", {
                 "path": {"type": "string"},
             }, open_file),
+            ("open_folder", "Open a directory under configured roots in Explorer.", {
+                "path": {"type": "string"},
+            }, open_folder),
             ("read_file", "Read small text or route previewed large-file analysis to launch_work.", {
                 "path": {"type": "string"},
             }, read_file),

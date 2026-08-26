@@ -11,4 +11,4 @@ apps:
   vscode:    {exe: vscode,                        words: [vs code, vscode, code, editor]}
   terminal:  {exe: wt,                            words: [terminal, windows terminal, shell]}
   notepad:   {exe: notepad,                       words: [notepad]}
-  spotify:   {url: https://open.spotify.com/,     words: [spotify, music]}
+  spotify:   {exe: spotify, url: https://open.spotify.com/, words: [spotify, music]}
