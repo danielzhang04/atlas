@@ -35,6 +35,41 @@ RESTART_BURST_WINDOW_S = 10.0 * 60.0
 MAX_RESTARTS_PER_BURST = 3
 APP_USER_MODEL_ID = "Atlas.Desktop"
 ATLAS_ICON = ATLAS / "ui" / "atlas.ico"
+GWL_STYLE = -16
+WS_CAPTION, WS_THICKFRAME = 0x00C00000, 0x00040000
+WS_MINIMIZEBOX, WS_MAXIMIZEBOX = 0x00020000, 0x00010000
+WM_NCCALCSIZE, WM_NCHITTEST, WM_NCDESTROY = 0x0083, 0x0084, 0x0082
+HTLEFT, HTRIGHT, HTTOP = 10, 11, 12
+HTTOPLEFT, HTTOPRIGHT, HTBOTTOM = 13, 14, 15
+HTBOTTOMLEFT, HTBOTTOMRIGHT = 16, 17
+MONITOR_DEFAULTTONEAREST = 2
+SWP_FRAMECHANGED, SWP_NOACTIVATE = 0x0020, 0x0010
+SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER = 0x0002, 0x0001, 0x0004
+_native_window_hooks = {}
+class _WindowRect(ctypes.Structure): _fields_ = [(name, ctypes.c_long) for name in ("left", "top", "right", "bottom")]
+class _NCCalcSizeParams(ctypes.Structure): _fields_ = [("rects", _WindowRect * 3), ("window_pos", ctypes.c_void_p)]
+class _MonitorInfo(ctypes.Structure): _fields_ = [("size", wintypes.DWORD), ("monitor", _WindowRect),
+                                                  ("work", _WindowRect), ("flags", wintypes.DWORD)]
+def _frameless_window_style(style: int) -> int:
+    return (style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX) & ~WS_CAPTION
+def _resize_hit_test(x: int, y: int, bounds, border: int = 8) -> int | None:
+    left, top, right, bottom = bounds
+    if not (left <= x < right and top <= y < bottom): return None
+    horizontal = HTLEFT if x < left + border else HTRIGHT if x >= right - border else None
+    vertical = HTTOP if y < top + border else HTBOTTOM if y >= bottom - border else None
+    corners = {(HTLEFT, HTTOP): HTTOPLEFT, (HTRIGHT, HTTOP): HTTOPRIGHT,
+               (HTLEFT, HTBOTTOM): HTBOTTOMLEFT, (HTRIGHT, HTBOTTOM): HTBOTTOMRIGHT}
+    return corners.get((horizontal, vertical)) or horizontal or vertical
+def _rect_tuple(rect): return rect.left, rect.top, rect.right, rect.bottom
+def _client_rect(proposed, work_area, maximized: bool):
+    if not maximized: return proposed
+    left, top, right, bottom = proposed
+    work_left, work_top, work_right, work_bottom = work_area
+    return max(left, work_left), max(top, work_top), min(right, work_right), min(bottom, work_bottom)
+def _window_long(call, args, set_last_error, get_last_error):
+    set_last_error(0); result = call(*args); error = get_last_error()
+    if result == 0 and error: raise OSError(error, "Windows window-style call failed")
+    return result
 def _set_app_user_model_id(*, shell32=None) -> None:
     try:
         if (shell32 or ctypes.windll.shell32).SetCurrentProcessExplicitAppUserModelID(
@@ -49,6 +84,79 @@ def _set_window_icon(window, *, icon_factory=None) -> None:
         window.native.Icon = icon_factory(str(ATLAS_ICON))
     except Exception:
         logger.warning("could not set the Atlas Windows window icon")
+def _native_window_hook(native, user32):
+    from System import IntPtr
+    from System.Windows.Forms import FormWindowState, NativeWindow
+    hwnd = native.Handle.ToInt64()
+    class AtlasNativeWindow(NativeWindow):
+        def WndProc(self, message):
+            if message.Msg == WM_NCCALCSIZE:
+                if native.WindowState == FormWindowState.Maximized:
+                    info = _MonitorInfo(size=ctypes.sizeof(_MonitorInfo))
+                    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                    if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                        extended = bool(message.WParam.ToInt64())
+                        rect_type = _NCCalcSizeParams if extended else _WindowRect
+                        proposed = ctypes.cast(message.LParam.ToInt64(), ctypes.POINTER(rect_type)).contents
+                        rect = proposed.rects[0] if extended else proposed
+                        rect.left, rect.top, rect.right, rect.bottom = _client_rect(
+                            _rect_tuple(rect), _rect_tuple(info.work), True)
+                message.Result = IntPtr.Zero
+                return
+            if message.Msg == WM_NCHITTEST and native.WindowState != FormWindowState.Maximized:
+                rect = _WindowRect()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    packed = message.LParam.ToInt64()
+                    x, y = ctypes.c_short(packed & 0xffff).value, ctypes.c_short((packed >> 16) & 0xffff).value
+                    hit = _resize_hit_test(x, y, _rect_tuple(rect))
+                    if hit is not None:
+                        message.Result = IntPtr(hit)
+                        return
+            if message.Msg == WM_NCDESTROY:
+                try:
+                    super().WndProc(message)
+                finally:
+                    self.ReleaseHandle()
+                    if _native_window_hooks.get(hwnd) is self: _native_window_hooks.pop(hwnd)
+                return
+            super().WndProc(message)
+    hook = AtlasNativeWindow(); hook.AssignHandle(native.Handle)
+    return hook
+def _configure_native_window(window, *, user32=None, hook_factory=_native_window_hook,
+                             set_last_error=None, get_last_error=None) -> None:
+    hook = hwnd = None
+    try:
+        native = window.native
+        if getattr(native, "InvokeRequired", False):
+            from System import Action
+            native.Invoke(Action(lambda: _configure_native_window(window, user32=user32,
+                                                                  hook_factory=hook_factory)))
+            return
+        hwnd = native.Handle.ToInt64()
+        if user32 is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetWindowLongW.argtypes, user32.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
+            user32.SetWindowLongW.argtypes, user32.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.GetWindowRect.argtypes, user32.GetWindowRect.restype = [wintypes.HWND, ctypes.POINTER(_WindowRect)], wintypes.BOOL
+            user32.MonitorFromWindow.argtypes, user32.MonitorFromWindow.restype = [wintypes.HWND, wintypes.DWORD], wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes, user32.GetMonitorInfoW.restype = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)], wintypes.BOOL
+        set_error, get_error = set_last_error or ctypes.set_last_error, get_last_error or ctypes.get_last_error
+        style = _frameless_window_style(_window_long(user32.GetWindowLongW, (hwnd, GWL_STYLE), set_error, get_error))
+        _window_long(user32.SetWindowLongW, (hwnd, GWL_STYLE, style), set_error, get_error)
+        hook = hook_factory(native, user32)
+        flags = SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+        if not user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags):
+            raise OSError("SetWindowPos failed")
+        previous = _native_window_hooks.get(hwnd)
+        if previous is not None and previous is not hook: previous.ReleaseHandle()
+        _native_window_hooks[hwnd] = hook
+    except Exception:
+        if hook is not None and _native_window_hooks.get(hwnd) is not hook:
+            with suppress(Exception): hook.ReleaseHandle()
+        logger.warning("could not configure the Atlas frameless Windows window")
 def _status_html(title: str, message: str, *, heading: str | None = None) -> str:
     return f"""<!doctype html>
 <html lang="en">
@@ -100,32 +208,7 @@ class WindowApi:
 
     def __init__(self) -> None:
         self._window = None
-        self._maximized = False
-        self._restore_bounds = None
         self._lock = Lock()
-
-    @staticmethod
-    def _number(value, lower_name: str, upper_name: str):
-        number = getattr(value, lower_name, None)
-        if number is None:
-            number = getattr(value, upper_name, None)
-        return number
-
-    @classmethod
-    def _screen_bounds(cls, screen):
-        if screen is None:
-            return None
-        frame = getattr(screen, "frame", None)
-        source = frame if frame is not None else screen
-        x = cls._number(source, "x", "X")
-        y = cls._number(source, "y", "Y")
-        width = cls._number(source, "width", "Width")
-        height = cls._number(source, "height", "Height")
-        if None in (x, y, width, height):
-            return None
-        if width <= 0 or height <= 0:
-            return None
-        return int(x), int(y), int(width), int(height)
 
     def minimize(self) -> None:
         if self._window is not None:
@@ -133,34 +216,19 @@ class WindowApi:
 
     def toggle_maximize(self) -> None:
         window = self._window
-        if window is None:
-            return
+        if window is None: return
         with self._lock:
-            if self._maximized:
-                if self._restore_bounds is None:
-                    return
-                x, y, width, height = self._restore_bounds
-                window.resize(width, height)
-                window.move(x, y)
-                self._restore_bounds = None
-                self._maximized = False
-                return
+            native = getattr(window, "native", None)
+            if native is None: return
             try:
-                screens = webview.screens
+                from System import Action
+                def toggle():
+                    states = type(native.WindowState)
+                    native.WindowState = (states.Normal if native.WindowState == states.Maximized
+                                          else states.Maximized)
+                native.Invoke(Action(toggle))
             except Exception:
-                screens = []
-            screen = screens[0] if screens else getattr(window, "screen", None)
-            bounds = self._screen_bounds(screen)
-            if bounds is None:
-                return
-            current = (window.x, window.y, window.width, window.height)
-            if None in current:
-                return
-            self._restore_bounds = tuple(int(value) for value in current)
-            x, y, width, height = bounds
-            window.resize(width, height)
-            window.move(x, y)
-            self._maximized = True
+                logger.warning("could not toggle the Atlas Windows window state")
 
     def request_close(self) -> None:
         if self._window is not None:
@@ -421,6 +489,7 @@ def _capture_ui_url(stream: TextIO, result: Queue[str | None]) -> None:
 
 def _on_window_shown(proc, window, closing, restart) -> None:
     _set_window_icon(window)
+    _configure_native_window(window)
     _watch_child(proc, window, closing, restart)
 def run(
     *,

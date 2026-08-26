@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from queue import Queue
 import subprocess
+import sys
 from threading import Event
 from types import SimpleNamespace
 
@@ -196,9 +197,244 @@ def test_set_window_icon_uses_atlas_icon_and_swallows_failure(desktop_log):
     assert "could not set the Atlas Windows window icon" in desktop_log.getvalue()
 
 
+def test_configure_native_window_sets_style_before_refreshing_frame():
+    desktop._native_window_hooks.clear()
+    calls = []
+    handle = SimpleNamespace(ToInt64=lambda: 456)
+    native = SimpleNamespace(Handle=handle)
+    old_style = desktop.WS_CAPTION | 0x08000000
+    user32 = SimpleNamespace(
+        GetWindowLongW=lambda hwnd, index: calls.append(("get", hwnd, index)) or old_style,
+        SetWindowLongW=lambda hwnd, index, style: calls.append(
+            ("set", hwnd, index, style)) or old_style,
+        SetWindowPos=lambda *args: calls.append(("position", *args)) or True,
+    )
+    hook = object()
+
+    desktop._configure_native_window(
+        SimpleNamespace(native=native),
+        user32=user32,
+        hook_factory=lambda form, functions: calls.append(
+            ("hook", form, functions)) or hook,
+    )
+
+    expected_style = desktop._frameless_window_style(old_style)
+    assert calls[:3] == [
+        ("get", 456, desktop.GWL_STYLE),
+        ("set", 456, desktop.GWL_STYLE, expected_style),
+        ("hook", native, user32),
+    ]
+    assert calls[3][0:7] == ("position", 456, None, 0, 0, 0, 0)
+    assert calls[3][7] & desktop.SWP_FRAMECHANGED
+    assert desktop._native_window_hooks.pop(456) is hook
+
+
+@pytest.mark.parametrize("failing_call", ["get", "set"])
+def test_configure_native_window_aborts_when_window_style_call_sets_last_error(
+        failing_call, desktop_log):
+    calls = []
+    error = [0]
+    old_style = desktop.WS_CAPTION | 0x08000000
+
+    def get_window_long(*_args):
+        calls.append("get")
+        if failing_call == "get":
+            error[0] = 5
+            return 0
+        return old_style
+
+    def set_window_long(*_args):
+        calls.append("set")
+        if failing_call == "set":
+            error[0] = 5
+            return 0
+        return old_style
+
+    user32 = SimpleNamespace(
+        GetWindowLongW=get_window_long,
+        SetWindowLongW=set_window_long,
+        SetWindowPos=lambda *_args: calls.append("position") or True,
+    )
+    desktop._configure_native_window(
+        SimpleNamespace(native=SimpleNamespace(
+            Handle=SimpleNamespace(ToInt64=lambda: 456))),
+        user32=user32,
+        hook_factory=lambda *_args: calls.append("hook") or object(),
+        set_last_error=lambda value: error.__setitem__(0, value),
+        get_last_error=lambda: error[0],
+    )
+
+    assert calls == (["get"] if failing_call == "get" else ["get", "set"])
+    assert "could not configure the Atlas frameless Windows window" in desktop_log.getvalue()
+
+
+def test_frameless_window_style_enables_resize_and_system_commands():
+    unrelated_style = 0x08000000
+    style = desktop.WS_CAPTION | unrelated_style
+
+    updated = desktop._frameless_window_style(style)
+
+    assert updated & desktop.WS_THICKFRAME
+    assert updated & desktop.WS_MAXIMIZEBOX
+    assert updated & desktop.WS_MINIMIZEBOX
+    assert updated & desktop.WS_CAPTION == 0
+    assert updated & unrelated_style
+
+
+@pytest.mark.parametrize(
+    ("point", "expected"),
+    [
+        ((100, 200), desktop.HTTOPLEFT),
+        ((899, 200), desktop.HTTOPRIGHT),
+        ((100, 799), desktop.HTBOTTOMLEFT),
+        ((899, 799), desktop.HTBOTTOMRIGHT),
+        ((100, 500), desktop.HTLEFT),
+        ((107, 500), desktop.HTLEFT),
+        ((108, 500), None),
+        ((891, 500), None),
+        ((892, 500), desktop.HTRIGHT),
+        ((899, 500), desktop.HTRIGHT),
+        ((500, 200), desktop.HTTOP),
+        ((500, 799), desktop.HTBOTTOM),
+        ((500, 500), None),
+    ],
+)
+def test_resize_hit_test_uses_an_eight_pixel_window_border(point, expected):
+    assert desktop._resize_hit_test(*point, (100, 200, 900, 800)) == expected
+
+
+@pytest.mark.parametrize(
+    ("proposed", "maximized", "expected"),
+    [
+        ((100, 100, 900, 700), False, (100, 100, 900, 700)),
+        ((-8, -8, 1928, 1088), True, (0, 0, 1920, 1040)),
+        ((0, 0, 960, 1040), False, (0, 0, 960, 1040)),
+    ],
+    ids=["normal", "maximized", "snapped"],
+)
+def test_client_rect_clamps_only_maximized_windows(proposed, maximized, expected):
+    assert desktop._client_rect(proposed, (0, 0, 1920, 1040), maximized) == expected
+
+
+class _FakeIntPtr:
+    def __init__(self, value):
+        self.value = value
+
+
+_FakeIntPtr.Zero = _FakeIntPtr(0)
+
+
+class _FakeNativeWindow:
+    def __init__(self):
+        self.assigned = None
+        self.forwarded = []
+        self.released = False
+
+    def AssignHandle(self, handle):
+        self.assigned = handle
+
+    def ReleaseHandle(self):
+        self.released = True
+
+    def WndProc(self, message):
+        self.forwarded.append(message.Msg)
+
+
+class _FakeFormWindowState:
+    Normal = object()
+    Maximized = object()
+
+
+def _install_fake_system(monkeypatch):
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(IntPtr=_FakeIntPtr))
+    monkeypatch.setitem(sys.modules, "System.Windows.Forms", SimpleNamespace(
+        FormWindowState=_FakeFormWindowState,
+        NativeWindow=_FakeNativeWindow,
+    ))
+
+
+def test_native_hook_converts_managed_handle_before_typed_hit_test_call(monkeypatch):
+    _install_fake_system(monkeypatch)
+    observed_handles = []
+    prototype = desktop.ctypes.CFUNCTYPE(
+        desktop.wintypes.BOOL,
+        desktop.wintypes.HWND,
+        desktop.ctypes.POINTER(desktop._WindowRect),
+    )
+
+    @prototype
+    def get_window_rect(hwnd, rect_pointer):
+        observed_handles.append(hwnd)
+        rect = rect_pointer.contents
+        rect.left, rect.top, rect.right, rect.bottom = 100, 200, 900, 800
+        return True
+
+    managed_handle = SimpleNamespace(ToInt64=lambda: 456)
+    native = SimpleNamespace(
+        Handle=managed_handle,
+        WindowState=_FakeFormWindowState.Normal,
+    )
+    hook = desktop._native_window_hook(
+        native, SimpleNamespace(GetWindowRect=get_window_rect))
+    packed_point = (500 << 16) | 101
+    message = SimpleNamespace(
+        Msg=desktop.WM_NCHITTEST,
+        LParam=SimpleNamespace(ToInt64=lambda: packed_point),
+        Result=None,
+    )
+
+    hook.WndProc(message)
+
+    assert observed_handles == [456]
+    assert message.Result.value == desktop.HTLEFT
+
+
+def test_native_hook_releases_and_drops_itself_on_destroy(monkeypatch):
+    _install_fake_system(monkeypatch)
+    hwnd = 789
+    native = SimpleNamespace(
+        Handle=SimpleNamespace(ToInt64=lambda: hwnd),
+        WindowState=_FakeFormWindowState.Normal,
+    )
+    hook = desktop._native_window_hook(native, SimpleNamespace())
+    desktop._native_window_hooks[hwnd] = hook
+
+    hook.WndProc(SimpleNamespace(Msg=desktop.WM_NCDESTROY))
+
+    assert hook.released is True
+    assert hook.forwarded == [desktop.WM_NCDESTROY]
+    assert hwnd not in desktop._native_window_hooks
+
+
+def test_configure_native_window_replaces_the_existing_hook_for_an_hwnd():
+    desktop._native_window_hooks.clear()
+    calls = []
+    first = SimpleNamespace(ReleaseHandle=lambda: calls.append("release-first"))
+    second = SimpleNamespace(ReleaseHandle=lambda: calls.append("release-second"))
+    hooks = iter([first, second])
+    native = SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 456))
+    user32 = SimpleNamespace(
+        GetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowPos=lambda *_args: True,
+    )
+
+    for _ in range(2):
+        desktop._configure_native_window(
+            SimpleNamespace(native=native), user32=user32,
+            hook_factory=lambda *_args: next(hooks))
+
+    assert calls == ["release-first"]
+    assert desktop._native_window_hooks.pop(456) is second
+
+
 def test_window_shown_sets_icon_before_watching(monkeypatch):
     calls = []
     monkeypatch.setattr(desktop, "_set_window_icon", lambda window: calls.append(("icon", window)))
+    monkeypatch.setattr(
+        desktop, "_configure_native_window",
+        lambda window: calls.append(("native", window)),
+    )
     monkeypatch.setattr(
         desktop, "_watch_child",
         lambda proc, window, closing, restart: calls.append(
@@ -210,6 +446,7 @@ def test_window_shown_sets_icon_before_watching(monkeypatch):
 
     assert calls == [
         ("icon", window),
+        ("native", window),
         ("watch", proc, window, closing, restart),
     ]
 
@@ -401,19 +638,64 @@ def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch
     )]
 
 
-def test_native_window_api_toggles_work_area_and_restores_saved_bounds(monkeypatch):
-    work_area = SimpleNamespace(X=0, Y=0, Width=1920, Height=1040)
-    screen = SimpleNamespace(frame=work_area)
+def test_native_window_api_toggles_native_maximized_state_through_invoke(monkeypatch):
+    class WindowState:
+        pass
+
+    WindowState.Normal = WindowState()
+    WindowState.Maximized = WindowState()
+
+    calls = []
+
+    class Native:
+        def __init__(self):
+            self._state = WindowState.Normal
+            self.invoking = False
+
+        @property
+        def WindowState(self):
+            return self._state
+
+        @WindowState.setter
+        def WindowState(self, value):
+            assert self.invoking
+            calls.append(("state", value))
+            self._state = value
+
+        def Invoke(self, action):
+            calls.append(("invoke", action))
+            self.invoking = True
+            try:
+                action()
+            finally:
+                self.invoking = False
+
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda action: action))
     window = FakeWindow()
+    window.native = Native()
     api = desktop.WindowApi()
     api._window = window
-    monkeypatch.setattr(desktop, "webview", SimpleNamespace(screens=[screen]))
 
     api.toggle_maximize()
+    assert window.native.WindowState is WindowState.Maximized
     api.toggle_maximize()
 
-    assert window.resize_calls == [(1920, 1040), (1100, 760)]
-    assert window.move_calls == [(0, 0), (100, 120)]
+    assert window.native.WindowState is WindowState.Normal
+    assert [call[0] for call in calls] == ["invoke", "state", "invoke", "state"]
+
+
+def test_native_window_api_logs_invoke_failure(monkeypatch, desktop_log):
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda action: action))
+    native = SimpleNamespace(
+        WindowState=SimpleNamespace(),
+        Invoke=lambda _action: (_ for _ in ()).throw(OSError("invoke failed")),
+    )
+    api = desktop.WindowApi()
+    api._window = SimpleNamespace(native=native)
+
+    api.toggle_maximize()
+
+    assert "could not toggle the Atlas Windows window state" in desktop_log.getvalue()
 
 
 def test_run_replaces_exit_21_child_and_loads_new_worker_url_in_same_window():
