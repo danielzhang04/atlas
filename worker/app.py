@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Any, Awaitable, Callable
 
 import yaml
@@ -202,16 +203,28 @@ async def _submit_voice_turn(
     publisher.add_line("user", text, source=source)
     publisher.set_state(state.THINKING)
     spoken: list[str] = []
+    respond_started: float | None = None
 
     async def _tee():
+        nonlocal respond_started
         response = brain.respond(text, context=context) if context is not None else brain.respond(text)
         async for chunk in response:
+            if respond_started is None:
+                respond_started = time.perf_counter()
             spoken.append(chunk)
             yield chunk
 
+    responded = False
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
+        responded = True
     finally:
+        from worker import traces as traces_mod
+        traces_mod.record_current_respond(
+            ms=(round((time.perf_counter() - respond_started) * 1000)
+                if respond_started is not None else 0),
+            ok=responded,
+        )
         if engagement.state == engagement_mod.ENGAGED:
             publisher.set_state(state.LISTENING)
     response = "".join(spoken)
@@ -263,7 +276,7 @@ async def _handle_reflex(
     return True
 
 
-async def _handle_audio_turn(
+async def _handle_audio_turn_inner(
     text: str,
     *,
     intents: dict,
@@ -275,6 +288,8 @@ async def _handle_audio_turn(
     sleep,
     turn_ownership: TurnOwnership | None = None,
     source: str = "speech",
+    _trace=None,
+    _trace_meta: dict | None = None,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
@@ -283,6 +298,26 @@ async def _handle_audio_turn(
         raise ValueError("turn source must be speech or typed")
     line_source = "typed" if source == "typed" else None
     ownership = turn_ownership or TurnOwnership()
+    route_started = time.perf_counter()
+    route_recorded = False
+
+    def _record_route() -> None:
+        nonlocal route_recorded
+        if _trace is not None and not route_recorded:
+            _trace[0].route(
+                _trace[1],
+                ms=round((time.perf_counter() - route_started) * 1000),
+                ok=True,
+            )
+            route_recorded = True
+
+    def _mark(*, addressed: bool, wake_kind: str, outcome: str) -> None:
+        if _trace_meta is not None:
+            _trace_meta.update(
+                addressed=addressed, wake_kind=wake_kind, outcome=outcome,
+            )
+        _record_route()
+
     lane, intent = router.route(text, intents)
 
     def _dismiss() -> None:
@@ -292,6 +327,7 @@ async def _handle_audio_turn(
         sleep()
 
     if lane == "reflex" and intent == "dismiss":
+        _mark(addressed=False, wake_kind="reflex", outcome="dismissed")
         await _handle_reflex(
             text,
             intents=intents,
@@ -306,6 +342,7 @@ async def _handle_audio_turn(
             source == "typed" or ownership.in_flight or _address_window_open(addressing)
         )
         if cancel_allowed:
+            _mark(addressed=False, wake_kind="reflex", outcome="cancelled")
             await _handle_reflex(
                 text,
                 intents=intents,
@@ -318,16 +355,25 @@ async def _handle_audio_turn(
             return ""
     previous = engagement.state
     if engagement.tick() != engagement_mod.ENGAGED:
+        _mark(addressed=False, wake_kind="ambient", outcome="asleep")
         if previous == engagement_mod.ENGAGED:
             sleep(announce=False)
         return ""
     normalized = router.normalize(text)
     if lane == "reflex" and intent == "cancel":
+        _mark(addressed=False, wake_kind="ambient", outcome="ignored")
         publisher.add_line("ambient", text)
         return ""
+    reply_window = _address_window_open(addressing)
     if source != "typed" and not addressing.is_addressed(normalized):
+        _mark(addressed=False, wake_kind="ambient", outcome="ignored")
         publisher.add_line("ambient", text)
         return ""
+    _mark(
+        addressed=True,
+        wake_kind="reply" if reply_window else "wake",
+        outcome="error",
+    )
     engagement.interacted()
     if lane == "reflex" and intent == "repeat":
         def _repeated() -> None:
@@ -366,6 +412,73 @@ async def _handle_audio_turn(
     return await ownership.run(_respond)
 
 
+async def _handle_audio_turn(
+    text: str,
+    *,
+    intents: dict,
+    brain: brain_mod.Brain,
+    session,
+    publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
+    addressing: router.Addressing,
+    sleep,
+    turn_ownership: TurnOwnership | None = None,
+    source: str = "speech",
+    trace_recorder=None,
+) -> str:
+    if trace_recorder is None or not isinstance(text, str) or not text.strip():
+        return await _handle_audio_turn_inner(
+            text,
+            intents=intents,
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=sleep,
+            turn_ownership=turn_ownership,
+            source=source,
+        )
+
+    from worker import traces as traces_mod
+    started = time.perf_counter()
+    metadata = {"addressed": False, "wake_kind": "ambient", "outcome": "error"}
+    turn = trace_recorder.begin_turn(wake_kind="ambient")
+    token = traces_mod.activate(trace_recorder, turn)
+    try:
+        response = await _handle_audio_turn_inner(
+            text,
+            intents=intents,
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=sleep,
+            turn_ownership=turn_ownership,
+            source=source,
+            _trace=(trace_recorder, turn),
+            _trace_meta=metadata,
+        )
+        if metadata["addressed"] and metadata["outcome"] == "error":
+            metadata["outcome"] = "responded"
+        return response
+    except asyncio.CancelledError:
+        metadata["outcome"] = "cancelled"
+        raise
+    except Exception:
+        if metadata["addressed"]:
+            metadata["outcome"] = "speech_failed"
+        raise
+    finally:
+        traces_mod.reset(token)
+        trace_recorder.end_turn(
+            turn,
+            **metadata,
+            total_ms=round((time.perf_counter() - started) * 1000),
+        )
+
+
 async def _handle_typed_turn(
     text: str,
     *,
@@ -379,6 +492,7 @@ async def _handle_typed_turn(
     engage,
     sleep,
     turn_ownership: TurnOwnership | None = None,
+    trace_recorder=None,
 ) -> str:
     """Route deliberate UI text through the same guarded turn path as speech."""
     if not ready:
@@ -396,6 +510,7 @@ async def _handle_typed_turn(
         sleep=sleep,
         turn_ownership=turn_ownership,
         source="typed",
+        trace_recorder=trace_recorder,
     )
 
 
@@ -444,7 +559,7 @@ def _record_tool(
 def _terminal_line(job) -> str:
     if job.state is JobState.SUCCEEDED:
         summary = " ".join((job.summary or "").split())
-        return (f"Done — {summary}" if summary else "Done.")[:320]
+        return (f"Done -- {summary}" if summary else "Done.")[:320]
     if job.state is JobState.CANCELLED:
         return "Cancelled."
     return "That task hit a problem; it's in History."
@@ -530,6 +645,9 @@ async def entrypoint(ctx: JobContext) -> None:
     wakeword.shutting_down.clear()
     envload.load_private_environment()
     cfg = _cfg()
+    trace_cfg = cfg.get("traces") if isinstance(cfg.get("traces"), dict) else {}
+    pricing_cfg = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
+    trace_recorder = None
     authorizer = stateserver.PairingAuthorizer()
     server: stateserver.StateServer | None = None
 
@@ -539,6 +657,23 @@ async def entrypoint(ctx: JobContext) -> None:
         return stateserver.pairing_url(authorizer, server.port)
 
     services = runtime.build(cfg, paired_url=_paired_url)
+
+    def _traces():
+        nonlocal trace_recorder
+        if trace_recorder is None:
+            from worker import traces as traces_mod
+            trace_recorder = traces_mod.TraceRecorder(
+                trace_cfg.get("path"),
+                enabled=trace_cfg.get("enabled") is not False,
+                pricing={key: value for key, value in pricing_cfg.items()
+                         if isinstance(value, dict)},
+                cache_ttl=pricing_cfg.get("cache_ttl", "5m"),
+                tool_names=services.registry.names(),
+                model_names=(cfg.get("fast_model"),),
+                retention_days=trace_cfg.get("retention_days", 30),
+            )
+        return trace_recorder
+
     user = cfg.get("user")
     user_name = user.get("name") if isinstance(user, dict) else None
     publisher = state.StatePublisher(voice=cfg.get("active_voice"), user_name=user_name)
@@ -591,6 +726,7 @@ async def entrypoint(ctx: JobContext) -> None:
             engage=_engage,
             sleep=_sleep,
             turn_ownership=turn_ownership,
+            trace_recorder=_traces(),
         )
 
     async def _handle_quick_result(name: str, result: tools_mod.ToolResult) -> None:
@@ -648,18 +784,34 @@ async def entrypoint(ctx: JobContext) -> None:
             if server is not None:
                 await _flush_store_and_stop_state_server(services.store, server)
         finally:
+            if trace_recorder is not None:
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
+                except TimeoutError:
+                    logger.warning("turn tracing close exceeded shutdown deadline")
             shutdown_done.set()
 
     desktop_status = desktopapps.StatusSnapshot()
 
     def _health() -> dict[str, Any]:
         snapshot = desktop_status.get()
+        summary = (trace_recorder.health if trace_recorder is not None else {
+            "enabled": trace_cfg.get("enabled") is not False,
+            "turns": 0, "avg_ms": 0.0, "cache_hit_ratio": 0.0, "cost_usd": 0.0,
+        })
         return {
             "claude": services.work.launcher.available,
             "mcp": services.mcp.status(),
             "apps": snapshot["apps"],
             "as_of": snapshot["as_of"],
             "cache_floor_ok": getattr(services.brain, "cache_floor_ok", None),
+            "traces": {
+                "enabled": summary["enabled"],
+                "turns_today": summary["turns"],
+                "avg_ms_today": summary["avg_ms"],
+                "cache_hit_ratio_today": summary["cache_hit_ratio"],
+                "cost_usd_today": summary["cost_usd"],
+            },
         }
 
     server = await stateserver.start(
@@ -809,6 +961,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 addressing=addressing,
                 sleep=_sleep,
                 turn_ownership=turn_ownership,
+                trace_recorder=_traces(),
             )
 
         agent.turn_handler = _audio_turn

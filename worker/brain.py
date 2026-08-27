@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
@@ -87,7 +88,7 @@ As a recipient, "myself" means Daniel's own address.
 After launch_work returns ok, say it is launching and will show in Workers; never pretend it is done.
 Use find_file and read_file for quick questions about a file. Use launch_work for
 analysis that needs code or produces artifacts.
-If read_file reports truncated, do not analyse the preview — call launch_work with the exact path.
+If read_file reports truncated, do not analyse the preview -- call launch_work with the exact path.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
 in:inbox for all; never count from a search page.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
@@ -169,6 +170,26 @@ def _field(block: Any, name: str) -> Any:
     return block.get(name) if isinstance(block, Mapping) else getattr(block, name, None)
 
 
+def _record_generation(
+    model: str,
+    started: float,
+    usage: Mapping[str, int] | None,
+    *,
+    ok: bool,
+) -> None:
+    def _tokens(name: str) -> int:
+        value = _field(usage, name)
+        return max(0, int(value)) if isinstance(value, (int, float)) else 0
+
+    from worker import traces as traces_mod
+    traces_mod.record_current_generate(
+        model, ms=round((time.perf_counter() - started) * 1000), ok=ok,
+        tokens_in=_tokens("input_tokens"), tokens_out=_tokens("output_tokens"),
+        cache_read_tokens=_tokens("cache_read_input_tokens"),
+        cache_write_tokens=_tokens("cache_creation_input_tokens"),
+    )
+
+
 def _block_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, Mapping):
         return dict(block)
@@ -202,6 +223,7 @@ class Brain:
         turn_timeout_s: float = 12.0,
         turn_ceiling_s: float = 30.0,
         history_exchanges: int = 8,
+        cache_ttl: str = "5m",
         on_tool: Callable[[str, ToolResult], None] | None = None,
         clock: Callable[[], datetime] = datetime.now,
         mcp_status: list[dict[str, Any]] | None = None,
@@ -226,6 +248,11 @@ class Brain:
         self.turn_ceiling_s = float(turn_ceiling_s)
         self.history_exchanges = history_exchanges
         self.on_tool = on_tool
+        if cache_ttl not in {"5m", "1h"}:
+            raise ValueError("cache_ttl must be 5m or 1h")
+        self._cache_control = {"type": "ephemeral"}
+        if cache_ttl == "1h":
+            self._cache_control["ttl"] = "1h"
         self._clock = clock
         rules = BASE_SYSTEM
         if persona.strip():
@@ -358,10 +385,10 @@ class Brain:
         task.add_done_callback(self._cache_floor_tasks.discard)
         return True
 
-    def _record_usage(self, message: Any) -> None:
+    def _record_usage(self, message: Any) -> dict[str, int] | None:
         usage = _field(message, "usage")
         if usage is None:
-            return
+            return None
         fields = (
             "input_tokens",
             "output_tokens",
@@ -381,6 +408,7 @@ class Brain:
             recorded["cache_read_input_tokens"],
             recorded["cache_creation_input_tokens"],
         )
+        return recorded
 
     def _remember(self, transcript: str, spoken: str) -> None:
         self._history.extend((
@@ -433,7 +461,7 @@ class Brain:
                             pending.name, pending.arguments, result.status == "ok",
                         ))
                         if result.status == "ok":
-                            host_line = f"Done — {pending.name} executed."
+                            host_line = f"Done -- {pending.name} executed."
                         else:
                             host_line = f"That didn't go through: {result.content[:160]}."
                     else:
@@ -474,26 +502,37 @@ class Brain:
                                 }],
                             },
                         ]
-                    async with asyncio.timeout(self.turn_timeout_s):
-                        async with self.client.messages.stream(
-                            model=self.model,
-                            max_tokens=self.max_tokens,
-                            system=narration_system,
-                            messages=narration_messages,
-                            tools=tools,
-                            tool_choice={"type": "none"},
-                        ) as stream:
-                            async for delta in stream.text_stream:
-                                buffer += delta
-                                chunks, buffer = split_spoken(buffer)
-                                for chunk in chunks:
-                                    if guard.delayed(chunk):
-                                        guarded_chunks.append(chunk)
-                                    else:
-                                        spoken.append(chunk)
-                                        yield chunk
-                            final = await stream.get_final_message()
-                            self._record_usage(final)
+                    generation_started = time.perf_counter()
+                    final = None
+                    generation_usage = None
+                    try:
+                        async with asyncio.timeout(self.turn_timeout_s):
+                            async with self.client.messages.stream(
+                                model=self.model,
+                                max_tokens=self.max_tokens,
+                                system=narration_system,
+                                messages=narration_messages,
+                                tools=tools,
+                                tool_choice={"type": "none"},
+                            ) as stream:
+                                async for delta in stream.text_stream:
+                                    buffer += delta
+                                    chunks, buffer = split_spoken(buffer)
+                                    for chunk in chunks:
+                                        if guard.delayed(chunk):
+                                            guarded_chunks.append(chunk)
+                                        else:
+                                            spoken.append(chunk)
+                                            yield chunk
+                                final = await stream.get_final_message()
+                                generation_usage = self._record_usage(final)
+                    finally:
+                        _record_generation(
+                            self.model,
+                            generation_started,
+                            generation_usage,
+                            ok=final is not None,
+                        )
                     if buffer:
                         if guard.delayed(buffer):
                             guarded_chunks.append(buffer)
@@ -509,26 +548,37 @@ class Brain:
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
-                    async with asyncio.timeout(self.turn_timeout_s):
-                        async with self.client.messages.stream(
-                            model=self.model,
-                            max_tokens=self.max_tokens,
-                            system=system,
-                            messages=messages,
-                            tools=tools,
-                            tool_choice=tool_choice,
-                        ) as stream:
-                            async for delta in stream.text_stream:
-                                buffer += delta
-                                chunks, buffer = split_spoken(buffer)
-                                for chunk in chunks:
-                                    if guard.delayed(chunk):
-                                        guarded_chunks.append(chunk)
-                                    else:
-                                        spoken.append(chunk)
-                                        yield chunk
-                            final = await stream.get_final_message()
-                            self._record_usage(final)
+                    generation_started = time.perf_counter()
+                    final = None
+                    generation_usage = None
+                    try:
+                        async with asyncio.timeout(self.turn_timeout_s):
+                            async with self.client.messages.stream(
+                                model=self.model,
+                                max_tokens=self.max_tokens,
+                                system=system,
+                                messages=messages,
+                                tools=tools,
+                                tool_choice=tool_choice,
+                            ) as stream:
+                                async for delta in stream.text_stream:
+                                    buffer += delta
+                                    chunks, buffer = split_spoken(buffer)
+                                    for chunk in chunks:
+                                        if guard.delayed(chunk):
+                                            guarded_chunks.append(chunk)
+                                        else:
+                                            spoken.append(chunk)
+                                            yield chunk
+                                final = await stream.get_final_message()
+                                generation_usage = self._record_usage(final)
+                    finally:
+                        _record_generation(
+                            self.model,
+                            generation_started,
+                            generation_usage,
+                            ok=final is not None,
+                        )
 
                     if getattr(final, "stop_reason", None) != "tool_use":
                         break

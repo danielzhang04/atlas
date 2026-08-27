@@ -526,6 +526,24 @@ def test_worker_tools_import_does_not_load_desktopcontrol_implementation():
     assert result.returncode == 0, result.stderr
 
 
+def test_worker_app_import_does_not_load_traces():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import worker.app; "
+                "raise SystemExit(int('worker.traces' in sys.modules))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 
 def test_open_prefers_spotify_desktop_profile_and_falls_back_to_web():
     from worker.desktopapps import DesktopAppError

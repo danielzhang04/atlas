@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import sys
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -240,6 +243,14 @@ def test_jobs_events_and_health_are_fixed_public_projections():
                 "claude": True, "mcp": mcp, "apps": apps,
                 "as_of": "2026-08-27T12:00:00+00:00",
                 "cache_floor_ok": False,
+                "traces": {
+                    "enabled": True,
+                    "turns_today": 7,
+                    "avg_ms_today": 125.5,
+                    "cache_hit_ratio_today": 0.75,
+                    "cost_usd_today": 0.0123,
+                    "secret": "must-not-escape",
+                },
             },
         )
         event_headers = {stateserver.HEADER: bearer}
@@ -297,6 +308,13 @@ def test_jobs_events_and_health_are_fixed_public_projections():
                 "detail": "signed executable not found: Spotify.exe",
             },
         ],
+        "traces": {
+            "enabled": True,
+            "turns_today": 7,
+            "avg_ms_today": 125.5,
+            "cache_hit_ratio_today": 0.75,
+            "cost_usd_today": 0.0123,
+        },
     }
     assert missing_mcp[0] == 404
     assert invalid[0] == 400
@@ -324,6 +342,13 @@ def test_health_projects_unknown_cache_floor_as_null():
         "as_of": "2026-08-22T12:00:01+00:00",
         "mcp": [],
         "apps": [],
+        "traces": {
+            "enabled": False,
+            "turns_today": 0,
+            "avg_ms_today": 0.0,
+            "cache_hit_ratio_today": 0.0,
+            "cost_usd_today": 0.0,
+        },
     }
     assert "must-not-escape" not in response[2]
 
@@ -378,12 +403,62 @@ def test_health_normalizes_state_derived_connection_shapes():
             },
         ],
         "apps": [],
+        "traces": {
+            "enabled": False,
+            "turns_today": 0,
+            "avg_ms_today": 0.0,
+            "cache_hit_ratio_today": 0.0,
+            "cost_usd_today": 0.0,
+        },
     }
+
+
+def test_health_returns_cached_trace_snapshot_while_database_is_exclusively_locked(tmp_path):
+    from worker.traces import TraceRecorder
+
+    path = tmp_path / "traces.db"
+    recorder = TraceRecorder(path)
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.route(turn, ms=1, ok=True)
+    recorder.end_turn(
+        turn, addressed=True, wake_kind="wake", outcome="responded", total_ms=7,
+    )
+    assert recorder.summary(days=1)["turns"] == 1
+
+    def health():
+        cached = recorder.health
+        return {"traces": {
+            "enabled": cached["enabled"], "turns_today": cached["turns"],
+            "avg_ms_today": cached["avg_ms"],
+            "cache_hit_ratio_today": cached["cache_hit_ratio"],
+            "cost_usd_today": cached["cost_usd"],
+        }}
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)), 0, health_provider=health,
+        )
+        lock = sqlite3.connect(path, timeout=0)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            started = time.perf_counter()
+            response = await _request(server, path="/health")
+            return response, time.perf_counter() - started
+        finally:
+            lock.rollback()
+            lock.close()
+            await server.stop()
+
+    response, elapsed = asyncio.run(scenario())
+    recorder.close()
+    assert elapsed < 0.1
+    assert json.loads(response[2])["traces"]["turns_today"] == 1
 
 
 def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypatch):
     from worker import app
 
+    sys.modules.pop("worker.traces", None)
     calls = []
     publishers = []
     placeholder_audio = []
@@ -557,6 +632,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         "livekit-connected",
         "session-started",
     ]
+    assert "worker.traces" not in sys.modules
 
 
 def test_entrypoint_wires_blocking_tool_into_real_state_server(monkeypatch):

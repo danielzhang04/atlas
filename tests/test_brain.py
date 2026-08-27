@@ -217,7 +217,10 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     local_timezone = datetime.now().astimezone().tzinfo
     clock = lambda: datetime(2026, 8, 22, 9, 41, 29, tzinfo=local_timezone)
     now = clock().astimezone()
-    brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock)
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock,
+        cache_ttl="1h",
+    )
     brain.mark_tools_settled()
 
     async def scenario():
@@ -776,7 +779,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
         {"role": "user", "content": "yes go ahead and create the draft"},
         {
             "role": "assistant",
-            "content": "Done — google__draft_gmail_message executed.",
+            "content": "Done -- google__draft_gmail_message executed.",
         },
     ]
     request = client.messages.calls[0]
@@ -805,7 +808,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
             }],
         },
     ]
-    assert "Done — google__draft_gmail_message executed." in request["system"][-1]["text"]
+    assert "Done -- google__draft_gmail_message executed." in request["system"][-1]["text"]
 
 
 def test_confirm_error_is_persisted_and_narrated_as_a_real_tool_error():
@@ -990,11 +993,11 @@ def test_confirm_narration_failure_returns_and_remembers_deterministic_host_line
 
     result = asyncio.run(collect(brain, "confirm"))
 
-    assert result == ["Done — mutate executed."]
+    assert result == ["Done -- mutate executed."]
     assert mutation_calls == [{"message": "hello"}]
     assert brain._history == [
         {"role": "user", "content": "confirm"},
-        {"role": "assistant", "content": "Done — mutate executed."},
+        {"role": "assistant", "content": "Done -- mutate executed."},
     ]
 
 
@@ -1467,7 +1470,7 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
     assert (
-        "If read_file reports truncated, do not analyse the preview — "
+        "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM

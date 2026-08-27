@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -378,11 +379,11 @@ def test_tool_events_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged
     lines = [(line["role"], line["text"]) for line in publisher.snapshot()["transcript"]]
     assert lines == [
         ("tool", "open: ok"),
-        ("atlas", "Done — Draft verified."),
+        ("atlas", "Done -- Draft verified."),
         ("atlas", "That task hit a problem; it's in History."),
     ]
     assert engagement.state != ENGAGED
-    assert session.spoken == ["Done — Draft verified."]
+    assert session.spoken == ["Done -- Draft verified."]
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -601,6 +602,144 @@ def test_addressed_turn_refreshes_engagement_and_reply_window():
     clock.value = 70
     assert engagement.tick() == "ENGAGED"
     assert addressing.is_addressed("ordinary follow up")
+
+
+def test_real_brain_turn_records_exact_metadata_steps_without_payloads(tmp_path):
+    from worker.brain import Brain
+    from worker.tools import Tool, ToolRegistry
+    from worker.traces import TraceRecorder
+
+    sentinels = {
+        "prompt": "PromptIdentifier94731", "argument": "ArgumentIdentifier94732",
+        "result": "ResultIdentifier94733", "output": "OutputIdentifier94734",
+        "exception": "ExceptionIdentifier94735",
+    }
+
+    class Stream:
+        def __init__(self, deltas, content, reason, usage):
+            self._deltas = deltas
+            self.final = SimpleNamespace(
+                content=content, stop_reason=reason, usage=SimpleNamespace(**usage),
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        @property
+        def text_stream(self):
+            async def iterate():
+                for delta in self._deltas:
+                    yield delta
+            return iterate()
+
+        async def get_final_message(self):
+            return self.final
+
+    tool_block = SimpleNamespace(
+        type="tool_use", id="toolu_1", name="lookup",
+        input={"query": sentinels["argument"]},
+    )
+    usages = {
+        "input_tokens": 10, "output_tokens": 2,
+        "cache_read_input_tokens": 30, "cache_creation_input_tokens": 4,
+    }
+    streams = [
+        Stream([], [tool_block], "tool_use", usages),
+        Stream([sentinels["output"]], [], "end_turn", usages),
+    ]
+
+    class Messages:
+        def stream(self, **_kwargs):
+            return streams.pop(0)
+
+    registry = ToolRegistry()
+
+    async def lookup(arguments):
+        assert arguments["query"] == sentinels["argument"]
+        try:
+            raise RuntimeError(sentinels["exception"])
+        except RuntimeError as exc:
+            return {"value": sentinels["result"], "error": str(exc)}
+
+    registry.register(Tool("lookup", "Look up a value.", {"type": "object"}, lookup))
+    brain = Brain(
+        SimpleNamespace(messages=Messages()), registry, model="fast", persona="",
+    )
+    recorder = TraceRecorder(
+        tmp_path / "traces.db", tool_names=registry.names(), model_names=("fast",),
+    )
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_audio_turn(
+        f"Atlas {sentinels['prompt']}",
+        intents={},
+        brain=brain,
+        session=FakeSession(),
+        publisher=StatePublisher(),
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    assert recorder.summary(days=1)["turns"] == 1
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        steps = connection.execute(
+            "SELECT kind,name,ok,tokens_in,tokens_out FROM steps ORDER BY seq"
+        ).fetchall()
+        turn = connection.execute("SELECT outcome,model FROM turns").fetchone()
+    assert steps == [
+        ("ROUTE", None, 1, 0, 0),
+        ("GENERATE", "fast", 1, 20, 4),
+        ("TOOL_CALL", "lookup", 1, 0, 0),
+        ("RESPOND", None, 1, 0, 0),
+    ]
+    assert turn == ("responded", "fast")
+    database_bytes = b"".join(
+        path.read_bytes() for path in tmp_path.glob("traces.db*") if path.is_file()
+    )
+    for sentinel in sentinels.values():
+        assert sentinel.encode("ascii") not in database_bytes
+
+
+def test_speech_failure_after_first_chunk_records_failed_response_timing(tmp_path, monkeypatch):
+    from worker.traces import TraceRecorder
+
+    class FailingSession(FakeSession):
+        async def say(self, source, *, add_to_chat_ctx):
+            assert add_to_chat_ctx is False
+            iterator = source.__aiter__()
+            assert await anext(iterator) == "Answer."
+            raise RuntimeError("speaker failed")
+
+    marks = iter((0.0, 0.001, 0.002, 0.100, 0.125, 0.130))
+    monkeypatch.setattr(app.time, "perf_counter", lambda: next(marks))
+    recorder = TraceRecorder(tmp_path / "traces.db")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    with pytest.raises(RuntimeError, match="speaker failed"):
+        asyncio.run(app._handle_audio_turn(
+            "atlas question", intents={}, brain=FakeBrain(chunks=("Answer.",)),
+            session=FailingSession(), publisher=StatePublisher(), engagement=engagement,
+            addressing=Addressing(30, ("atlas",)), sleep=lambda announce=True: None,
+            trace_recorder=recorder,
+        ))
+    assert recorder.summary(days=1)["turns"] == 1
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+        respond = connection.execute(
+            "SELECT ms,ok FROM steps WHERE kind='RESPOND'"
+        ).fetchone()
+    assert outcome == "speech_failed"
+    assert respond == (25, 0)
 
 
 def test_reply_restamps_clocks_before_turn_releases_ownership():
