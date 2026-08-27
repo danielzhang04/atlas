@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
+import importlib
 import json
 import os
 from pathlib import Path
@@ -42,7 +43,17 @@ _READBACK_VALUE_LIMIT = 160
 _HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
-_TRUNCATED = "…[truncated]"
+_TRUNCATED = "...[truncated]"
+_DESKTOP_DELETE_CHORDS = ("delete", "ctrl+d", "ctrl+x", "shift+delete")
+_DESKTOP_ALLOWED_CHORDS = frozenset({
+    "alt+tab", "backspace", "ctrl+a", "ctrl+c", "ctrl+f", "ctrl+l", "ctrl+p",
+    "ctrl+s", "ctrl+t", "ctrl+v", "ctrl+w", "ctrl+y", "ctrl+z", "down", "end",
+    "enter", "escape", "home", "left", "pagedown", "pageup", "right", "space",
+    "tab", "up",
+})
+_DESKTOP_MEDIA_KEYS = (
+    "play_pause", "next", "previous", "volume_up", "volume_down", "mute",
+)
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
 _NEXT_PAGE_TOKEN = re.compile(
     r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
@@ -64,6 +75,14 @@ class Tool:
     input_schema: dict
     run: Callable[[dict], Awaitable[Any]]
     policy: Policy = "instant"
+    prepare: Callable[[dict], dict | _PreparedAction] | None = None
+    execute_prepared: Callable[[dict, Any], Awaitable[Any]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAction:
+    arguments: dict[str, Any]
+    host_state: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +99,7 @@ class PendingAction:
     arguments: dict[str, Any]
     summary: str
     expires: float
+    host_state: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +192,16 @@ class ToolRegistry:
             copied = deepcopy(dict(arguments))
             if tainted and self._refused_after_external_content(name, copied):
                 return ToolResult("error", _TAINT_REFUSAL)
+            if tool.prepare is not None:
+                prepared = tool.prepare(copied)
+                if isinstance(prepared, _PreparedAction):
+                    copied = prepared.arguments
+                    host_state = prepared.host_state
+                else:
+                    copied = prepared
+                    host_state = None
+            else:
+                host_state = None
             if tainted and name == "launch_work":
                 if not isinstance(transcript, str) or not transcript.strip():
                     return ToolResult("error", "missing turn transcript")
@@ -186,6 +216,7 @@ class ToolRegistry:
                     arguments=copied,
                     summary=_readback_summary(name, copied),
                     expires=self._clock() + 120.0,
+                    host_state=host_state,
                 )
                 self._pending = pending
                 return ToolResult(
@@ -196,7 +227,7 @@ class ToolRegistry:
                     ),
                     pending.confirm_id,
                 )
-            return await self._execute(tool, copied)
+            return await self._execute(tool, copied, host_state=host_state)
         except Exception as exc:
             return ToolResult("error", type(exc).__name__)
 
@@ -214,6 +245,13 @@ class ToolRegistry:
             "open_file",
             "open_folder",
             "cancel_work",
+            "focus_window",
+            "window_action",
+            "media_key",
+            "click",
+            "type_text",
+            "press_keys",
+            "press_delete",
         }:
             return True
         if name != "open":
@@ -233,16 +271,27 @@ class ToolRegistry:
         if pending.confirm_id != confirm_id:
             return ToolResult("error", "nothing to confirm")
         self._pending = None
-        return await self._execute(self._tools[pending.name], pending.arguments)
+        return await self._execute(
+            self._tools[pending.name], pending.arguments, host_state=pending.host_state,
+        )
 
     def cancel_pending(self) -> ToolResult:
         self._pending = None
         return ToolResult("ok", "cancelled")
 
-    async def _execute(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+    async def _execute(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        host_state: Any = None,
+    ) -> ToolResult:
         try:
             async with asyncio.timeout(self._timeout_s):
-                value = await tool.run(arguments)
+                if tool.execute_prepared is not None and host_state is not None:
+                    value = await tool.execute_prepared(arguments, host_state)
+                else:
+                    value = await tool.run(arguments)
         except McpToolError as exc:
             return ToolResult("error", str(exc))
         except Exception as exc:
@@ -274,6 +323,10 @@ def load_apps(path: Path) -> dict[str, AppEntry]:
     return apps
 
 
+def _desktopcontrol() -> Any:
+    return importlib.import_module("worker.desktopcontrol")
+
+
 def builtin(
     registry: ToolRegistry,
     apps: Mapping[str, AppEntry],
@@ -285,9 +338,13 @@ def builtin(
     profile_closer: Callable[[str], object] = desktopapps.close_profile,
     paired_url: Callable[[], str | None] | None = None,
     files: LocalFiles | None = None,
+    desktop: Any | None = None,
 ) -> None:
     aliases = _aliases(apps)
     registry._configure_open_aliases(aliases)
+
+    def desktop_api() -> Any:
+        return desktop if desktop is not None else _desktopcontrol()
 
     async def open_target(arguments: dict) -> ToolResult | dict:
         target = _text_argument(arguments, "target", maximum=2048)
@@ -296,11 +353,18 @@ def builtin(
             name, app = entry
             if app.exe is not None:
                 try:
-                    profile_opener(app.exe, None)
+                    opened = profile_opener(app.exe, None)
                 except desktopapps.DesktopAppError:
                     if app.url is None:
                         raise
                     opener(app.url)
+                else:
+                    if (
+                        isinstance(opened, Mapping)
+                        and opened.get("focused") is True
+                        and opened.get("existing") is True
+                    ):
+                        return ToolResult("ok", "focused existing window")
             elif app.url is not None:
                 dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
                 opener(dynamic_url or app.url)
@@ -368,6 +432,106 @@ def builtin(
         path = _text_argument(arguments, "path", maximum=2048)
         return await files.read_file(path)
 
+    async def list_desktop_windows(arguments: dict) -> dict[str, Any]:
+        _only_arguments(arguments, {"limit"})
+        limit = arguments.get("limit", 40)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("invalid limit")
+        inventory = desktop_api().list_windows(limit=limit)
+        return _bounded_window_inventory(inventory)
+
+    async def focus_desktop_window(arguments: dict) -> dict:
+        return desktop_api().focus_window(**_window_target(arguments))
+
+    async def desktop_window_action(arguments: dict) -> dict:
+        _only_arguments(
+            arguments, {"action", "title", "pid", "x", "y", "width", "height"},
+        )
+        action = _text_argument(arguments, "action", maximum=64).casefold()
+        target = _window_target(arguments, ignored={"action", "x", "y", "width", "height"})
+        extras = {
+            name: _integer_argument(arguments, name)
+            for name in ("x", "y", "width", "height")
+            if name in arguments
+        }
+        return desktop_api().window_action(action, **target, **extras)
+
+    async def desktop_media_key(arguments: dict) -> dict:
+        _only_arguments(arguments, {"key"})
+        return desktop_api().media_key(
+            _text_argument(arguments, "key", maximum=32).casefold(),
+        )
+
+    async def desktop_click(arguments: dict) -> dict:
+        _only_arguments(arguments, {"x", "y", "title", "pid"})
+        target = _window_target(arguments, optional=True, ignored={"x", "y"})
+        return desktop_api().click(
+            _integer_argument(arguments, "x"),
+            _integer_argument(arguments, "y"),
+            **target,
+        )
+
+    async def desktop_type_text(arguments: dict) -> dict:
+        _only_arguments(arguments, {"text"})
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text or len(text) > 4000:
+            raise ValueError("invalid text")
+        return desktop_api().type_text(text)
+
+    async def desktop_press_keys(arguments: dict) -> ToolResult | dict:
+        _only_arguments(arguments, {"chord"})
+        api = desktop_api()
+        chord = api.normalize_chord(arguments.get("chord"))
+        if chord in _DESKTOP_DELETE_CHORDS:
+            return ToolResult("error", "delete chords require press_delete")
+        return api.press_keys(chord)
+
+    def prepare_delete(arguments: dict) -> _PreparedAction:
+        _only_arguments(arguments, {"chord"})
+        api = desktop_api()
+        chord = api.normalize_chord(arguments.get("chord"))
+        if chord not in _DESKTOP_DELETE_CHORDS:
+            raise ValueError("invalid delete chord")
+        identity = api.focused_window_identity()
+        title = identity.get("title")
+        pid = identity.get("pid")
+        hwnd = identity.get("_handle")
+        if (
+            not isinstance(title, str)
+            or not title
+            or len(title) > 512
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(hwnd, bool)
+            or not isinstance(hwnd, int)
+            or hwnd <= 0
+        ):
+            raise ValueError("invalid foreground window identity")
+        return _PreparedAction(
+            arguments={"chord": chord, "window": title, "pid": pid},
+            host_state=hwnd,
+        )
+
+    async def desktop_press_delete(arguments: dict) -> ToolResult:
+        return ToolResult("error", "delete confirmation state is unavailable")
+
+    async def execute_desktop_press_delete(
+        arguments: dict,
+        expected_hwnd: Any,
+    ) -> ToolResult | dict:
+        _only_arguments(arguments, {"chord", "window", "pid"})
+        try:
+            return desktop_api().press_delete(
+                arguments["chord"], expected_hwnd=expected_hwnd,
+            )
+        except Exception:
+            return ToolResult("error", "focused window changed; delete not executed")
+
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
@@ -401,6 +565,103 @@ def builtin(
             "required": list(properties), "additionalProperties": False,
         }
         registry.register(Tool(name, description, schema, run))
+
+    target_properties = {
+        "title": {"type": "string"},
+        "pid": {"type": "integer", "minimum": 1},
+    }
+    target_choice = [{"required": ["title"]}, {"required": ["pid"]}]
+    desktop_definitions = (
+        (
+            "list_windows",
+            "List visible top-level windows without exposing native handles.",
+            {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+            [],
+            list_desktop_windows,
+        ),
+        (
+            "focus_window",
+            "Focus one host-resolved visible window by title or pid.",
+            target_properties,
+            target_choice,
+            focus_desktop_window,
+        ),
+        (
+            "window_action",
+            "Minimize, maximize, restore, close, move, or resize a host-resolved window.",
+            {
+                **target_properties,
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "minimize", "maximize", "restore", "close", "move", "resize",
+                        "move:left-half", "move:right-half", "move:center",
+                    ],
+                },
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+            },
+            [{"required": ["title", "action"]}, {"required": ["pid", "action"]}],
+            desktop_window_action,
+        ),
+        (
+            "media_key",
+            "Press one allowlisted media key.",
+            {"key": {"type": "string", "enum": list(_DESKTOP_MEDIA_KEYS)}},
+            [{"required": ["key"]}],
+            desktop_media_key,
+        ),
+        (
+            "click",
+            "Click screen coordinates, or coordinates relative to a host-resolved window.",
+            {"x": {"type": "integer"}, "y": {"type": "integer"}, **target_properties},
+            [{"required": ["x", "y"]}],
+            desktop_click,
+        ),
+        (
+            "type_text",
+            "Type Unicode text into the foreground application.",
+            {"text": {"type": "string", "minLength": 1, "maxLength": 4000}},
+            [{"required": ["text"]}],
+            desktop_type_text,
+        ),
+        (
+            "press_keys",
+            "Press one allowlisted non-delete key chord in the foreground application.",
+            {"chord": {"type": "string", "enum": sorted(_DESKTOP_ALLOWED_CHORDS)}},
+            [{"required": ["chord"]}],
+            desktop_press_keys,
+        ),
+    )
+    for name, description, properties, choices, run in desktop_definitions:
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": False,
+        }
+        if choices:
+            schema["oneOf"] = choices
+        registry.register(Tool(name, description, schema, run))
+
+    delete_schema = {
+        "type": "object",
+        "properties": {
+            "chord": {"type": "string", "enum": list(_DESKTOP_DELETE_CHORDS)},
+        },
+        "required": ["chord"],
+        "additionalProperties": False,
+    }
+    registry.register(Tool(
+        "press_delete",
+        "Press a delete chord in the foreground application after confirmation.",
+        delete_schema,
+        desktop_press_delete,
+        policy="confirm",
+        prepare=prepare_delete,
+        execute_prepared=execute_desktop_press_delete,
+    ))
 
 
 def register_count_mail(
@@ -497,6 +758,69 @@ def _text_argument(arguments: Mapping[str, Any], name: str, *, maximum: int) -> 
     return value.strip()
 
 
+def _only_arguments(arguments: Mapping[str, Any], allowed: set[str]) -> None:
+    if set(arguments) - allowed:
+        raise ValueError("unexpected argument")
+
+
+def _integer_argument(arguments: Mapping[str, Any], name: str) -> int:
+    value = arguments.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _window_target(
+    arguments: Mapping[str, Any],
+    *,
+    optional: bool = False,
+    ignored: set[str] | None = None,
+) -> dict[str, Any]:
+    ignored = ignored or set()
+    _only_arguments(arguments, {"title", "pid"} | ignored)
+    has_title = "title" in arguments
+    has_pid = "pid" in arguments
+    if has_title and has_pid:
+        raise ValueError("provide title or pid, not both")
+    if not has_title and not has_pid:
+        if optional:
+            return {}
+        raise ValueError("missing title or pid")
+    if has_title:
+        return {"title": _text_argument(arguments, "title", maximum=512)}
+    pid = _integer_argument(arguments, "pid")
+    if pid <= 0:
+        raise ValueError("invalid pid")
+    return {"pid": pid}
+
+
+def _bounded_window_inventory(inventory: Any) -> dict[str, Any]:
+    if not isinstance(inventory, Mapping):
+        raise ValueError("invalid window inventory")
+    windows = inventory.get("windows")
+    total = inventory.get("total")
+    truncated = inventory.get("truncated")
+    if (
+        not isinstance(windows, list)
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < len(windows)
+        or not isinstance(truncated, bool)
+    ):
+        raise ValueError("invalid window inventory")
+    bounded = {
+        "windows": deepcopy(windows),
+        "total": total,
+        "truncated": truncated,
+    }
+    while len(_serialize(bounded)) > _CONTENT_LIMIT and bounded["windows"]:
+        bounded["windows"].pop()
+        bounded["truncated"] = True
+    if len(_serialize(bounded)) > _CONTENT_LIMIT:
+        raise ValueError("window inventory metadata is too large")
+    return bounded
+
+
 def _configured_url(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -532,15 +856,20 @@ def _serialize(value: Any) -> str:
 
 
 def _readback_summary(name: str, arguments: Mapping[str, Any]) -> str:
+    if name == "press_delete":
+        chord = _CONTROL_CHARACTERS.sub("", str(arguments.get("chord", "")))
+        title = _CONTROL_CHARACTERS.sub("", str(arguments.get("window", "")))
+        pid = arguments.get("pid")
+        return f"press_delete - chord: {chord}; window: {title}; pid: {pid}"
     details = []
     for key, value in arguments.items():
         serialized = _serialize(value)
         cleaned = _CONTROL_CHARACTERS.sub("", serialized)
         if len(cleaned) > _READBACK_VALUE_LIMIT:
             omitted = len(cleaned) - _READBACK_VALUE_LIMIT
-            cleaned = f"{cleaned[:_READBACK_VALUE_LIMIT]} …(+{omitted} chars)"
+            cleaned = f"{cleaned[:_READBACK_VALUE_LIMIT]} ...(+{omitted} chars)"
         details.append(f"{key}: {cleaned}")
-    return f"{name} — " + ("; ".join(details) if details else "no arguments")
+    return f"{name} - " + ("; ".join(details) if details else "no arguments")
 
 
 def _bound_content(value: str) -> str:

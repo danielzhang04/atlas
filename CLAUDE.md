@@ -28,6 +28,9 @@ Non-negotiable rules:
     private environment values, MCP child environments, prompts, or raw child stdout.
 11. No new eager third-party import on the desktop or worker startup path without an importtime
     comparison and idle-RSS check recorded in the change.
+12. Desktop control acts on windows by host-resolved title/pid; the model never supplies handles,
+    executables, or delete chords. `delete`, `shift+delete`, `ctrl+d`, and `ctrl+x` are confirm-only.
+    A single `backspace` stays instant as the narrow editing-correction exception.
 
 Do not merge, deploy, activate external connections, or launch paid/background work unless the user
 explicitly authorizes that exact action.

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+import importlib
 import os
 from pathlib import Path
 import re
@@ -198,7 +199,23 @@ def _taskkill_executable() -> str:
 
 def native_launcher(executable: str, url: str | None) -> dict[str, object]:
     """Launch one already-allowlisted executable without a shell or inherited stdin."""
+    if executable not in _EXPECTED_PUBLISHERS:
+        raise DesktopAppError("desktop application is not an approved profile")
     resolved = _resolve_executable(executable)
+    existing = None
+    if url is None:
+        try:
+            existing = _visible_profile_window(resolved)
+        except _desktopcontrol().DesktopControlError:
+            existing = None
+    if existing is not None:
+        _focus_profile_window(existing)
+        return {
+            "application": executable,
+            "pid": existing["pid"],
+            "focused": True,
+            "existing": True,
+        }
     command = [resolved] + ([url] if url is not None else [])
     child_env = {
         key: os.environ[key]
@@ -228,6 +245,18 @@ def native_launcher(executable: str, url: str | None) -> dict[str, object]:
         "pid": process.pid,
         "targeted": url is not None,
     }
+
+
+def _desktopcontrol():
+    return importlib.import_module("worker.desktopcontrol")
+
+
+def _visible_profile_window(executable_path: str) -> dict | None:
+    return _desktopcontrol().find_window_by_process_path(executable_path)
+
+
+def _focus_profile_window(window: dict) -> object:
+    return _desktopcontrol().focus_resolved_window(window)
 
 
 def _resolve_executable(executable: str) -> str:

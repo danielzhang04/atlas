@@ -77,6 +77,8 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         assert built.registry.names() == [
             "open", "focus", "launch_work", "work_status", "cancel_work", "close",
             "find_file", "open_file", "open_folder", "read_file",
+            "list_windows", "focus_window", "window_action", "media_key", "click",
+            "type_text", "press_keys", "press_delete",
             "count_mail",
         ]
         assert built.mcp.status() == [{

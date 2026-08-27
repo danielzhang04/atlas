@@ -167,6 +167,86 @@ def test_native_launcher_uses_resolved_executable_without_shell(monkeypatch):
     assert result == {"application": "chrome.exe", "pid": 42, "targeted": True}
 
 
+def test_native_launcher_resolves_signed_path_before_focusing_exact_existing_window(
+    monkeypatch,
+):
+    calls = []
+    selected = {"title": "notes.txt - Notepad", "pid": 91, "_handle": 9001}
+    monkeypatch.setattr(
+        desktopapps,
+        "_resolve_executable",
+        lambda executable: calls.append(("resolve", executable)) or "C:/Windows/notepad.exe",
+    )
+    monkeypatch.setattr(
+        desktopapps,
+        "_visible_profile_window",
+        lambda executable: calls.append(("inventory", executable)) or selected,
+    )
+    monkeypatch.setattr(
+        desktopapps,
+        "_focus_profile_window",
+        lambda window: calls.append(("focus", window)),
+    )
+
+    result = native_launcher("notepad.exe", None)
+
+    assert result == {
+        "application": "notepad.exe",
+        "pid": 91,
+        "focused": True,
+        "existing": True,
+    }
+    assert calls == [
+        ("resolve", "notepad.exe"),
+        ("inventory", "C:/Windows/notepad.exe"),
+        ("focus", selected),
+    ]
+
+
+def test_profile_focus_carries_selected_hwnd_instead_of_resolving_pid(monkeypatch):
+    selected = {"title": "one", "pid": 91, "_handle": 9001}
+    calls = []
+
+    class FakeDesktopControl:
+        def focus_resolved_window(self, window):
+            calls.append(window)
+            return {"focused": window["title"], "pid": window["pid"]}
+
+        def focus_window(self, **_target):
+            pytest.fail("selected window must not be resolved again by pid")
+
+    monkeypatch.setattr(desktopapps, "_desktopcontrol", lambda: FakeDesktopControl())
+
+    assert desktopapps._focus_profile_window(selected) == {"focused": "one", "pid": 91}
+    assert calls == [selected]
+
+
+def test_native_launcher_falls_back_to_launch_when_window_inventory_fails(monkeypatch):
+    from worker.desktopcontrol import DesktopControlError
+
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _executable: "C:/Windows/notepad.exe",
+    )
+    monkeypatch.setattr(
+        desktopapps,
+        "_visible_profile_window",
+        lambda _path: (_ for _ in ()).throw(DesktopControlError("inventory failed")),
+    )
+
+    class Proc:
+        pid = 42
+
+    monkeypatch.setattr(
+        desktopapps.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: Proc(),
+    )
+
+    assert native_launcher("notepad.exe", None) == {
+        "application": "notepad.exe", "pid": 42, "targeted": False,
+    }
+
+
 def test_resolver_uses_known_folders_not_inherited_environment_and_checks_publisher(
     tmp_path,
     monkeypatch,
