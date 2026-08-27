@@ -14,7 +14,7 @@ Live checkout `C:\Users\danie\Atlas` = `claude/atlas-streamline` = `bfb7164` (+ 
 | Y5a assistant loop | `/state.tool = {name, since}` while a registry tool runs (token-tracked, newest shown); UI TOOL palette (amber) + `TOOL - <name>` strip; time-of-day greeting with `user.name` from config. | `/state.user.name = Daniel`, `tool: null` idle. Greeting/strip need a look at the window. |
 | Y5b quick actions | 14 outer-ring segments = `config/quick_actions.yaml` (Spotify, Windows, Play/Pause, Next, Previous, Mute, Vol+/-, Gmail, Calendar, Terminal, VS Code, Notepad, GitHub) executed via `POST /actions/quick` through the same registry policy path (instant runs; confirm-tier creates the normal pending action; typed text via `POST /turn` goes through the spoken-turn guards as an addressed turn); holo CSS keyframes with reduced-motion respect. | Endpoint auth/policy covered by tests; click/keyboard paths need your hands on the window. |
 
-Perf: importtime 2.1-2.3 s (baseline 2.3-3.0 s); engine +0.006 ms/frame for the TOOL palette (headless measurement); RSS after launch: python=4MB  pythonw=5MB.
+Perf: importtime 2.1-2.3 s (baseline 2.3-3.0 s); engine +0.006 ms/frame for the TOOL palette (headless measurement); RSS after launch: worker.desktop=5MB  worker.desktop=103MB  worker.app=4MB  worker.app=336MB  '\"'\"','\"'\"''\"'\"') import p s s open(p, EOF git=6MB  '\"'\"','\"'\"''\"'\"') import p s s open(p, EOF git=10MB  '\"'\"','\"'\"''\"'\"') import p s s open(p, EOF git=8MB  '\"'\"','\"'\"''\"'\"') import p s s open(p, EOF git=8MB  ','')=80MB (worker.app + worker.desktop, idle, all MCP connected).
 LOC: worker/ 8,741 -> 10,904 (traces 308, statusdetail, quick actions, hook); ui/app.js 1,505.
 
 ## Process record
