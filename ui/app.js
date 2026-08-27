@@ -3,6 +3,7 @@
 
   const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
   const VOICE_STATES = new Set(["ASLEEP", "LISTENING", "THINKING", "SPEAKING"]);
+  const ENGINE_STATES = new Set([...VOICE_STATES, "TOOL"]);
   const TRANSCRIPT_ROLES = new Set(["user", "atlas", "tool", "ambient", "system"]);
   const ACTIVE_JOB_STATES = new Set(["queued", "launching", "running"]);
   const ACTION_HEADER = "x-atlas-action-token";
@@ -24,6 +25,8 @@
     windowControls: document.querySelector("#window-controls"), windowMinimize: document.querySelector("#window-minimize"),
     windowMaximize: document.querySelector("#window-maximize"), windowClose: document.querySelector("#window-close"),
     canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
+    greeting: document.querySelector("#greeting"), toolStrip: document.querySelector("#tool-strip"),
+    toolAnnouncer: document.querySelector("#tool-announcer"),
     audioLine: document.querySelector("#audio-line"), transcript: document.querySelector("#transcript"),
     workerSummary: document.querySelector("#worker-summary"), workerTabs: document.querySelector("#worker-tabs"),
     workerOutput: document.querySelector("#worker-output"), history: document.querySelector("#history-list"),
@@ -39,6 +42,7 @@
   let actionToken = "", actionExpiresAt = 0, pairingExpiryTimer = 0;
   let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
   let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
+  let greetingTimer = 0, userName = "", activeToolIdentity = "";
   const pendingRequests = new Set();
   const eventsByJob = new Map();
   const resultsByJob = new Map();
@@ -154,6 +158,10 @@
       THINKING: {
         primary: [255, 165, 55], secondary: [255, 222, 111], core: [255, 184, 71],
         motion: [.92, 1, .68, .64, 1, 0],
+      },
+      TOOL: {
+        primary: [255, 196, 38], secondary: [255, 244, 184], core: [255, 211, 92],
+        motion: [.78, .94, .74, .82, .72, 0],
       },
       SPEAKING: {
         primary: [255, 113, 72], secondary: [255, 236, 184], core: [255, 244, 220],
@@ -438,9 +446,9 @@
     }
 
     function setState(nextState) {
-      realState = VOICE_STATES.has(nextState) ? nextState : "OFFLINE";
+      realState = ENGINE_STATES.has(nextState) ? nextState : "OFFLINE";
       canvas.setAttribute("aria-label", `Atlas engine ${realState.toLowerCase()}`);
-      if (!VOICE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
+      if (!ENGINE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
     }
 
     function drawBackdrop() {
@@ -631,7 +639,7 @@
 
     function draw(now) {
       // boss-authorized preview override for headless review; visuals only
-      const previewState = VOICE_STATES.has(window.__atlasEnginePreview)
+      const previewState = ENGINE_STATES.has(window.__atlasEnginePreview)
         ? window.__atlasEnginePreview
         : null;
       setVisualState(previewState || realState);
@@ -759,9 +767,38 @@
     refs.connection.querySelector(".connection-label").textContent = online ? "connected" : "offline";
   }
 
-  function setEngineState(rawState) {
-    const state = VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
-    refs.stateLabel.textContent = state; engine.setState(state);
+  function setEngineState(rawState, tool = null) {
+    const state = rawState === "THINKING" && isRecord(tool) && typeof tool.name === "string" && tool.name.trim()
+      ? "TOOL"
+      : VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
+    if (refs.stateLabel.textContent !== state) refs.stateLabel.textContent = state;
+    engine.setState(state);
+  }
+
+  function renderTool(rawState, tool) {
+    const name = rawState === "THINKING" && isRecord(tool) && typeof tool.name === "string"
+      ? tool.name.trim()
+      : "";
+    const since = name && typeof tool.since === "string" ? tool.since.trim() : "";
+    const identity = name && since ? JSON.stringify([name, since]) : "";
+    if (identity === activeToolIdentity) return;
+    activeToolIdentity = identity;
+    if (!identity) {
+      refs.toolStrip.hidden = true;
+      refs.toolStrip.textContent = "";
+      return;
+    }
+    refs.toolStrip.hidden = false;
+    refs.toolStrip.textContent = `TOOL - ${name}`;
+    refs.toolAnnouncer.replaceChildren(document.createTextNode(`Tool started: ${name}.`));
+  }
+
+  function renderGreeting(user = null, now = new Date()) {
+    if (isRecord(user)) userName = typeof user.name === "string" ? user.name.trim() : "";
+    const hour = now.getHours();
+    const period = hour < 12 ? "MORNING" : hour < 18 ? "AFTERNOON" : "EVENING";
+    const greeting = `GOOD ${period}${userName ? `, ${userName.toLocaleUpperCase()}` : ""}`;
+    if (refs.greeting.textContent !== greeting) refs.greeting.textContent = greeting;
   }
 
   function renderTranscript(lines) {
@@ -822,13 +859,16 @@
       try {
         const payload = await publicJson("/state", {cache: "no-store"});
         setConnection(true);
-        setEngineState(payload.state);
+        setEngineState(payload.state, payload.tool);
+        renderTool(payload.state, payload.tool);
+        renderGreeting(payload.user);
         renderTranscript(payload.transcript);
         renderVoice(payload);
         renderAudio(payload.audio);
       } catch (_error) {
         setConnection(false);
         setEngineState("OFFLINE");
+        renderTool("OFFLINE", null);
         renderAudio(null);
       }
     });
@@ -850,6 +890,10 @@
     const active = currentView === "live" && document.visibilityState === "visible";
     if (active) {
       engine.start();
+      if (!greetingTimer) {
+        renderGreeting();
+        greetingTimer = window.setInterval(renderGreeting, 60_000);
+      }
       if (!signalTimer) {
         refreshSignal();
         signalTimer = window.setInterval(refreshSignal, SIGNAL_INTERVAL_MS);
@@ -857,6 +901,8 @@
       return;
     }
     engine.stop();
+    if (greetingTimer) window.clearInterval(greetingTimer);
+    greetingTimer = 0;
     if (signalTimer) window.clearInterval(signalTimer);
     signalTimer = 0;
   }

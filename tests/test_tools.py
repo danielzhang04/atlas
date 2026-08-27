@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 from dataclasses import dataclass
 import subprocess
@@ -74,6 +75,49 @@ def test_instant_call_reports_success_exception_and_timeout():
     assert timeout.status == "error"
     assert timeout.content == "TimeoutError"
     assert _call(registry, "missing", {}).content == "unknown tool"
+
+
+def test_execution_observer_keeps_newest_call_until_its_own_completion():
+    async def scenario():
+        times = iter((
+            datetime(2026, 8, 22, 12, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 22, 12, 0, 1, tzinfo=timezone.utc),
+        ))
+        registry = ToolRegistry(execution_clock=lambda: next(times))
+        started_a = asyncio.Event()
+        started_b = asyncio.Event()
+        release_a = asyncio.Event()
+        release_b = asyncio.Event()
+        observed = []
+
+        async def block(started, release):
+            started.set()
+            await release.wait()
+            return "done"
+
+        registry.register(_tool("a", run=lambda _: block(started_a, release_a)))
+        registry.register(_tool("b", run=lambda _: block(started_b, release_b)))
+        registry.set_execution_observer(observed.append)
+
+        call_a = asyncio.create_task(registry.call("a", {}))
+        await started_a.wait()
+        call_b = asyncio.create_task(registry.call("b", {}))
+        await started_b.wait()
+        release_a.set()
+        await call_a
+        after_a = observed[-1]
+        release_b.set()
+        await call_b
+        return observed, after_a
+
+    observed, after_a = asyncio.run(scenario())
+
+    assert observed[:2] == [
+        {"name": "a", "since": "2026-08-22T12:00:00+00:00"},
+        {"name": "b", "since": "2026-08-22T12:00:01+00:00"},
+    ]
+    assert after_a == {"name": "b", "since": "2026-08-22T12:00:01+00:00"}
+    assert observed[-1] is None
 
 
 def test_mcp_tool_error_passes_through_bounded_sanitized_message():

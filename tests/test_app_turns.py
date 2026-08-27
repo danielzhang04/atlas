@@ -5,11 +5,14 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from worker import app, router
 from worker.router import Addressing
 from worker.engagement import ENGAGED, Engagement
 from worker.jobstore import JobState
 from worker.state import LISTENING, StatePublisher
+from worker.tools import Tool, ToolRegistry
 
 
 class FakeBrain:
@@ -72,6 +75,10 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.value
+
+
+def _dt(second: int) -> datetime:
+    return datetime(2026, 8, 22, 12, 0, second, tzinfo=timezone.utc)
 
 
 def test_wake_model_callback_publishes_runtime_model():
@@ -236,6 +243,42 @@ def test_tool_events_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged
     ]
     assert engagement.state != ENGAGED
     assert session.spoken == ["Done — Draft verified."]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_registry_tool_state_is_visible_only_while_execution_is_in_flight(fails):
+    async def scenario():
+        publisher = StatePublisher(clock=lambda: _dt(0))
+        registry = ToolRegistry(execution_clock=lambda: _dt(0))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def run(_arguments):
+            started.set()
+            await release.wait()
+            if fails:
+                raise RuntimeError("tool failure")
+            return "done"
+
+        registry.register(Tool(
+            "search_messages",
+            "Search messages.",
+            {"type": "object", "properties": {}},
+            run,
+        ))
+        registry.set_execution_observer(publisher.set_tool)
+        task = asyncio.create_task(registry.call("search_messages", {}))
+        await started.wait()
+        active = publisher.snapshot()["tool"]
+        release.set()
+        result = await task
+        return active, publisher.snapshot()["tool"], result
+
+    active, cleared, result = asyncio.run(scenario())
+
+    assert active == {"name": "search_messages", "since": _dt(0).isoformat()}
+    assert cleared is None
+    assert result.status == ("error" if fails else "ok")
 
 
 def test_engaged_completion_refreshes_silence_and_address_windows():

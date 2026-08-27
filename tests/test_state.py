@@ -12,8 +12,8 @@ def _dt(second: int) -> datetime:
     return datetime(2026, 8, 22, 12, 0, second, tzinfo=timezone.utc)
 
 
-def test_initial_snapshot_publishes_live_voice_and_wake_configuration():
-    publisher = StatePublisher(clock=lambda: _dt(0), voice="mars")
+def test_initial_snapshot_publishes_live_voice_wake_and_user_configuration():
+    publisher = StatePublisher(clock=lambda: _dt(0), voice="mars", user_name="Daniel")
     assert publisher.state == ASLEEP
     assert publisher.snapshot() == {
         "version": 1,
@@ -23,6 +23,8 @@ def test_initial_snapshot_publishes_live_voice_and_wake_configuration():
         "session_id": None,
         "voice": "mars",
         "wake_model": None,
+        "user": {"name": "Daniel"},
+        "tool": None,
         "transcript": [],
         "audio": {
             "input": {"name": None, "following": False},
@@ -30,6 +32,19 @@ def test_initial_snapshot_publishes_live_voice_and_wake_configuration():
         },
         "audio_energy": 0.0,
     }
+
+
+def test_tool_state_publishes_only_name_and_start_time_then_clears():
+    publisher = StatePublisher(clock=lambda: _dt(0))
+
+    publisher.set_tool({"name": "search_messages", "since": _dt(1).isoformat()})
+    assert publisher.snapshot()["tool"] == {
+        "name": "search_messages",
+        "since": _dt(1).isoformat(),
+    }
+
+    publisher.set_tool(None)
+    assert publisher.snapshot()["tool"] is None
 
 
 def test_wake_model_is_trimmed_and_bounded_in_the_public_snapshot():
