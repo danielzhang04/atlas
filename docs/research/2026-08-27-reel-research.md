@@ -42,3 +42,20 @@ WebGL port (0.73 ms/frame today; WebView2 144+ drops SwiftShader), gesture contr
 ## Proposed waves
 
 A quick wins (Atlas cache TTL + UI touches; PostToolUse hook; connector status). B Mission Control (autonomy field, herdr rules -> live state, fleet radar/org tree, FTS5). C gated (dream --apply via PR, Claims/Facts, plan role, skill loop, BM25+RRF). Parked: herdr runtime, constellation view.
+
+## Revision 2 - the five flagged reels + corrections
+
+Correction: one research pass retracted part of its output as unverified; all flagged claims were re-checked
+directly and stood (kzzy47 = Pulse/Vaylo Studios, eadmin2/jarvis_ai HUD = ~58 KB canvas-2D single file with a
+STATE_STYLE table standby/listening/thinking/tool/speaking/error + holo* keyframes + shadowBlur, siriwave MIT/UMD,
+jarvis-mlx terminal-only + no license) except: cosmos.gl is MIT (not CC-BY-NC); jwsun.org attribution dropped.
+
+| Reel | Underneath (verified) | Verdict |
+|---|---|---|
+| OpenJarvis (Julian Goldie) | open-jarvis/OpenJarvis - Stanford Scaling Intelligence/Hazy, Apache-2.0, 9.1k stars, v1.0.0 May 2026 (five primitives), Tauri desktop v1.0.2 w/ Windows installer; engine/ = Ollama/cloud/LiteLLM/Apple FM/Gemma/NIM (no SGLang/llama.cpp); traces/ append-only SQLite; telemetry/ energy (NVIDIA/AMD/Apple/RAPL) + FLOPs; "learning loop" = harness optimization (router/prompts/tool descriptions), GRPO stub, LoRA "v2"; posthog non-optional dep | LIFT trace schema (Atlas, S); LIFT composite routing score 0.6 success + 0.4 feedback (kb, S-M); ADAPT bench-vs-evals split + CLI (kb, M); REWORK local cheap-turn routing (Atlas, M-L) BLOCKED by Atlas rule 2 until amended |
+| Zoey OS | zoeyos.com commercial: "Zoey coordinates, companions specialize, bots execute", up to 200 agents, files-as-terrain 3D, voice, Telegram bridge, Python/visual skill builder, Claude Code terminal on top tier (~$170/mo); no source/self-host. Agent-Zoey/Zoey (Rust, MIT) unrelated | ADAPT org chart w/ live WORKING/IDLE badges (via herdr rules) |
+| MAYA OS v7 (The Hunter Ai) | personal build, no repo; HUD template over a tool-calling agent | ADAPT the visible "Tool Running: <tool>" strip (Atlas) |
+| Wideband (Zayed Haq) | private (no repo/site). Parts: ttyd (MIT, Windows, read-only default), tmux (no Windows), Tailscale Serve (tailnet-only), Kokoro (Apache-2.0, 82M), imessage-exporter (GPL-3, read-only, Mac), MentraOS (MIT; G2 apps run on phone). kb ALREADY has tailnet trust mode designed+implemented (docs/superpowers/specs/2026-08-18-tailnet-trust-mode-design.md; kb.command.ts.net -> 127.0.0.1:4317; /proc/net/tcp peer-UID proof; Linux-only; Funnel forbidden) | ADAPT kill-switch tile (S), fleet-as-thread-list view (M), Kokoro (S); NO ttyd --writable, NO T3 by phone; Windows tailnet mode = L security design |
+
+Added recommendations: #13 Atlas trace store (S), #14 kb kill-switch tile (S), #15 routing score (S-M), #16 evals split (M),
+#17 Kokoro (S), #18 local routing (M-L, rule-2 gate).
