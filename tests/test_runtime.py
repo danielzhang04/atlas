@@ -34,7 +34,9 @@ def _root(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (config / "mcp.yaml").write_text(
-        "servers:\n  demo: {command: demo}\ndefaults: {connect_timeout_s: 1}\n",
+        "servers:\n"
+        "  demo: {command: [demo], enabled_from: kb_bridge.enabled}\n"
+        "defaults: {connect_timeout_s: 1}\n",
         encoding="utf-8",
     )
     (config / "persona.md").write_text("Dry and concise.", encoding="utf-8")

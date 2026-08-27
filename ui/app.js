@@ -49,8 +49,8 @@
   }
   function callNativeWindow(method) {
     const api = nativeWindowApi();
-    if (api === null || typeof api[method] !== "function") return;
-    Promise.resolve(api[method]()).catch(() => {});
+    if (api === null || typeof api[method] !== "function") return Promise.resolve(undefined);
+    return Promise.resolve(api[method]()).catch(() => undefined);
   }
   document.querySelectorAll(".no-drag").forEach((element) => {
     element.addEventListener("mousedown", (event) => event.stopPropagation());
@@ -75,6 +75,32 @@
     if (text !== undefined) element.textContent = text;
     return element;
   }
+
+  const kbUnlockButton = node("button", "button", "Unlock kb");
+  kbUnlockButton.id = "kb-unlock-button";
+  kbUnlockButton.type = "button";
+  const kbUnlockStatus = node("p", "status-note", "");
+  refs.mcpList.parentElement.append(kbUnlockButton, kbUnlockStatus);
+  let kbVoiceSignature = "";
+  async function requestKbUnlock() {
+    kbUnlockButton.disabled = true;
+    kbUnlockStatus.textContent = "Unlocking kb";
+    const result = await callNativeWindow("unlock_kb");
+    kbUnlockStatus.textContent = typeof result === "string" && result ? result : "unlock cancelled";
+    kbUnlockButton.disabled = false;
+    refreshSettings();
+  }
+  function maybeRequestVoiceKbUnlock(lines) {
+    const latest = [...lines].reverse().find((line) => isRecord(line) && line.role === "user" && typeof line.text === "string");
+    if (!latest) return;
+    const phrase = latest.text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!["atlas unlock kb", "unlock the dashboard"].includes(phrase)) return;
+    const signature = `${stringValue(latest.t)}:${latest.text}`;
+    if (signature === kbVoiceSignature) return;
+    kbVoiceSignature = signature;
+    requestKbUnlock();
+  }
+  kbUnlockButton.addEventListener("click", requestKbUnlock);
 
   function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
   async function requestJson(path, {
@@ -743,6 +769,7 @@
     const signature = JSON.stringify(safeLines);
     if (signature === transcriptSignature) return;
     transcriptSignature = signature;
+    maybeRequestVoiceKbUnlock(safeLines);
     refs.transcript.replaceChildren();
     if (safeLines.length === 0) {
       refs.transcript.append(node("p", "empty", "No transcript yet."));
@@ -1085,7 +1112,10 @@
       const row = node("div", "mcp-row");
       row.append(node("strong", "", stringValue(server.name)));
       const tools = Number.isInteger(server.tools) ? server.tools : 0;
-      const detail = server.connected ? `${tools} ${tools === 1 ? "tool" : "tools"}` : stringValue(server.error || "disconnected");
+      let detail = server.connected ? `${tools} ${tools === 1 ? "tool" : "tools"}` : stringValue(server.error || "disconnected");
+      if (server.name === "kb" && ["held", "none", "expired"].includes(server.session)) {
+        detail = `${detail}, session ${server.session}`;
+      }
       row.append(node("span", server.connected ? "is-connected" : "is-failed", detail));
       refs.mcpList.append(row);
     });
