@@ -137,6 +137,8 @@ def build(
 
     register_count_mail(registry, search)
 
+    brain_holder: list[Brain] = []
+
     def on_server(name: str, _current_registry: ToolRegistry) -> None:
         if name != "google":
             return
@@ -150,9 +152,14 @@ def build(
 
         current_search[0] = connected_search
 
+    def on_state(_name: str, _state: str, snapshot: list[dict]) -> None:
+        if brain_holder:
+            brain_holder[0].refresh_capabilities(snapshot)
+
     mcp = McpServers(
         load_mcp_config(ATLAS / "config" / "mcp.yaml"),
         on_server=on_server,
+        on_state=on_state,
         account_values={"user_google_email": google_account},
         **mcp_kwargs,
     )
@@ -167,5 +174,7 @@ def build(
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
         turn_ceiling_s=float(ceiling_s),
+        mcp_status=mcp.status(),
     )
+    brain_holder.append(brain)
     return Runtime(registry, mcp, work, brain, store)

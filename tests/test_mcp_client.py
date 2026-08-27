@@ -414,7 +414,10 @@ def test_connect_registers_schema_policy_and_bounded_concatenated_text():
     assert len(content) == 4_096
     assert content.endswith("…[truncated]")
     assert "\x00" not in content and "\x1f" not in content
-    assert status == [{"name": "google", "connected": True, "tools": 3, "error": None}]
+    assert status == [{
+        "name": "google", "connected": True, "tools": 3, "error": None,
+        "state": "connected", "detail": "ready",
+    }]
 
 
 @pytest.mark.parametrize(
@@ -730,8 +733,14 @@ def test_one_factory_failure_is_class_only_and_does_not_block_other_server(caplo
 
     (status, names) = asyncio.run(scenario())
     assert status == [
-        {"name": "broken", "connected": False, "tools": 0, "error": "RuntimeError"},
-        {"name": "google", "connected": True, "tools": 3, "error": None},
+        {
+            "name": "broken", "connected": False, "tools": 0,
+            "error": "RuntimeError", "state": "error", "detail": "spawn failed",
+        },
+        {
+            "name": "google", "connected": True, "tools": 3, "error": None,
+            "state": "connected", "detail": "ready",
+        },
     ]
     assert names == [
         "google__get_events",
@@ -775,8 +784,14 @@ def test_servers_connect_concurrently():
         return status
 
     assert asyncio.run(scenario()) == [
-        {"name": "one", "connected": True, "tools": 3, "error": None},
-        {"name": "two", "connected": True, "tools": 3, "error": None},
+        {
+            "name": "one", "connected": True, "tools": 3, "error": None,
+            "state": "connected", "detail": "ready",
+        },
+        {
+            "name": "two", "connected": True, "tools": 3, "error": None,
+            "state": "connected", "detail": "ready",
+        },
     ]
 
 
@@ -800,7 +815,276 @@ def test_connect_timeout_is_reported_by_class_name():
         return status
 
     assert asyncio.run(scenario()) == [
-        {"name": "slow", "connected": False, "tools": 0, "error": "TimeoutError"},
+        {
+            "name": "slow", "connected": False, "tools": 0,
+            "error": "TimeoutError", "state": "error",
+            "detail": "handshake timeout after 0.01s",
+        },
+    ]
+
+
+def test_status_distinguishes_connecting_and_disabled_configuration():
+    servers = McpServers({
+        "servers": {
+            "google": {"command": "node"},
+            "kb": {"command": "node", "enabled": False, "session_channel": True},
+        },
+    })
+
+    assert servers.status() == [
+        {
+            "name": "google", "connected": False, "tools": 0, "error": None,
+            "state": "connecting", "detail": "connection pending",
+        },
+        {
+            "name": "kb", "connected": False, "tools": 0, "error": None,
+            "state": "not_configured", "detail": "disabled by configuration",
+            "session": "none",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error", "expected_detail"),
+    [
+        (FileNotFoundError("private path"), "FileNotFoundError", "executable not found: missing.exe"),
+        (OSError("private spawn detail"), "OSError", "spawn failed"),
+        (
+            ExceptionGroup(
+                "private group detail",
+                [type("McpError", (Exception,), {})("Connection closed")],
+            ),
+            "ExceptionGroup",
+            "closed during initialize",
+        ),
+        (
+            type("McpError", (Exception,), {})("Authentication required: private URL"),
+            "McpError",
+            "session required",
+        ),
+    ],
+)
+def test_connection_failures_have_closed_bounded_details(failure, expected_error, expected_detail):
+    def factory(_server_name, _spec):
+        raise failure
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"broken": {"command": "C:/private/path/missing.exe?token=secret"}}},
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "broken", "connected": False, "tools": 0,
+        "error": expected_error, "state": "error", "detail": expected_detail,
+    }]
+    assert len(expected_detail) <= 120
+    assert "private" not in expected_detail and "secret" not in expected_detail
+
+
+def test_missing_claude_config_entry_is_not_configured(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text('{"mcpServers": {}}', encoding="utf-8")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0, "error": "KeyError",
+        "state": "not_configured", "detail": "config entry missing",
+    }]
+
+
+def test_missing_claude_config_file_is_not_configured(tmp_path):
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=tmp_path / "missing.json",
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "FileNotFoundError", "state": "not_configured",
+        "detail": "config file missing",
+    }]
+
+
+def test_malformed_claude_config_is_an_error(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text("{malformed", encoding="utf-8")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "JSONDecodeError", "state": "error",
+        "detail": "config malformed",
+    }]
+
+
+def test_unreadable_claude_config_is_an_error(tmp_path, monkeypatch):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def deny_read(path, *args, **kwargs):
+        if path == claude_config:
+            raise PermissionError("private path")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "PermissionError", "state": "error",
+        "detail": "config unreadable",
+    }]
+
+
+def test_transport_import_failure_is_an_error(monkeypatch):
+    def unavailable():
+        raise ImportError("private import detail")
+
+    monkeypatch.setattr(mcp_client, "_load_mcp_transport", unavailable)
+
+    async def scenario():
+        servers = McpServers({"servers": {"google": {"command": "node"}}})
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "ImportError", "state": "error",
+        "detail": "transport unavailable",
+    }]
+
+
+def test_status_detail_vocabulary_rejects_unknown_pairs():
+    servers = McpServers({"servers": {"google": {"command": "node"}}})
+
+    with pytest.raises(ValueError, match="invalid MCP status detail"):
+        servers._set_status(
+            "google",
+            state="error",
+            detail="private arbitrary detail",
+            connected=False,
+            tools=0,
+            error="RuntimeError",
+        )
+
+    expected = {
+        ("connecting", "connection pending"),
+        ("connected", "ready"),
+        ("configured", "signed executable found"),
+        ("not_configured", "disabled by configuration"),
+        ("not_configured", "config file missing"),
+        ("not_configured", "config entry missing"),
+        ("not_configured", "signed executable not found: tool.exe"),
+        ("error", "config unreadable"),
+        ("error", "config malformed"),
+        ("error", "transport unavailable"),
+        ("error", "handshake timeout after 0.01s"),
+        ("error", "session required"),
+        ("error", "closed during initialize"),
+        ("error", "tool listing failed"),
+        ("error", "executable not found: tool.exe"),
+        ("error", "spawn failed"),
+        ("error", "profile check failed"),
+        ("error", "status unavailable"),
+    }
+    assert all(mcp_client._status_detail_allowed(*pair) for pair in expected)
+
+
+def test_tool_listing_failure_is_reported_without_exception_text():
+    class FailedListing:
+        async def list_tools(self):
+            raise RuntimeError("private child output")
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FailedListing()
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"command": "node"}}},
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0, "error": "RuntimeError",
+        "state": "error", "detail": "tool listing failed",
+    }]
+
+
+def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
+    attempts = [OSError("first private failure"), FileNotFoundError("second private failure")]
+    transitions = []
+
+    def factory(_server_name, _spec):
+        raise attempts.pop(0)
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"command": "C:/private/tool.exe"}}},
+            session_factory=factory,
+            on_state=lambda name, state, snapshot: transitions.append((name, state, snapshot)),
+        )
+        await servers.connect(FakeRegistry())
+        servers.status()
+        servers.status()
+        await servers.connect(FakeRegistry())
+        result = servers.status()
+        await servers.close()
+        return result
+
+    assert asyncio.run(scenario()) == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "FileNotFoundError", "state": "error",
+        "detail": "executable not found: tool.exe",
+    }]
+    assert [(name, state) for name, state, _snapshot in transitions] == [
+        ("google", "error"),
+        ("google", "connecting"),
+        ("google", "error"),
     ]
 
 
@@ -846,6 +1130,33 @@ def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
     assert events == ["entered", "closed"]
 
 
+def test_double_connect_keeps_one_live_task_and_one_child_kill_path():
+    events = []
+
+    async def scenario():
+        kills = []
+        servers = McpServers(
+            {"servers": {"google": {"command": "unused"}}},
+            session_factory=_memory_factory(_server(), events),
+            killer=lambda pid, **kwargs: kills.append((pid, kwargs)),
+        )
+        await servers.connect(FakeRegistry())
+        first_task = servers._server_tasks["google"]
+        servers._server_pids["google"] = 2468
+        with pytest.raises(RuntimeError, match="connection already active"):
+            await servers.connect(FakeRegistry())
+        assert servers._server_tasks == {"google": first_task}
+        assert not first_task.done()
+        await servers.close()
+        return kills, first_task.done()
+
+    kills, done = asyncio.run(scenario())
+
+    assert kills == [(2468, {"check": False})]
+    assert events == ["closed"]
+    assert done is True
+
+
 def test_claude_config_resolves_child_spec_without_leaking_env(tmp_path, caplog):
     secret = "test-secret-value"
     claude_config = tmp_path / "claude.json"
@@ -885,7 +1196,10 @@ def test_claude_config_resolves_child_spec_without_leaking_env(tmp_path, caplog)
     assert seen[0].command == "node"
     assert seen[0].args == ["server.js"]
     assert seen[0].env == {"ACCESS_TOKEN": secret}
-    assert status == [{"name": "google", "connected": False, "tools": 0, "error": "LookupError"}]
+    assert status == [{
+        "name": "google", "connected": False, "tools": 0, "error": "LookupError",
+        "state": "error", "detail": "spawn failed",
+    }]
     assert secret not in caplog.text
     assert secret not in repr(status)
 
@@ -954,7 +1268,10 @@ def test_failed_server_task_ends_and_retains_disconnected_status():
     status, done = asyncio.run(scenario())
 
     assert status == [
-        {"name": "broken", "connected": False, "tools": 0, "error": "LookupError"},
+        {
+            "name": "broken", "connected": False, "tools": 0,
+            "error": "LookupError", "state": "error", "detail": "spawn failed",
+        },
     ]
     assert done is True
 
@@ -1033,6 +1350,8 @@ def test_command_config_is_dormant_by_default_and_resolves_a_minimal_environment
             "connected": False,
             "tools": 0,
             "error": None,
+            "state": "not_configured",
+            "detail": "disabled by configuration",
             "session": "none",
         },
     ]
@@ -1128,6 +1447,8 @@ def test_kb_session_is_notified_after_initialize_and_on_refresh_without_logging(
         "connected": True,
         "tools": 0,
         "error": None,
+        "state": "connected",
+        "detail": "ready",
         "session": "held",
     }]
     assert token not in caplog.text

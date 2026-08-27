@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from worker import brain as brain_mod
 from worker.brain import BASE_SYSTEM, Brain, split_spoken
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
@@ -214,8 +215,9 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     assert call["system"][0]["text"].startswith(
         BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed."
     )
-    assert "lookup: Look something up." in call["system"][0]["text"]
-    assert "mutate: Change something." in call["system"][0]["text"]
+    assert "lookup" in call["system"][0]["text"]
+    assert "mutate" in call["system"][0]["text"]
+    assert "Look something up." not in call["system"][0]["text"]
     assert call["system"][1] == {
         "type": "text",
         "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
@@ -370,12 +372,61 @@ def test_registry_capabilities_are_named_in_the_system_prompt():
         FakeStream(content=[tool_block(name="open_folder")], stop_reason="tool_use"),
         FakeStream(["The folder is open."], content=[text_block("The folder is open.")]),
     )
-    brain = Brain(client, registry, model="fast", persona="")
+    brain = Brain(
+        client,
+        registry,
+        model="fast",
+        persona="",
+        mcp_status=[{
+            "name": "google", "state": "not_configured",
+            "detail": "private detail must not enter the prompt",
+        }],
+    )
 
     assert asyncio.run(collect(brain, "open my kb folder")) == ["The folder is open."]
     system_text = client.messages.calls[0]["system"][0]["text"]
-    assert "open_folder: Test tool." in system_text
+    assert "open_folder" in system_text
+    assert "google: not_configured" in system_text
+    assert "private detail" not in system_text
     assert "Before saying you cannot do something, check this list" in system_text
+
+
+def test_capability_prefix_changes_only_when_explicitly_refreshed():
+    registry = ToolRegistry()
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        FakeStream(["Third."], content=[text_block("Third.")]),
+    )
+    brain = Brain(
+        client, registry, model="fast", persona="",
+        mcp_status=[{"name": "google", "state": "connecting"}],
+    )
+
+    asyncio.run(collect(brain, "one"))
+    registry.register(registry_tool("google__search", lambda _arguments: return_value({})))
+    asyncio.run(collect(brain, "two"))
+    brain.refresh_capabilities([{"name": "google", "state": "connected"}])
+    asyncio.run(collect(brain, "three"))
+
+    prefixes = [call["system"][0]["text"] for call in client.messages.calls]
+    assert prefixes[0] == prefixes[1]
+    assert prefixes[2] != prefixes[1]
+    assert "google__search" in prefixes[2]
+    assert "google: connected" in prefixes[2]
+
+
+def test_capability_text_is_stable_across_snapshot_permutations():
+    schemas = [{"name": "zeta"}, {"name": "alpha"}, {"name": "middle"}]
+    states = [
+        {"name": "zeta", "state": "error"},
+        {"name": "alpha", "state": "connected"},
+        {"name": "middle", "state": "not_configured"},
+    ]
+
+    expected = brain_mod._capability_system_text(schemas, states)
+
+    assert brain_mod._capability_system_text(list(reversed(schemas)), states[1:] + states[:1]) == expected
 
 
 def test_refusal_of_registered_capability_is_suppressed(caplog):

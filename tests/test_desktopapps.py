@@ -18,6 +18,53 @@ def test_default_profiles_match_configured_signed_desktop_apps():
     assert desktopapps.DEFAULT_PROFILES["spotify"].executable == "Spotify.exe"
 
 
+def test_profile_status_uses_signed_resolution_and_closed_details():
+    profiles = {
+        "ready": desktopapps.AppProfile("ready", "ready.exe"),
+        "missing": desktopapps.AppProfile(
+            "missing", "C:/private/profile/tool.exe?token=secret --inspect",
+        ),
+        "broken": desktopapps.AppProfile("broken", "broken.exe"),
+    }
+
+    def resolver(executable):
+        if executable == "ready.exe":
+            return "C:/private/install/ready.exe"
+        if executable.startswith("C:/private/profile/tool.exe"):
+            raise DesktopAppError("private path must not escape")
+        raise RuntimeError("private resolver detail")
+
+    assert desktopapps.status(profiles=profiles, resolver=resolver) == [
+        {"name": "ready", "state": "configured", "detail": "signed executable found"},
+        {
+            "name": "missing", "state": "not_configured",
+            "detail": "signed executable not found: tool.exe",
+        },
+        {"name": "broken", "state": "error", "detail": "profile check failed"},
+    ]
+
+
+def test_status_snapshot_resolves_lazily_once_across_twenty_reads():
+    calls = []
+    snapshot = desktopapps.StatusSnapshot(
+        profiles={"tool": desktopapps.AppProfile("tool", "tool.exe")},
+        resolver=lambda executable: calls.append(executable) or "C:/signed/tool.exe",
+        clock=lambda: "2026-08-27T12:00:00+00:00",
+    )
+
+    values = [snapshot.get() for _ in range(20)]
+
+    assert calls == ["tool.exe"]
+    assert all(value == values[0] for value in values)
+    assert values[0] == {
+        "apps": [{
+            "name": "tool", "state": "configured",
+            "detail": "signed executable found",
+        }],
+        "as_of": "2026-08-27T12:00:00+00:00",
+    }
+
+
 def test_open_and_focus_delegate_only_allowlisted_profiles():
     launches = []
     focuses = []

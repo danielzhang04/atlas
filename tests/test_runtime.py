@@ -85,6 +85,7 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         ]
         assert built.mcp.status() == [{
             "name": "demo", "connected": False, "tools": 0, "error": None,
+            "state": "not_configured", "detail": "disabled by configuration",
         }]
         assert factory_calls == []
     finally:
@@ -275,12 +276,19 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
     class CapturingMcp:
         def __init__(self, _config, **kwargs):
             self.on_server = kwargs["on_server"]
+            self.on_state = kwargs["on_state"]
             self.account_values = kwargs["account_values"]
             self.calls = []
             self.responses = [
                 "Found 61 messages matching 'in:inbox':\n1. first",
                 "Found 14 messages matching 'in:inbox category:primary':\n1. first",
             ]
+
+        def status(self):
+            return [{
+                "name": "google", "connected": False, "tools": 0, "error": None,
+                "state": "connecting", "detail": "connection pending",
+            }]
 
         async def call_raw(self, server, tool, arguments):
             self.calls.append((server, tool, arguments))
@@ -304,6 +312,9 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
         assert built.registry.names().count("count_mail") == 1
 
         built.mcp.on_server("google", built.registry)
+        built.mcp.on_state("google", "connected", [{
+            "name": "google", "state": "connected", "detail": "ready",
+        }])
         result = asyncio.run(built.registry.call("count_mail", {"query": "in:inbox"}))
 
         assert result.content == "61 in your inbox, 14 in Primary"
@@ -330,5 +341,7 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
         assert built.mcp.account_values == {
             "user_google_email": "owner@example.test",
         }
+        assert "google: connected" in built.brain._capability_text
+        assert "detail" not in built.brain._capability_text
     finally:
         built.store.close()

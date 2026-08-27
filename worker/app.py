@@ -16,6 +16,7 @@ from livekit.agents import Agent, AgentSession, JobContext, StopResponse, Worker
 from livekit.plugins import deepgram, silero
 
 from worker import brain as brain_mod
+from worker import desktopapps
 from worker import devicewatch
 from worker import engagement as engagement_mod
 from worker import envload, jobobject, router, runtime, sanitize, state, stateserver
@@ -482,6 +483,7 @@ async def entrypoint(ctx: JobContext) -> None:
     session_started = False
     mcp_task: asyncio.Task | None = None
     work_task: asyncio.Task | None = None
+    desktop_status_task: asyncio.Task | None = None
     engagement: engagement_mod.Engagement | None = None
     turn_ownership: TurnOwnership | None = None
     wake_switch: Any | None = None
@@ -523,6 +525,9 @@ async def entrypoint(ctx: JobContext) -> None:
             if sleep_task is not None:
                 sleep_task.cancel()
                 await asyncio.gather(sleep_task, return_exceptions=True)
+            if desktop_status_task is not None:
+                desktop_status_task.cancel()
+                await asyncio.gather(desktop_status_task, return_exceptions=True)
             if _should_cancel_active_jobs(shutdown_jobs_requested):
                 await services.work.cancel_active(timeout_s=15.0)
             stop_work.set()
@@ -538,6 +543,17 @@ async def entrypoint(ctx: JobContext) -> None:
         finally:
             shutdown_done.set()
 
+    desktop_status = desktopapps.StatusSnapshot()
+
+    def _health() -> dict[str, Any]:
+        snapshot = desktop_status.get()
+        return {
+            "claude": services.work.launcher.available,
+            "mcp": services.mcp.status(),
+            "apps": snapshot["apps"],
+            "as_of": snapshot["as_of"],
+        }
+
     server = await stateserver.start(
         publisher,
         int(cfg["state_port"]),
@@ -546,10 +562,13 @@ async def entrypoint(ctx: JobContext) -> None:
         job_event_provider=services.store.events,
         result_provider=services.store.result,
         cancel_provider=services.work.cancel,
-        health_provider=lambda: {"claude": services.work.launcher.available, "mcp": services.mcp.status()},
+        health_provider=_health,
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
     )
+    desktop_status_task = asyncio.create_task(desktop_status.run())
+    _BG_TASKS.add(desktop_status_task)
+    desktop_status_task.add_done_callback(_BG_TASKS.discard)
     try:
         ctx.add_shutdown_callback(_shutdown)
         _emit_ui_url(authorizer, server.port)

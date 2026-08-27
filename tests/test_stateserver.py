@@ -148,6 +148,7 @@ def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
     assert 'publicJson("/health"' in script[2]
     assert '"/mcp"' not in script[2]
     assert "renderMcp(health.mcp);" in script[2]
+    assert "renderApps(health.apps);" in script[2]
     assert 'kbUnlockButton.id = "kb-unlock-button";' in script[2]
     assert 'callNativeWindow("unlock_kb")' in script[2]
     assert '"atlas unlock kb"' in script[2]
@@ -174,10 +175,19 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     )]
     mcp = [{
         "name": "google", "connected": True, "tools": 11, "error": None,
+        "state": "connected", "detail": "ready",
         "env": "must-not-escape",
     }, {
         "name": "kb", "connected": True, "tools": 22, "error": None,
+        "state": "connected", "detail": "ready",
         "session": "held", "token": "must-not-escape",
+    }]
+    apps = [{
+        "name": "vscode", "state": "configured", "detail": "signed executable found",
+        "path": "must-not-escape",
+    }, {
+        "name": "spotify", "state": "not_configured",
+        "detail": "signed executable not found: Spotify.exe",
     }]
 
     async def scenario():
@@ -190,7 +200,10 @@ def test_jobs_events_and_health_are_fixed_public_projections():
             job_event_provider=lambda requested, after: (
                 after_seen.append((requested, after)) or events
             ),
-            health_provider=lambda: {"claude": True, "mcp": mcp},
+            health_provider=lambda: {
+                "claude": True, "mcp": mcp, "apps": apps,
+                "as_of": "2026-08-27T12:00:00+00:00",
+            },
         )
         event_headers = {stateserver.HEADER: bearer}
         try:
@@ -227,11 +240,23 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert "must-not-escape" not in health_response[2]
     assert json.loads(health_response[2]) == {
         "claude": True,
+        "as_of": "2026-08-27T12:00:00+00:00",
         "mcp": [
-            {"name": "google", "connected": True, "tools": 11, "error": None},
+            {
+                "name": "google", "connected": True, "tools": 11, "error": None,
+                "state": "connected", "detail": "ready",
+            },
             {
                 "name": "kb", "connected": True, "tools": 22, "error": None,
+                "state": "connected", "detail": "ready",
                 "session": "held",
+            },
+        ],
+        "apps": [
+            {"name": "vscode", "state": "configured", "detail": "signed executable found"},
+            {
+                "name": "spotify", "state": "not_configured",
+                "detail": "signed executable not found: Spotify.exe",
             },
         ],
     }
@@ -240,12 +265,66 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert oversized[0] == 400
 
 
+def test_health_normalizes_state_derived_connection_shapes():
+    mcp = [
+        {
+            "name": "connected", "state": "connected", "detail": "ready",
+            "connected": False, "tools": 3, "error": "RuntimeError",
+        },
+        {
+            "name": "failed", "state": "error", "detail": "spawn failed",
+            "connected": True, "tools": 9, "error": "OSError",
+        },
+        {
+            "name": "pending", "state": "connecting", "detail": "connection pending",
+            "connected": True, "tools": 7, "error": "RuntimeError",
+        },
+    ]
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            clock=lambda: _dt(1),
+            health_provider=lambda: {"mcp": mcp},
+        )
+        try:
+            return await _request(server, path="/health")
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert json.loads(response[2]) == {
+        "claude": False,
+        "as_of": "2026-08-22T12:00:01+00:00",
+        "mcp": [
+            {
+                "name": "connected", "state": "connected", "detail": "ready",
+                "connected": True, "tools": 3, "error": None,
+            },
+            {
+                "name": "failed", "state": "error", "detail": "spawn failed",
+                "connected": False, "tools": 0, "error": "OSError",
+            },
+            {
+                "name": "pending", "state": "connecting",
+                "detail": "connection pending", "connected": False,
+                "tools": 0, "error": None,
+            },
+        ],
+        "apps": [],
+    }
+
+
 def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypatch):
     from worker import app
 
     calls = []
     publishers = []
     placeholder_audio = []
+    health_providers = []
+    desktop_resolutions = []
     build_active = False
 
     real_publisher = app.state.StatePublisher
@@ -311,6 +390,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
 
     async def start_server(*_args, **_kwargs):
         publishers.append(_args[0])
+        health_providers.append(_kwargs["health_provider"])
         snapshot = publishers[0].snapshot()
         assert snapshot["ready"] is False
         assert snapshot["audio"] == placeholder_audio[0]
@@ -376,9 +456,14 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
     monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
     monkeypatch.setattr(app.stateserver, "start", start_server)
+    monkeypatch.setattr(
+        app.desktopapps,
+        "status",
+        lambda **_kwargs: desktop_resolutions.append("resolved") or [],
+    )
     monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: calls.append("ui-emitted"))
     real_create_task = asyncio.create_task
-    scheduled = iter(("mcp-scheduled", "work-scheduled"))
+    scheduled = iter(("desktop-status-scheduled", "mcp-scheduled", "work-scheduled"))
 
     def record_create_task(coro):
         calls.append(next(scheduled))
@@ -387,12 +472,16 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.asyncio, "create_task", record_create_task)
 
     asyncio.run(app.entrypoint(FakeContext()))
+    health = [health_providers[0]() for _ in range(20)]
 
     assert publishers[0].snapshot()["ready"] is True
+    assert desktop_resolutions == ["resolved"]
+    assert all(item["apps"] == [] and item["as_of"] for item in health)
     assert calls == [
         "build-returned",
         "publisher-created",
         "server-started",
+        "desktop-status-scheduled",
         "ui-emitted",
         "warm",
         "wake-resolved",

@@ -18,6 +18,8 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from .statusdetail import status_detail_allowed
+
 __all__ = [
     "HEADER",
     "HOST",
@@ -52,7 +54,9 @@ JOB_ID = re.compile(
 JOB_FIELDS = (
     "id", "title", "status", "session_id", "created_at", "updated_at", "summary", "error",
 )
-MCP_FIELDS = ("name", "connected", "tools", "error")
+MCP_FIELDS = ("name", "connected", "tools", "error", "state", "detail")
+MCP_STATES = frozenset({"connecting", "connected", "not_configured", "error"})
+APP_STATES = frozenset({"configured", "not_configured", "error"})
 WAKE_MODEL_LIMIT = 128
 
 
@@ -247,22 +251,46 @@ def _safe_mcp(value: Any) -> list[dict[str, Any]]:
     for item in value[:32]:
         if not isinstance(item, dict):
             continue
-        name, connected, tools, error = (item.get(key) for key in MCP_FIELDS)
+        name, _connected, tools, error, state, detail = (
+            item.get(key) for key in MCP_FIELDS
+        )
         if not (
-            isinstance(name, str) and isinstance(connected, bool)
+            isinstance(name, str)
             and isinstance(tools, int) and not isinstance(tools, bool)
             and (error is None or isinstance(error, str))
+            and state in MCP_STATES
+            and status_detail_allowed(state, detail)
         ):
             continue
+        connected = state == "connected"
         projected = {
-            "name": name[:128], "connected": connected, "tools": max(0, tools),
-            "error": error[:128] if error is not None else None,
+            "name": name[:128], "connected": connected,
+            "tools": max(0, tools) if connected else 0,
+            "error": error[:128] if state == "error" and error is not None else None,
+            "state": state, "detail": detail,
         }
         session = item.get("session")
         if name == "kb" and session in {"held", "none", "expired"}:
             projected["session"] = session
         servers.append(projected)
     return servers
+
+
+def _safe_apps(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    apps = []
+    for item in value[:32]:
+        if not isinstance(item, dict):
+            continue
+        name, state, detail = (item.get(key) for key in ("name", "state", "detail"))
+        if not (
+            isinstance(name, str) and state in APP_STATES
+            and status_detail_allowed(state, detail)
+        ):
+            continue
+        apps.append({"name": name[:128], "state": state, "detail": detail})
+    return apps
 
 
 class StateServer:
@@ -383,7 +411,9 @@ class StateServer:
             value = {}
         payload = {
             "claude": value.get("claude") is True,
+            "as_of": _bounded_string(value.get("as_of"), 64) or self._clock().isoformat(),
             "mcp": _safe_mcp(value.get("mcp", [])),
+            "apps": _safe_apps(value.get("apps", [])),
         }
         return web.json_response(payload, headers={"cache-control": "no-store"})
 

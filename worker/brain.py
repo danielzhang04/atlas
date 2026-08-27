@@ -202,6 +202,7 @@ class Brain:
         history_exchanges: int = 8,
         on_tool: Callable[[str, ToolResult], None] | None = None,
         clock: Callable[[], datetime] = datetime.now,
+        mcp_status: list[dict[str, Any]] | None = None,
     ) -> None:
         if (
             isinstance(turn_timeout_s, bool)
@@ -229,6 +230,17 @@ class Brain:
             rules += "\n\nVoice and personality:\n" + persona.strip()
         self._system_text = rules
         self._history: list[dict[str, str]] = []
+        self._capability_text = _capability_system_text(
+            self.registry.schemas(),
+            mcp_status or [],
+        )
+
+    def refresh_capabilities(self, mcp_status: list[dict[str, Any]]) -> None:
+        """Refresh the cached tool/state prefix after a host-observed transition."""
+        self._capability_text = _capability_system_text(
+            self.registry.schemas(),
+            mcp_status,
+        )
 
     def _request_tools(self) -> list[dict[str, Any]]:
         tools = [dict(schema) for schema in self.registry.schemas()]
@@ -259,7 +271,7 @@ class Brain:
             turn_content = f"{context}\n\nCurrent addressed utterance:\n{prompt}"
         messages.append({"role": "user", "content": turn_content})
         tools = self._request_tools()
-        system_text = self._system_text + "\n\n" + _capability_system_text(tools)
+        system_text = self._system_text + "\n\n" + self._capability_text
         system = [{
             "type": "text",
             "text": system_text,
@@ -457,16 +469,33 @@ class Brain:
         return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
 
 
-def _capability_system_text(schemas: list[dict[str, Any]]) -> str:
+def _capability_system_text(
+    schemas: list[dict[str, Any]],
+    mcp_status: list[dict[str, Any]],
+) -> str:
     lines = ["Available registered capabilities by name:"]
-    for schema in schemas:
-        name = schema.get("name")
-        description = schema.get("description")
-        if not isinstance(name, str) or not isinstance(description, str):
-            continue
-        purpose = " ".join(description.split())[:200]
-        lines.append(f"{name}: {purpose}")
+    names = sorted(
+        schema.get("name")
+        for schema in schemas
+        if isinstance(schema.get("name"), str)
+    )
+    for name in names:
+        lines.append(name)
     if len(lines) == 1:
+        lines.append("none")
+    lines.append("MCP server states:")
+    state_count = 0
+    states = sorted(
+        (item.get("name"), item.get("state"))
+        for item in mcp_status
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and item.get("state") in {"connecting", "connected", "not_configured", "error"}
+    )
+    for name, state in states:
+        lines.append(f"{name}: {state}")
+        state_count += 1
+    if state_count == 0:
         lines.append("none")
     lines.append(
         "Before saying you cannot do something, check this list; if a tool covers it, call it."

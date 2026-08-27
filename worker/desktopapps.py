@@ -1,26 +1,34 @@
 """Open or focus signed, allowlisted desktop application profiles."""
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import ctypes
+from datetime import datetime, timezone
 import importlib
 import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable
+import threading
+from typing import Any
 from urllib.parse import urlsplit
+
+from .statusdetail import render_status_detail
 
 __all__ = [
     "AppProfile",
     "DEFAULT_PROFILES",
     "DesktopAppError",
     "DesktopApps",
+    "StatusSnapshot",
     "close_profile",
     "focus_profile",
     "known_folder_path",
     "native_launcher",
     "open_profile",
+    "status",
 ]
 
 
@@ -138,6 +146,91 @@ class DesktopApps:
             return self._profiles[app_id]
         except KeyError as exc:
             raise DesktopAppError("app is not allowlisted") from exc
+
+
+def status(
+    *,
+    profiles: dict[str, AppProfile] | None = None,
+    resolver: Callable[[str], str] | None = None,
+) -> list[dict[str, str]]:
+    """Report signed executable availability without exposing resolved paths."""
+    configured = profiles or DEFAULT_PROFILES
+    resolve = resolver or _resolve_executable
+    result = []
+    for name, profile in configured.items():
+        try:
+            resolve(profile.executable)
+        except DesktopAppError:
+            result.append({
+                "name": name,
+                "state": "not_configured",
+                "detail": render_status_detail(
+                    "not_configured", "signed_missing", executable=profile.executable,
+                ),
+            })
+        except Exception:
+            result.append({
+                "name": name,
+                "state": "error",
+                "detail": render_status_detail("error", "profile_failed"),
+            })
+        else:
+            result.append({
+                "name": name,
+                "state": "configured",
+                "detail": render_status_detail("configured", "signed_found"),
+            })
+    return result
+
+
+class StatusSnapshot:
+    """Lazily cache signed desktop status and refresh it only off the poll path."""
+
+    def __init__(
+        self,
+        *,
+        profiles: dict[str, AppProfile] | None = None,
+        resolver: Callable[[str], str] | None = None,
+        clock: Callable[[], datetime | str] = lambda: datetime.now(timezone.utc),
+        refresh_interval_s: float = 600.0,
+    ) -> None:
+        self._profiles = profiles
+        self._resolver = resolver
+        self._clock = clock
+        self._refresh_interval_s = refresh_interval_s
+        self._lock = threading.Lock()
+        self._apps: list[dict[str, str]] | None = None
+        self._as_of: str | None = None
+
+    def refresh(self) -> dict[str, Any]:
+        apps = status(profiles=self._profiles, resolver=self._resolver)
+        now = self._clock()
+        as_of = now.isoformat() if isinstance(now, datetime) else str(now)
+        with self._lock:
+            self._apps = apps
+            self._as_of = as_of[:64]
+            return self._copy_locked()
+
+    def get(self) -> dict[str, Any]:
+        with self._lock:
+            if self._apps is not None:
+                return self._copy_locked()
+            apps = status(profiles=self._profiles, resolver=self._resolver)
+            now = self._clock()
+            self._apps = apps
+            self._as_of = (now.isoformat() if isinstance(now, datetime) else str(now))[:64]
+            return self._copy_locked()
+
+    async def run(self) -> None:
+        while True:
+            await asyncio.sleep(self._refresh_interval_s)
+            await asyncio.to_thread(self.refresh)
+
+    def _copy_locked(self) -> dict[str, Any]:
+        return {
+            "apps": [dict(item) for item in self._apps or ()],
+            "as_of": self._as_of,
+        }
 
 
 def _direct_https(value: str) -> bool:
