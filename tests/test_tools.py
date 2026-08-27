@@ -1,6 +1,8 @@
 import asyncio
 import json
 from dataclasses import dataclass
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -104,7 +106,7 @@ def test_host_confirmation_is_single_use_and_model_calls_are_host_only():
     assert pending.confirm_id
     assert pending.content == (
         "NOT EXECUTED. Read this summary back to Daniel and wait for his yes or no: "
-        "send — to: Daniel."
+        "send - to: Daniel."
     )
     assert calls == []
     assert _call(registry, "confirm", {"confirm_id": pending.confirm_id}) == ToolResult(
@@ -196,8 +198,8 @@ def test_confirmation_readback_lists_all_arguments_and_truncates_each_value():
     assert result.status == "needs_confirmation"
     assert registry.pending is not None
     assert registry.pending.summary == (
-        "send — to: Daniel; "
-        f"subject: {'x' * 160} …(+10 chars); "
+        "send - to: Daniel; "
+        f"subject: {'x' * 160} ...(+10 chars); "
         'metadata: {"draft": true}'
     )
     assert registry.pending.summary in result.content
@@ -260,6 +262,225 @@ def test_open_exe_and_focus_use_signed_profiles():
     assert focused == ["vscode"]
     result = _call(registry, "focus", {"app": "gmail"})
     assert result.status == "error" and result.content == "unknown app"
+
+
+def test_open_reports_when_signed_profile_focused_an_existing_window():
+    registry = ToolRegistry()
+    apps = {"notepad": AppEntry(exe="notepad", words=("notepad",))}
+    builtin(
+        registry,
+        apps,
+        _FakeWork(),
+        profile_opener=lambda _app_id, _url: {
+            "application": "notepad.exe", "focused": True, "existing": True,
+        },
+    )
+
+    result = _call(registry, "open", {"target": "notepad"})
+
+    assert result == ToolResult("ok", "focused existing window")
+
+
+class _FakeDesktopControl:
+    def __init__(self):
+        self.calls = []
+        self.focused_title = "Report - Notepad"
+        self.focused_handle = 10
+
+    def list_windows(self, *, limit=40):
+        windows = [
+            {"title": self.focused_title, "pid": 101, "class": "Fake"}
+            for _ in range(limit)
+        ]
+        return {"windows": windows, "total": limit, "truncated": False}
+
+    def focus_window(self, **target):
+        self.calls.append(("focus", target))
+        return {"focused": self.focused_title, "pid": 101}
+
+    def window_action(self, action, **arguments):
+        self.calls.append(("window_action", action, arguments))
+        return {"action": action}
+
+    def media_key(self, key):
+        self.calls.append(("media_key", key))
+        return {"pressed": key}
+
+    def click(self, x, y, **target):
+        self.calls.append(("click", x, y, target))
+        return {"clicked": True}
+
+    def type_text(self, value):
+        self.calls.append(("type_text", value))
+        return {"typed": len(value)}
+
+    def press_keys(self, chord):
+        self.calls.append(("press_keys", chord))
+        return {"pressed": chord}
+
+    def press_delete(self, chord, *, expected_hwnd):
+        if self.focused_handle != expected_hwnd:
+            raise RuntimeError("focus changed")
+        self.calls.append(("press_keys", chord))
+        return {"pressed": chord}
+
+    def focused_window_identity(self):
+        return {
+            "title": self.focused_title,
+            "pid": 101,
+            "_handle": self.focused_handle,
+        }
+
+    @staticmethod
+    def normalize_chord(chord):
+        return "+".join(part.strip().casefold() for part in chord.split("+"))
+
+
+def test_desktop_tools_have_typed_schemas_and_required_policies():
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    expected = {
+        "list_windows": "instant",
+        "focus_window": "instant",
+        "window_action": "instant",
+        "media_key": "instant",
+        "click": "instant",
+        "type_text": "instant",
+        "press_keys": "instant",
+        "press_delete": "confirm",
+    }
+    assert {name: registry._tools[name].policy for name in expected} == expected
+    schemas = {item["name"]: item["input_schema"] for item in registry.schemas()}
+    assert set(expected).issubset(schemas)
+    assert schemas["focus_window"]["additionalProperties"] is False
+    assert schemas["list_windows"]["properties"]["limit"]["maximum"] == 100
+    assert schemas["press_delete"]["properties"]["chord"]["enum"] == [
+        "delete", "ctrl+d", "ctrl+x", "shift+delete",
+    ]
+    assert "ctrl+x" not in schemas["press_keys"]["properties"]["chord"]["enum"]
+    assert "backspace" in schemas["press_keys"]["properties"]["chord"]["enum"]
+
+
+def test_desktop_tools_resolve_targets_host_side_and_execute_instantly():
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    assert _call(registry, "list_windows", {"limit": 2}).status == "ok"
+    assert _call(registry, "focus_window", {"title": "Notepad"}).status == "ok"
+    assert _call(registry, "window_action", {
+        "pid": 101, "action": "move:right-half",
+    }).status == "ok"
+    assert _call(registry, "media_key", {"key": "mute"}).status == "ok"
+    assert _call(registry, "click", {"x": 5, "y": 6, "title": "Notepad"}).status == "ok"
+    assert _call(registry, "type_text", {"text": "hello"}).status == "ok"
+    assert _call(registry, "press_keys", {"chord": "ctrl+s"}).status == "ok"
+    assert desktop.calls == [
+        ("focus", {"title": "Notepad"}),
+        ("window_action", "move:right-half", {"pid": 101}),
+        ("media_key", "mute"),
+        ("click", 5, 6, {"title": "Notepad"}),
+        ("type_text", "hello"),
+        ("press_keys", "ctrl+s"),
+    ]
+
+
+@pytest.mark.parametrize("chord", ["delete", "ctrl+d", "ctrl+x", "shift+delete"])
+def test_press_keys_refuses_delete_chords_and_press_delete_reads_back_focus(chord):
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    refused = _call(registry, "press_keys", {"chord": chord})
+    pending = _call(registry, "press_delete", {"chord": chord})
+
+    assert refused == ToolResult("error", "delete chords require press_delete")
+    assert pending.status == "needs_confirmation"
+    assert "Report - Notepad" in pending.content
+    assert registry.pending.arguments == {
+        "chord": chord, "window": "Report - Notepad", "pid": 101,
+    }
+    assert registry.pending.host_state == 10
+    assert desktop.calls == []
+    confirmed = asyncio.run(registry.confirm(pending.confirm_id))
+    assert confirmed.status == "ok"
+    assert desktop.calls == [("press_keys", chord)]
+
+
+def test_press_delete_fails_if_focus_changes_after_confirmation_readback():
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+    pending = _call(registry, "press_delete", {"chord": "delete"})
+    desktop.focused_handle = 20
+
+    result = asyncio.run(registry.confirm(pending.confirm_id))
+
+    assert result == ToolResult("error", "focused window changed; delete not executed")
+    assert desktop.calls == []
+
+
+def test_press_delete_aborts_for_same_title_on_a_different_window():
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+    pending = _call(registry, "press_delete", {"chord": "delete"})
+    desktop.focused_handle = 20
+
+    result = asyncio.run(registry.confirm(pending.confirm_id))
+
+    assert desktop.focused_title == "Report - Notepad"
+    assert result == ToolResult("error", "focused window changed; delete not executed")
+    assert desktop.calls == []
+
+
+def test_press_delete_readback_keeps_a_sane_full_title_without_exposing_hwnd():
+    desktop = _FakeDesktopControl()
+    desktop.focused_title = "A" * 400
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    pending = _call(registry, "press_delete", {"chord": "delete"})
+
+    assert desktop.focused_title in pending.content
+    assert "handle" not in pending.content.casefold()
+    assert "hwnd" not in pending.content.casefold()
+
+
+def test_list_windows_result_remains_valid_json_under_content_cap():
+    desktop = _FakeDesktopControl()
+    desktop.focused_title = "W" * 500
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    result = _call(registry, "list_windows", {"limit": 100})
+    payload = json.loads(result.content)
+
+    assert len(result.content) <= 4096
+    assert payload["total"] == 100
+    assert payload["truncated"] is True
+    assert len(payload["windows"]) < 100
+
+
+def test_worker_tools_import_does_not_load_desktopcontrol_implementation():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import worker.tools; "
+                "raise SystemExit(int('worker.desktopcontrol' in sys.modules))"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
 
 
 def test_open_prefers_spotify_desktop_profile_and_falls_back_to_web():
@@ -460,6 +681,13 @@ def test_open_atlas_uses_the_static_alias_without_a_paired_url():
         ("open_folder", {"path": "C:/Desk"}),
         ("cancel_work", {"job_id": "job-1"}),
         ("open", {"target": "https://example.com/"}),
+        ("focus_window", {"pid": 101}),
+        ("window_action", {"pid": 101, "action": "close"}),
+        ("media_key", {"key": "mute"}),
+        ("click", {"x": 1, "y": 2}),
+        ("type_text", {"text": "hello"}),
+        ("press_keys", {"chord": "ctrl+s"}),
+        ("press_delete", {"chord": "delete"}),
     ],
 )
 def test_tainted_turn_refuses_actions_that_can_change_state(name, arguments):
@@ -593,7 +821,7 @@ def test_content_is_bounded_and_control_characters_are_stripped():
 
     assert "\x00" not in result.content and "\x1f" not in result.content
     assert len(result.content) == 4096
-    assert result.content.endswith("…[truncated]")
+    assert result.content.endswith("...[truncated]")
 
 
 def test_load_apps_reads_the_teachable_alias_config(tmp_path):
