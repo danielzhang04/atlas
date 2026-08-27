@@ -209,21 +209,189 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         {"role": "assistant", "content": "First sentence. Second sentence! Tail"},
     ]
     call = client.messages.calls[0]
-    assert call["system"] == [
-        {
-            "type": "text",
-            "text": BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed.",
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
-        },
-    ]
+    assert call["system"][0]["type"] == "text"
+    assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert call["system"][0]["text"].startswith(
+        BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed."
+    )
+    assert "lookup: Look something up." in call["system"][0]["text"]
+    assert "mutate: Change something." in call["system"][0]["text"]
+    assert call["system"][1] == {
+        "type": "text",
+        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
+    }
     assert "cache_control" not in call["system"][1]
     assert call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in call["tools"][0]
     assert call["tool_choice"] == {"type": "auto"}
+
+
+@pytest.mark.parametrize("claim", ["I opened Spotify.", "I've opened Spotify."])
+def test_unbacked_action_claim_is_suppressed_by_the_host(caplog, claim):
+    client = FakeClient(FakeStream(
+        [claim],
+        content=[text_block(claim)],
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert "".join(asyncio.run(collect(brain, "Open Spotify"))) == (
+        "I did not actually do that - I have no tool result. Want me to?"
+    )
+    assert caplog.text.count("unbacked action claim suppressed") == 1
+
+
+def test_action_claim_after_ok_tool_result_passes_through():
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == ["Spotify is open."]
+
+
+def test_known_registry_target_state_claim_requires_a_relevant_call():
+    registry = ToolRegistry()
+    builtin(
+        registry,
+        {"spotify": AppEntry(url="https://spotify.test/", words=("spotify", "music"))},
+        BrainWork(),
+        opener=lambda _target: None,
+    )
+    reply = "Spotify is open."
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Is Spotify open?")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+def test_unrelated_ok_read_does_not_license_failed_open_claim():
+    registry = FakeRegistry(
+        ToolResult("ok", "read result"),
+        ToolResult("error", "could not open"),
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="read_file")], stop_reason="tool_use"),
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Read the note, then open Spotify")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+def test_cancel_pending_does_not_license_open_claim():
+    registry = FakeRegistry(ToolResult("ok", "cancelled"))
+    registry._pending = PendingAction(
+        confirm_id="confirm-123",
+        name="open",
+        arguments={"target": "spotify"},
+        summary="open Spotify",
+        expires=float("inf"),
+    )
+    client = FakeClient(
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "no")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        (
+            "No problem, I opened Spotify.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+        ("I did not open Spotify.", "I did not open Spotify."),
+        (
+            "I couldn't open X, but I opened Y.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+        ("I couldn't open Spotify.", "I couldn't open Spotify."),
+        (
+            "The task is done.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+    ],
+)
+def test_action_claim_negation_is_clause_local(reply, expected):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert "".join(asyncio.run(collect(brain, "Help me"))) == expected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Spotify was created in 2006.",
+        "The store is open today.",
+        "This project is open source.",
+        "The question is open-ended.",
+    ],
+)
+def test_factual_action_words_are_not_treated_as_attributed_claims(reply):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Tell me a fact")) == [reply]
+
+
+@pytest.mark.parametrize("reply", ["Spotify has many playlists.", "Would you like a playlist?"])
+def test_non_action_answers_and_questions_are_not_changed(reply):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Tell me about Spotify")) == [reply]
+
+
+def test_registry_capabilities_are_named_in_the_system_prompt():
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "open_folder",
+        lambda _arguments: return_value({"opened": "C:/Users/danie/kb"}),
+    ))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        FakeStream(["The folder is open."], content=[text_block("The folder is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "open my kb folder")) == ["The folder is open."]
+    system_text = client.messages.calls[0]["system"][0]["text"]
+    assert "open_folder: Test tool." in system_text
+    assert "Before saying you cannot do something, check this list" in system_text
+
+
+def test_refusal_of_registered_capability_is_suppressed(caplog):
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "open_folder",
+        lambda _arguments: return_value({"opened": "C:/Users/danie/kb"}),
+    ))
+    refusal = "I don't have access to your local desktop folders."
+    client = FakeClient(FakeStream([refusal], content=[text_block(refusal)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "open my kb folder")) == [
+        "I can do that with open_folder - shall I?",
+    ]
+    assert "available capability refusal suppressed (tool=open_folder)" in caplog.text
 
 
 def test_ambient_context_reaches_provider_taints_tools_and_is_not_remembered():
@@ -711,12 +879,12 @@ def test_brain_passes_the_exact_transcript_to_each_registry_call():
     registry = FakeRegistry(ToolResult("ok", "done"))
     client = FakeClient(
         FakeStream(content=[tool_block()], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
     transcript = "  Keep my spacing  "
 
-    assert asyncio.run(collect(brain, transcript)) == ["Done."]
+    assert asyncio.run(collect(brain, transcript)) == ["Finished."]
     assert registry.transcripts == [transcript]
 
 
@@ -726,11 +894,11 @@ def test_content_bearing_tools_taint_every_later_call_in_the_turn(content_tool):
     client = FakeClient(
         FakeStream(content=[tool_block(name=content_tool)], stop_reason="tool_use"),
         FakeStream(content=[tool_block(name="lookup")], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Check, then act")) == ["Done."]
+    assert asyncio.run(collect(brain, "Check, then act")) == ["Finished."]
     assert registry.taints == [False, True]
 
 
@@ -743,11 +911,11 @@ def test_metadata_tools_do_not_taint_later_calls_in_the_turn(first_tool, later_t
     client = FakeClient(
         FakeStream(content=[tool_block(name=first_tool)], stop_reason="tool_use"),
         FakeStream(content=[tool_block(name=later_tool)], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Check, then open it")) == ["Done."]
+    assert asyncio.run(collect(brain, "Check, then open it")) == ["Finished."]
     assert registry.calls == [(first_tool, {}), (later_tool, {})]
     assert registry.taints == [False, False]
 
@@ -835,7 +1003,11 @@ def test_streamed_text_is_yielded_before_tool_runs():
     registry = FakeRegistry(ToolResult("ok", "result"))
     registry.when_called = lambda: seen.append("called")
     client = FakeClient(
-        FakeStream(["Let me check. "], content=[tool_block()], stop_reason="tool_use"),
+        FakeStream(
+            ["Let me check. "],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
         FakeStream(["Done."], content=[text_block("Done.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
@@ -850,6 +1022,33 @@ def test_streamed_text_is_yielded_before_tool_runs():
     first, rest = asyncio.run(scenario())
     assert first == "Let me check. "
     assert rest == ["Done."]
+    assert seen == ["called"]
+
+
+def test_claim_sentence_waits_while_safe_sentence_streams_first():
+    seen: list[str] = []
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    registry.when_called = lambda: seen.append("called")
+    client = FakeClient(
+        FakeStream(
+            ["Let me check. ", "I opened Spotify."],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        iterator = brain.respond("Open Spotify")
+        first = await anext(iterator)
+        assert seen == []
+        rest = [chunk async for chunk in iterator]
+        return first, rest
+
+    first, rest = asyncio.run(scenario())
+    assert first == "Let me check. "
+    assert rest == ["I did not actually do that - I have no tool result. Want me to?"]
     assert seen == ["called"]
 
 
