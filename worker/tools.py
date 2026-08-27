@@ -411,40 +411,63 @@ def register_count_mail(
 
     async def count_mail(arguments: dict) -> ToolResult | dict:
         query = _text_argument(arguments, "query", maximum=1024)
-        total = 0
-        page_token = None
-        seen_tokens: set[str] = set()
-        for _page in range(4):
-            search_arguments = {
-                "query": query,
-                "page_size": 500,
-                "include_headers": False,
-            }
-            if page_token is not None:
-                search_arguments["page_token"] = page_token
-            try:
-                content = await search(search_arguments)
-            except RuntimeError as exc:
-                if str(exc) == "google not connected":
-                    return ToolResult("error", "Google isn't connected yet")
-                raise
-            found = _FOUND_MESSAGES.search(content)
-            if found is None:
-                return ToolResult("error", "unexpected mail search result")
-            page_count = int(found.group(1))
-            if page_count > 500:
-                return ToolResult("error", "unexpected mail search result")
-            total += page_count
-            token_match = _NEXT_PAGE_TOKEN.search(content)
-            page_token = token_match.group(1) if token_match is not None else None
-            if page_token is None:
-                return {"query": query, "count": total, "exact": True}
-            if page_count < 500:
-                return ToolResult("error", "unexpected mail search result")
-            if page_token in seen_tokens:
-                return {"query": query, "count": total, "exact": False}
-            seen_tokens.add(page_token)
-        return {"query": query, "count": total, "exact": page_token is None}
+
+        async def bounded_count(target_query: str) -> tuple[int, bool] | ToolResult:
+            total = 0
+            page_token = None
+            seen_tokens: set[str] = set()
+            for _page in range(4):
+                search_arguments = {
+                    "query": target_query,
+                    "page_size": 500,
+                    "include_headers": False,
+                }
+                if page_token is not None:
+                    search_arguments["page_token"] = page_token
+                try:
+                    content = await search(search_arguments)
+                except RuntimeError as exc:
+                    if str(exc) == "google not connected":
+                        return ToolResult("error", "Google isn't connected yet")
+                    raise
+                found = _FOUND_MESSAGES.search(content)
+                if found is None:
+                    return ToolResult("error", "unexpected mail search result")
+                page_count = int(found.group(1))
+                if page_count > 500:
+                    return ToolResult("error", "unexpected mail search result")
+                total += page_count
+                token_match = _NEXT_PAGE_TOKEN.search(content)
+                page_token = token_match.group(1) if token_match is not None else None
+                if page_token is None:
+                    return total, True
+                if page_count < 500:
+                    return ToolResult("error", "unexpected mail search result")
+                if page_token in seen_tokens:
+                    return total, False
+                seen_tokens.add(page_token)
+            return total, page_token is None
+
+        inbox_count = await bounded_count(query)
+        if isinstance(inbox_count, ToolResult):
+            return inbox_count
+        if re.search(r"(?:^|\s)in:inbox(?:\s|$)", query, re.IGNORECASE):
+            primary_query = query
+            if not re.search(r"(?:^|\s)category:primary(?:\s|$)", query, re.IGNORECASE):
+                primary_query += " category:primary"
+            primary_count = await bounded_count(primary_query)
+            if isinstance(primary_count, ToolResult):
+                return primary_count
+            inbox_total, inbox_exact = inbox_count
+            primary_total, primary_exact = primary_count
+            inbox_text = str(inbox_total) if inbox_exact else f"at least {inbox_total}"
+            primary_text = str(primary_total) if primary_exact else f"at least {primary_total}"
+            return ToolResult(
+                "ok",
+                f"{inbox_text} in your inbox, {primary_text} in Primary",
+            )
+        total, exact = inbox_count
+        return {"query": query, "count": total, "exact": exact}
 
     schema = {
         "type": "object", "properties": {"query": {"type": "string"}},

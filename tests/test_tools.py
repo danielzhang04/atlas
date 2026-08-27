@@ -651,9 +651,47 @@ def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
 def test_count_mail_sums_pages_and_accepts_both_token_shapes():
     calls = []
     responses = [
-        "Found 500 messages matching 'in:inbox':\n1. first\nNext page token: token-2",
-        "Found 500 messages matching 'in:inbox':\n1. next\npage_token: token-3",
-        "Found 17 messages matching 'in:inbox':\n1. last",
+        "Found 500 messages matching 'label:archive':\n1. first\nNext page token: token-2",
+        "Found 500 messages matching 'label:archive':\n1. next\npage_token: token-3",
+        "Found 17 messages matching 'label:archive':\n1. last",
+    ]
+
+    async def search(arguments):
+        calls.append(arguments)
+        return responses.pop(0)
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:archive"})
+
+    assert json.loads(result.content) == {"query": "label:archive", "count": 1017, "exact": True}
+    assert calls == [
+        {
+            "query": "label:archive",
+            "page_size": 500,
+            "include_headers": False,
+        },
+        {
+            "query": "label:archive",
+            "page_size": 500,
+            "include_headers": False,
+            "page_token": "token-2",
+        },
+        {
+            "query": "label:archive",
+            "page_size": 500,
+            "include_headers": False,
+            "page_token": "token-3",
+        },
+    ]
+
+
+def test_count_mail_reports_inbox_and_primary_with_two_bounded_searches():
+    calls = []
+    responses = [
+        "Found 61 messages matching 'in:inbox':\n1. first",
+        "Found 14 messages matching 'in:inbox category:primary':\n1. first",
     ]
 
     async def search(arguments):
@@ -665,26 +703,13 @@ def test_count_mail_sums_pages_and_accepts_both_token_shapes():
 
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
-    assert json.loads(result.content) == {"query": "in:inbox", "count": 1017, "exact": True}
-    assert calls == [
-        {
-            "query": "in:inbox",
-            "page_size": 500,
-            "include_headers": False,
-        },
-        {
-            "query": "in:inbox",
-            "page_size": 500,
-            "include_headers": False,
-            "page_token": "token-2",
-        },
-        {
-            "query": "in:inbox",
-            "page_size": 500,
-            "include_headers": False,
-            "page_token": "token-3",
-        },
+    assert result == ToolResult("ok", "61 in your inbox, 14 in Primary")
+    assert [call["query"] for call in calls] == [
+        "in:inbox",
+        "in:inbox category:primary",
     ]
+    assert all(call["page_size"] == 500 for call in calls)
+    assert all(call["include_headers"] is False for call in calls)
 
 
 def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
@@ -694,16 +719,16 @@ def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
         calls.append(arguments)
         token = len(calls) + 1
         return (
-            f"Found 500 messages matching 'in:inbox':\n"
+            f"Found 500 messages matching 'label:archive':\n"
             f"Next page token: token-{token}"
         )
 
     registry = ToolRegistry()
     register_count_mail(registry, search)
 
-    result = _call(registry, "count_mail", {"query": "in:inbox"})
+    result = _call(registry, "count_mail", {"query": "label:archive"})
 
-    assert json.loads(result.content) == {"query": "in:inbox", "count": 2000, "exact": False}
+    assert json.loads(result.content) == {"query": "label:archive", "count": 2000, "exact": False}
     assert len(calls) == 4
 
 
@@ -742,8 +767,8 @@ def test_count_mail_reports_when_google_is_not_connected():
 
 def test_count_mail_stops_inexactly_when_a_page_token_repeats():
     responses = [
-        "Found 500 messages matching 'in:inbox':\nNext page token: repeated",
-        "Found 500 messages matching 'in:inbox':\nNext page token: repeated",
+        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
+        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
     ]
 
     async def search(_arguments):
@@ -752,10 +777,10 @@ def test_count_mail_stops_inexactly_when_a_page_token_repeats():
     registry = ToolRegistry()
     register_count_mail(registry, search)
 
-    result = _call(registry, "count_mail", {"query": "in:inbox"})
+    result = _call(registry, "count_mail", {"query": "label:archive"})
 
     assert json.loads(result.content) == {
-        "query": "in:inbox",
+        "query": "label:archive",
         "count": 1000,
         "exact": False,
     }
