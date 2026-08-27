@@ -1,4 +1,6 @@
 fast_model: claude-haiku-4-5
+# Projected to the UI as /state user.name; no extra endpoint.
+user: {name: "Daniel"}
 google_account: daniel.zhang.t1@gmail.com
 turn_timeout_s: 12.0
 turn_ceiling_s: 30.0

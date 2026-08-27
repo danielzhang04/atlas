@@ -11,6 +11,7 @@ import aiohttp
 
 from worker import stateserver
 from worker.state import StatePublisher
+from worker.tools import Tool, ToolRegistry
 
 
 def _dt(second: int) -> datetime:
@@ -30,6 +31,7 @@ def test_state_signal_assets_and_security_headers():
             clock=lambda: _dt(0),
             voice="mars",
             wake_model="hey_atlas",
+            user_name="Daniel",
         )
         publisher.start_session()
         publisher.set_state("LISTENING")
@@ -57,6 +59,8 @@ def test_state_signal_assets_and_security_headers():
     assert payload["heartbeat"] == _dt(1).isoformat()
     assert payload["state"] == "LISTENING"
     assert payload["wake_model"] == "hey_atlas"
+    assert payload["user"] == {"name": "Daniel"}
+    assert payload["tool"] is None
     assert payload["audio"] == {
         "input": {"name": "Headset microphone", "following": True},
         "output": {"name": "Headphones", "following": True},
@@ -71,6 +75,9 @@ def test_state_signal_assets_and_security_headers():
     assert 'data-view="live"' in page[2]
     assert 'aria-controls="history-view"' in page[2]
     assert 'id="audio-line"' in page[2]
+    assert 'id="greeting"' in page[2]
+    assert 'id="tool-strip" hidden' in page[2]
+    assert 'id="tool-strip" aria-hidden' not in page[2]
     assert 'class="core"' not in page[2]
     assert styles[0] == 200 and "--header: 40px" in styles[2]
     assert ".view[hidden]" in styles[2]
@@ -89,6 +96,19 @@ def test_state_signal_assets_and_security_headers():
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]
+    assert "TOOL:" in script[2]
+    assert "renderGreeting" in script[2]
+    assert "renderTool" in script[2]
+    render_tool = script[2].split("function renderTool", 1)[1].split("function renderGreeting", 1)[0]
+    identity_guard = "if (identity === activeToolIdentity) return;"
+    assert "JSON.stringify([name, since])" in render_tool
+    assert render_tool.index(identity_guard) < render_tool.index("refs.toolStrip.hidden")
+    assert render_tool.index(identity_guard) < render_tool.index("refs.toolAnnouncer.replaceChildren")
+    live_activity = script[2].split("function updateLiveActivity", 1)[1].split("function eventStore", 1)[0]
+    assert "currentView === \"live\" && document.visibilityState === \"visible\"" in live_activity
+    assert "window.setInterval(renderGreeting, 60_000)" in live_activity
+    assert "window.clearInterval(greetingTimer)" in live_activity
+    assert script[2].count("window.setInterval(renderGreeting, 60_000)") == 1
     assert 'publicJson("/signal"' in script[2]
     assert 'currentView !== "live"' in script[2]
     assert 'document.visibilityState !== "visible"' in script[2]
@@ -280,7 +300,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
             self.brain = SimpleNamespace(on_tool=None)
             self.work = FakeWork()
             self.mcp = FakeMcp()
-            self.registry = object()
+            self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
         def warm_model_client(self):
@@ -406,6 +426,151 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     ]
 
 
+def test_entrypoint_wires_blocking_tool_into_real_state_server(monkeypatch):
+    from worker import app
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    registry = ToolRegistry(execution_clock=lambda: _dt(4))
+    servers = []
+
+    async def block(_arguments):
+        started.set()
+        await release.wait()
+        return "done"
+
+    registry.register(Tool(
+        "search_messages",
+        "Search messages.",
+        {"type": "object", "properties": {}},
+        block,
+    ))
+
+    class FakeWork:
+        launcher = SimpleNamespace(available=True)
+
+        def on_terminal(self, _callback):
+            return None
+
+        def active(self):
+            return []
+
+        async def cancel(self, _job_id):
+            return True
+
+        async def cancel_active(self, *, timeout_s):
+            return None
+
+        async def run(self, _stop):
+            return None
+
+    class FakeMcp:
+        async def connect(self, _registry):
+            return None
+
+        async def close(self):
+            return None
+
+        def status(self):
+            return []
+
+    services = SimpleNamespace(
+        brain=SimpleNamespace(on_tool=None),
+        work=FakeWork(),
+        mcp=FakeMcp(),
+        registry=registry,
+        store=SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None),
+        warm_model_client=lambda: None,
+    )
+
+    class FakeSession:
+        input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
+
+        async def start(self, **_kwargs):
+            return None
+
+        def interrupt(self):
+            return None
+
+    class FakeContext:
+        room = object()
+
+        async def connect(self):
+            return None
+
+        def add_shutdown_callback(self, _callback):
+            return None
+
+        def shutdown(self, _reason):
+            return None
+
+    real_start = app.stateserver.start
+
+    async def capture_start(*args, **kwargs):
+        server = await real_start(*args, **kwargs)
+        servers.append(server)
+        return server
+
+    cfg = {
+        "active_voice": "mars",
+        "engagement_timeout_s": 30,
+        "state_port": 0,
+        "wake_input_device": None,
+        "wake_model": "hey_atlas",
+    }
+    monkeypatch.setattr(app, "TEXT_MODE", True)
+    monkeypatch.setattr(app, "_cfg", lambda: cfg)
+    monkeypatch.setattr(app.runtime, "build", lambda *_args, **_kwargs: services)
+    monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
+    monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
+    monkeypatch.setattr(app.router, "Addressing", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app.router, "vocabulary", lambda _cfg: [])
+    monkeypatch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
+    monkeypatch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
+    monkeypatch.setattr(
+        app.devicewatch,
+        "AudioRestartCoalescer",
+        lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None),
+    )
+    monkeypatch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+    monkeypatch.setattr(
+        app.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(start=lambda: None),
+    )
+    monkeypatch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
+    monkeypatch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
+    monkeypatch.setattr(app, "_build_tts", lambda _cfg: object())
+    monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
+    monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
+    monkeypatch.setattr(app.stateserver, "start", capture_start)
+    monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: None)
+
+    async def scenario():
+        await app.entrypoint(FakeContext())
+        call = asyncio.create_task(registry.call("search_messages", {}))
+        try:
+            await started.wait()
+            active = json.loads((await _request(servers[0]))[2])["tool"]
+            release.set()
+            result = await call
+            cleared = json.loads((await _request(servers[0]))[2])["tool"]
+            return active, cleared, result
+        finally:
+            release.set()
+            await asyncio.gather(call, return_exceptions=True)
+            await servers[0].stop()
+
+    active, cleared, result = asyncio.run(scenario())
+
+    assert active == {
+        "name": "search_messages",
+        "since": _dt(4).isoformat(),
+    }
+    assert cleared is None
+    assert result.status == "ok"
+
+
 def test_wake_before_session_exists_publishes_listening_without_speaking():
     from worker import app
 
@@ -473,7 +638,7 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
                 self.brain = SimpleNamespace(on_tool=None)
                 self.work = FakeWork()
                 self.mcp = FakeMcp()
-                self.registry = object()
+                self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
                 self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
             def warm_model_client(self):
@@ -605,7 +770,7 @@ def test_entrypoint_early_shutdown_is_registered_and_idempotent(monkeypatch):
             self.brain = SimpleNamespace(on_tool=None)
             self.work = FakeWork()
             self.mcp = FakeMcp()
-            self.registry = object()
+            self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
     class FakeServer:

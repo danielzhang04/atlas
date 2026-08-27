@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib
 import json
 import os
@@ -132,14 +133,18 @@ class WorkLike(Protocol):
 
 class ToolRegistry:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
+                 execution_clock: Callable[[], datetime] | None = None,
                  timeout_s: float = 8.0) -> None:
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
         self._clock = clock
+        self._execution_clock = execution_clock or (lambda: datetime.now(timezone.utc))
         self._timeout_s = timeout_s
         self._tools: dict[str, Tool] = {}
         self._pending: PendingAction | None = None
         self._open_aliases: frozenset[str] = frozenset()
+        self._executions: dict[object, dict[str, str]] = {}
+        self._execution_observer: Callable[[dict[str, str] | None], None] | None = None
 
     @property
     def pending(self) -> PendingAction | None:
@@ -159,6 +164,18 @@ class ToolRegistry:
         if not isinstance(tool.input_schema, dict) or tool.input_schema.get("type") != "object":
             raise ValueError("tool input schema must describe an object")
         self._tools[tool.name] = tool
+
+    def set_execution_observer(
+        self,
+        observer: Callable[[dict[str, str] | None], None] | None,
+    ) -> None:
+        self._execution_observer = observer
+
+    def _publish_execution(self) -> None:
+        if self._execution_observer is None:
+            return
+        newest = next(reversed(self._executions.values()), None)
+        self._execution_observer(dict(newest) if newest is not None else None)
 
     def names(self) -> list[str]:
         return list(self._tools)
@@ -290,16 +307,26 @@ class ToolRegistry:
         *,
         host_state: Any = None,
     ) -> ToolResult:
+        call_token = object()
+        self._executions[call_token] = {
+            "name": tool.name,
+            "since": self._execution_clock().isoformat(),
+        }
         try:
-            async with asyncio.timeout(self._timeout_s):
-                if tool.execute_prepared is not None and host_state is not None:
-                    value = await tool.execute_prepared(arguments, host_state)
-                else:
-                    value = await tool.run(arguments)
-        except McpToolError as exc:
-            return ToolResult("error", str(exc))
-        except Exception as exc:
-            return ToolResult("error", type(exc).__name__)
+            self._publish_execution()
+            try:
+                async with asyncio.timeout(self._timeout_s):
+                    if tool.execute_prepared is not None and host_state is not None:
+                        value = await tool.execute_prepared(arguments, host_state)
+                    else:
+                        value = await tool.run(arguments)
+            except McpToolError as exc:
+                return ToolResult("error", str(exc))
+            except Exception as exc:
+                return ToolResult("error", type(exc).__name__)
+        finally:
+            self._executions.pop(call_token, None)
+            self._publish_execution()
         if isinstance(value, ToolResult):
             return ToolResult(value.status, _bound_content(value.content), value.confirm_id)
         return ToolResult("ok", _bound_content(_serialize(value)))

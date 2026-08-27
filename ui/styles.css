@@ -309,6 +309,45 @@ main {
   letter-spacing: .2em;
 }
 
+.engine-status .engine-greeting {
+  color: var(--muted);
+  font: 600 .58rem ui-monospace, "Cascadia Mono", monospace;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.engine-status .tool-strip {
+  position: relative;
+  overflow: hidden;
+  min-width: 10rem;
+  padding: .18rem .58rem;
+  border: 1px solid rgb(255 196 38 / 36%);
+  color: rgb(255 222 128);
+  background: rgb(255 196 38 / 7%);
+  font: 600 .56rem ui-monospace, "Cascadia Mono", monospace;
+  letter-spacing: .12em;
+  text-align: center;
+  text-transform: uppercase;
+  animation: tool-pulse 1.8s ease-in-out infinite;
+}
+
+.engine-status .tool-strip::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 0 42%, rgb(255 244 184 / 22%) 50%, transparent 58% 100%);
+  content: "";
+  transform: translateY(-100%);
+  animation: tool-scanline 1.35s linear infinite;
+}
+
+@keyframes tool-pulse {
+  50% { border-color: rgb(255 211 92 / 68%); }
+}
+
+@keyframes tool-scanline {
+  to { transform: translateY(100%); }
+}
+
 .engine-status span {
   color: var(--muted);
   font-size: .63rem;
@@ -871,5 +910,7 @@ main {
   *::after {
     scroll-behavior: auto !important;
     transition-duration: .001ms !important;
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

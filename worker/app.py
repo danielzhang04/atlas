@@ -476,7 +476,10 @@ async def entrypoint(ctx: JobContext) -> None:
         return stateserver.pairing_url(authorizer, server.port)
 
     services = runtime.build(cfg, paired_url=_paired_url)
-    publisher = state.StatePublisher(voice=cfg.get("active_voice"))
+    user = cfg.get("user")
+    user_name = user.get("name") if isinstance(user, dict) else None
+    publisher = state.StatePublisher(voice=cfg.get("active_voice"), user_name=user_name)
+    services.registry.set_execution_observer(publisher.set_tool)
     loop = asyncio.get_running_loop()
     session: Any | None = None
     session_started = False
