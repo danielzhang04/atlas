@@ -1,5 +1,24 @@
-(() => {
+(root => {
   "use strict";
+
+  function hitTestQuickAction(x, y, geometry, actionCount = Number.POSITIVE_INFINITY) {
+    if (!geometry || !Array.isArray(geometry.segments)) return -1;
+    const dx = x - geometry.centerX;
+    const dy = y - geometry.centerY;
+    const radius = Math.hypot(dx, dy);
+    if (radius < geometry.innerRadius || radius > geometry.outerRadius) return -1;
+    let angle = Math.atan2(dy, dx);
+    if (angle < 0) angle += Math.PI * 2;
+    for (const segment of geometry.segments) {
+      if (segment.index >= actionCount) continue;
+      const comparable = angle < segment.start ? angle + Math.PI * 2 : angle;
+      if (comparable >= segment.start && comparable <= segment.end) return segment.index;
+    }
+    return -1;
+  }
+
+  if (root.__ATLAS_TEST__ === true) root.__atlasHitTest = hitTestQuickAction;
+  if (typeof document === "undefined") return;
 
   const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
   const VOICE_STATES = new Set(["ASLEEP", "LISTENING", "THINKING", "SPEAKING"]);
@@ -24,6 +43,9 @@
     windowControls: document.querySelector("#window-controls"), windowMinimize: document.querySelector("#window-minimize"),
     windowMaximize: document.querySelector("#window-maximize"), windowClose: document.querySelector("#window-close"),
     canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
+    engineStage: document.querySelector(".engine-stage"), quickActions: document.querySelector("#quick-actions"),
+    textForm: document.querySelector("#text-turn-form"), textInput: document.querySelector("#text-turn-input"),
+    pendingCard: document.querySelector("#pending-confirmation"), pendingText: document.querySelector("#pending-confirmation-text"),
     audioLine: document.querySelector("#audio-line"), transcript: document.querySelector("#transcript"),
     workerSummary: document.querySelector("#worker-summary"), workerTabs: document.querySelector("#worker-tabs"),
     workerOutput: document.querySelector("#worker-output"), history: document.querySelector("#history-list"),
@@ -39,6 +61,7 @@
   let actionToken = "", actionExpiresAt = 0, pairingExpiryTimer = 0;
   let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
   let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
+  let quickActionSignature = "", quickActions = [], pendingDismissTimer = 0, pendingDismissEnd = null;
   const pendingRequests = new Set();
   const eventsByJob = new Map();
   const resultsByJob = new Map();
@@ -142,6 +165,13 @@
     const INPUT_BANDS = 24;
     const PARTICLE_COUNT = 42;
     const TAU = Math.PI * 2;
+    const OUTER_SEGMENT_COUNT = 14;
+    const OUTER_SEGMENT_RADIUS = .417;
+    const outerSegments = Array.from({length: OUTER_SEGMENT_COUNT}, (_value, index) => {
+      const start = index / OUTER_SEGMENT_COUNT * TAU;
+      const length = TAU / OUTER_SEGMENT_COUNT * (.48 + (index % 3) * .08);
+      return {index, start, end: start + length, middle: start + length / 2};
+    });
     const palettes = {
       ASLEEP: {
         primary: [105, 119, 137], secondary: [139, 151, 166], core: [114, 130, 148],
@@ -211,6 +241,10 @@
     let minorTickPath = new Path2D();
     let innerSegmentPath = new Path2D();
     let outerSegmentPath = new Path2D();
+    let outerSegmentPaths = [];
+    let quickActionHover = -1;
+    let quickActionFlash = -1;
+    let quickActionFlashUntil = 0;
 
     for (let index = 0; index < BAR_COUNT; index += 1) {
       const angle = -Math.PI / 2 + index * TAU / BAR_COUNT;
@@ -305,18 +339,22 @@
 
       innerSegmentPath = new Path2D();
       outerSegmentPath = new Path2D();
-      const segmentSets = [
-        {path: innerSegmentPath, radius: .295, count: 18, fill: .62},
-        {path: outerSegmentPath, radius: .417, count: 14, fill: .48},
-      ];
-      segmentSets.forEach(({path, radius, count, fill}) => {
-        for (let index = 0; index < count; index += 1) {
-          const start = index / count * TAU;
-          const length = TAU / count * (fill + (index % 3) * .08);
-          path.moveTo(Math.cos(start) * radius * scale, Math.sin(start) * radius * scale);
-          path.arc(0, 0, radius * scale, start, start + length);
-        }
+      outerSegmentPaths = outerSegments.map((segment) => {
+        const path = new Path2D();
+        path.moveTo(
+          Math.cos(segment.start) * OUTER_SEGMENT_RADIUS * scale,
+          Math.sin(segment.start) * OUTER_SEGMENT_RADIUS * scale,
+        );
+        path.arc(0, 0, OUTER_SEGMENT_RADIUS * scale, segment.start, segment.end);
+        outerSegmentPath.addPath(path);
+        return path;
       });
+      for (let index = 0; index < 18; index += 1) {
+        const start = index / 18 * TAU;
+        const length = TAU / 18 * (.62 + (index % 3) * .08);
+        innerSegmentPath.moveTo(Math.cos(start) * .295 * scale, Math.sin(start) * .295 * scale);
+        innerSegmentPath.arc(0, 0, .295 * scale, start, start + length);
+      }
 
       const spriteSize = Math.max(256, Math.ceil(scale * 1.08));
       backdropSprite.width = spriteSize;
@@ -471,10 +509,15 @@
       context.lineCap = "round";
       context.save();
       context.translate(centerX, centerY);
-      context.rotate(now * speed);
       context.lineWidth = Math.max(.75, scale * .0032);
       context.strokeStyle = colorString(primaryColor, (.22 + motion[1] * .3) * visibility);
       context.stroke(outerSegmentPath);
+      const activeIndex = now < quickActionFlashUntil ? quickActionFlash : quickActionHover;
+      if (activeIndex >= 0 && outerSegmentPaths[activeIndex]) {
+        context.lineWidth = Math.max(1.5, scale * .006);
+        context.strokeStyle = colorString(secondaryColor, .82 * visibility);
+        context.stroke(outerSegmentPaths[activeIndex]);
+      }
       context.restore();
 
       context.save();
@@ -681,6 +724,26 @@
       animationFrame = 0;
     }
 
+    function quickActionGeometry() {
+      return {
+        centerX,
+        centerY,
+        innerRadius: .385 * scale,
+        outerRadius: .45 * scale,
+        labelRadius: .417 * scale,
+        segments: outerSegments.map((segment) => ({...segment})),
+      };
+    }
+
+    function setQuickActionHover(index) {
+      quickActionHover = Number.isInteger(index) ? index : -1;
+    }
+
+    function flashQuickAction(index) {
+      quickActionFlash = Number.isInteger(index) ? index : -1;
+      quickActionFlashUntil = performance.now() + 420;
+    }
+
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver(resize);
       observer.observe(canvas);
@@ -693,10 +756,170 @@
     canvas.dataset.frameMaxMs = "0.000";
     canvas.dataset.animation = "paused";
     window.__atlasEngineMetrics = metrics;
-    return {setSignal, setState, start, stop};
+    return {
+      setSignal, setState, start, stop, quickActionGeometry, setQuickActionHover, flashQuickAction,
+    };
   }
 
   const engine = createEngine(refs.canvas);
+  root.__atlasEngineGeometry = {snapshot: () => engine.quickActionGeometry()};
+
+  function positionQuickActions() {
+    const geometry = engine.quickActionGeometry();
+    refs.quickActions.querySelectorAll(".quick-action").forEach((button) => {
+      const segment = geometry.segments[Number(button.dataset.index)];
+      if (!segment) return;
+      button.style.left = `${geometry.centerX + Math.cos(segment.middle) * geometry.labelRadius}px`;
+      button.style.top = `${geometry.centerY + Math.sin(segment.middle) * geometry.labelRadius}px`;
+    });
+  }
+
+  function showPendingConfirmation(readback) {
+    if (pendingDismissTimer) window.clearTimeout(pendingDismissTimer);
+    pendingDismissTimer = 0;
+    if (pendingDismissEnd) refs.pendingCard.removeEventListener("animationend", pendingDismissEnd);
+    pendingDismissEnd = null;
+    refs.pendingText.textContent = readback;
+    refs.pendingCard.hidden = false;
+    refs.pendingCard.classList.remove("is-holo-dismissing");
+  }
+
+  function hidePendingConfirmation() {
+    if (refs.pendingCard.hidden || pendingDismissTimer) return;
+    const finish = () => {
+      if (pendingDismissTimer) window.clearTimeout(pendingDismissTimer);
+      pendingDismissTimer = 0;
+      if (pendingDismissEnd) refs.pendingCard.removeEventListener("animationend", pendingDismissEnd);
+      pendingDismissEnd = null;
+      refs.pendingCard.hidden = true;
+      refs.pendingCard.classList.remove("is-holo-dismissing");
+    };
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true) {
+      finish();
+      return;
+    }
+    refs.pendingCard.classList.add("is-holo-dismissing");
+    pendingDismissEnd = (event) => {
+      if (event.target === refs.pendingCard) finish();
+    };
+    refs.pendingCard.addEventListener("animationend", pendingDismissEnd);
+    pendingDismissTimer = window.setTimeout(finish, 400);
+  }
+
+  function renderPendingConfirmation(pending) {
+    if (isRecord(pending) && typeof pending.readback === "string") {
+      showPendingConfirmation(pending.readback);
+    } else {
+      hidePendingConfirmation();
+    }
+  }
+
+  async function activateQuickAction(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= quickActions.length) return;
+    if (!actionToken) {
+      showPendingConfirmation("Pair Atlas before running quick actions.");
+      return;
+    }
+    const button = refs.quickActions.querySelector(`[data-index="${index}"]`);
+    if (button) button.disabled = true;
+    try {
+      const payload = await authenticatedJson("/actions/quick", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({index}),
+      });
+      if (!payload) return;
+      engine.flashQuickAction(index);
+      if (button) {
+        button.classList.remove("is-flashing");
+        void button.offsetWidth;
+        button.classList.add("is-flashing");
+      }
+      renderPendingConfirmation(payload.pending);
+    } catch (_error) {
+      showPendingConfirmation("Quick action unavailable.");
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function renderQuickActions(actions) {
+    const safeActions = Array.isArray(actions)
+      ? actions.filter((action) => isRecord(action) && typeof action.label === "string").slice(0, 14)
+      : [];
+    const signature = JSON.stringify(safeActions);
+    if (signature === quickActionSignature) return;
+    quickActionSignature = signature;
+    quickActions = safeActions;
+    refs.quickActions.replaceChildren();
+    safeActions.forEach((action, index) => {
+      const button = node("button", "quick-action", action.label);
+      button.type = "button";
+      button.dataset.index = String(index);
+      button.setAttribute("aria-label", `Quick action: ${action.label}`);
+      button.addEventListener("mouseenter", () => engine.setQuickActionHover(index));
+      button.addEventListener("mouseleave", () => engine.setQuickActionHover(-1));
+      button.addEventListener("focus", () => engine.setQuickActionHover(index));
+      button.addEventListener("blur", () => engine.setQuickActionHover(-1));
+      button.addEventListener("click", () => activateQuickAction(index));
+      refs.quickActions.append(button);
+    });
+    positionQuickActions();
+  }
+
+  function canvasQuickActionIndex(event) {
+    const bounds = refs.canvas.getBoundingClientRect();
+    return hitTestQuickAction(
+      event.clientX - bounds.left,
+      event.clientY - bounds.top,
+      engine.quickActionGeometry(),
+      quickActions.length,
+    );
+  }
+
+  refs.canvas.addEventListener("pointermove", (event) => {
+    engine.setQuickActionHover(canvasQuickActionIndex(event));
+  });
+  refs.canvas.addEventListener("pointerleave", () => engine.setQuickActionHover(-1));
+  refs.canvas.addEventListener("click", (event) => activateQuickAction(canvasQuickActionIndex(event)));
+  if (typeof ResizeObserver === "function") {
+    const quickActionObserver = new ResizeObserver(positionQuickActions);
+    quickActionObserver.observe(refs.engineStage);
+  } else {
+    window.addEventListener("resize", positionQuickActions);
+  }
+
+  refs.textForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = refs.textInput.value.trim();
+    if (!text) return;
+    if (!actionToken) {
+      showPendingConfirmation("Pair Atlas before sending a message.");
+      return;
+    }
+    refs.textInput.disabled = true;
+    try {
+      const payload = await authenticatedJson("/turn", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({text}),
+      });
+      if (payload?.ok === true) {
+        refs.textInput.value = "";
+        renderPendingConfirmation(payload.pending);
+      }
+    } catch (_error) {
+      showPendingConfirmation("Message could not be sent.");
+    } finally {
+      refs.textInput.disabled = false;
+      refs.textInput.focus();
+    }
+  });
+  refs.textInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    refs.textInput.value = "";
+  });
 
   function activateTab(button, active, handler = null, syncHash = false) {
     button.classList.toggle("is-active", active);
@@ -824,6 +1047,7 @@
         setConnection(true);
         setEngineState(payload.state);
         renderTranscript(payload.transcript);
+        renderQuickActions(payload.quick_actions);
         renderVoice(payload);
         renderAudio(payload.audio);
       } catch (_error) {
@@ -1205,4 +1429,4 @@
   refreshState();
   refreshJobs();
   updatePolling();
-})();
+})(globalThis);

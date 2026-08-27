@@ -1,0 +1,14 @@
+- {label: Spotify, tool: open, args: {target: spotify}}
+- {label: Windows, tool: list_windows, args: {limit: 20}}
+- {label: Play / Pause, tool: media_key, args: {key: play_pause}}
+- {label: Next Track, tool: media_key, args: {key: next}}
+- {label: Previous, tool: media_key, args: {key: previous}}
+- {label: Mute, tool: media_key, args: {key: mute}}
+- {label: Volume Up, tool: media_key, args: {key: volume_up}}
+- {label: Volume Down, tool: media_key, args: {key: volume_down}}
+- {label: Gmail, tool: open, args: {target: gmail}}
+- {label: Calendar, tool: open, args: {target: calendar}}
+- {label: Terminal, tool: open, args: {target: terminal}}
+- {label: VS Code, tool: open, args: {target: vscode}}
+- {label: Notepad, tool: open, args: {target: notepad}}
+- {label: GitHub, tool: open, args: {target: github}}

@@ -71,6 +71,9 @@ def test_state_signal_assets_and_security_headers():
     assert 'data-view="live"' in page[2]
     assert 'aria-controls="history-view"' in page[2]
     assert 'id="audio-line"' in page[2]
+    assert 'id="quick-actions"' in page[2]
+    assert 'id="text-turn-input"' in page[2]
+    assert "autofocus" not in page[2]
     assert 'class="core"' not in page[2]
     assert styles[0] == 200 and "--header: 40px" in styles[2]
     assert ".view[hidden]" in styles[2]
@@ -79,6 +82,12 @@ def test_state_signal_assets_and_security_headers():
     assert ".engine::before" not in styles[2]
     assert ".orbit" not in styles[2]
     assert "background-size:" not in styles[2]
+    assert all(
+        f"@keyframes {name}" in styles[2]
+        for name in (
+            "holoApproach", "holoIdle", "holoDismiss", "holoTrace", "holoScanSweep",
+        )
+    )
     assert script[0] == 200 and "const BAR_COUNT = 96" in script[2]
     assert "const INPUT_BANDS = 24" in script[2]
     assert "const UNIQUE_BANDS = 48" in script[2]
@@ -89,6 +98,13 @@ def test_state_signal_assets_and_security_headers():
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]
+    assert "root.__atlasEngineGeometry" in script[2]
+    assert 'authenticatedJson("/actions/quick"' in script[2]
+    assert 'authenticatedJson("/turn"' in script[2]
+    assert "renderPendingConfirmation(payload.pending)" in script[2]
+    assert 'classList.add("is-holo-dismissing")' in script[2]
+    assert 'addEventListener("animationend"' in script[2]
+    assert "window.setTimeout(finish, 400)" in script[2]
     assert 'publicJson("/signal"' in script[2]
     assert 'currentView !== "live"' in script[2]
     assert 'document.visibilityState !== "visible"' in script[2]
