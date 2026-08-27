@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
-from fnmatch import fnmatchcase
 from typing import Any, Protocol
 
+from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
 from .tools import PendingAction, ToolRegistry, ToolResult
 
@@ -23,79 +22,6 @@ MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
-UNBACKED_ACTION_REPLY = "I did not actually do that - I have no tool result. Want me to?"
-
-ACTION_CLAIM_VERBS = (
-    "open",
-    "opened",
-    "launched",
-    "sent",
-    "created",
-    "closed",
-    "deleted",
-    "done",
-    "played",
-    "paused",
-    "started",
-    "moved",
-    "minimized",
-    "maximized",
-)
-_ACTION_WORDS = re.compile(
-    r"\b(?:"
-    + "|".join(
-        r"open(?![-]|\s+source\b)" if verb == "open" else re.escape(verb)
-        for verb in ACTION_CLAIM_VERBS
-    )
-    + r")\b",
-    re.IGNORECASE,
-)
-_IS_OPEN = re.compile(
-    r"\bis(?:\s+(?:already|currently|now))?\s+open\b(?![-]|\s+source\b)",
-    re.IGNORECASE,
-)
-_DONE = re.compile(
-    r"^\s*(?:done|all done|(?:it|that|this|the (?:task|job)) (?:is|'s) done)\s*[.!]?\s*$",
-    re.IGNORECASE,
-)
-_FIRST_PERSON = re.compile(r"\b(?:I(?:'ve| have)?|we(?:'ve| have)?)\b", re.IGNORECASE)
-_TIED_NEGATION = re.compile(
-    r"\b(?:not|never|cannot|can't|couldn't|didn't|haven't|hasn't|wasn't|weren't)\b",
-    re.IGNORECASE,
-)
-_TARGET_ARGUMENTS = frozenset({"app", "application", "profile", "target", "window"})
-_CLAIM_TOOL_ASSOCIATIONS = {
-    "opened": ("open", "open_folder", "focus_window"),
-    "sent": ("*send*",),
-    "launched": ("launch_work", "kb_*launch*", "window_action", "media_key"),
-    "started": ("launch_work", "kb_*launch*", "window_action", "media_key"),
-    "created": ("*create*", "*draft*"),
-    "closed": ("window_action(close)",),
-    "deleted": ("*delete*", "press_delete"),
-    "moved": ("window_action",),
-    "minimized": ("window_action",),
-    "maximized": ("window_action",),
-    "played": ("media_key", "*play*"),
-    "paused": ("media_key", "*play*"),
-}
-_REFUSAL_MARKERS = (
-    "can t",
-    "cannot",
-    "unable to",
-    "don t have access",
-    "do not have access",
-    "no access",
-)
-_REFUSAL_ROUTES = (
-    ("open_folder", re.compile(
-        r"\b(?:open|show|launch)\b.*\b(?:folder|directory)\b|"
-        r"\b(?:folder|directory)\b.*\b(?:open|show|launch)\b"
-    )),
-    ("find_file", re.compile(r"\b(?:find|locate|search)\b.*\b(?:file|folder|directory)\b")),
-    ("read_file", re.compile(r"\bread\b.*\bfile\b")),
-    ("count_mail", re.compile(r"\b(?:count|how many)\b.*\b(?:email|emails|mail|messages)\b")),
-    ("open", re.compile(r"\b(?:open|show|launch)\b")),
-)
 
 _AFFIRM = frozenset({
     "confirm",
@@ -342,16 +268,13 @@ class Brain:
             "type": "text",
             "text": self._now_system_text(),
         }]
-        available_tools = frozenset(
-            schema["name"] for schema in tools if isinstance(schema.get("name"), str)
-        )
         buffer = ""
         spoken: list[str] = []
         guarded_chunks: list[str] = []
         tool_results: list[tuple[str, bool]] = []
-        known_targets = _registry_claim_targets(self.registry, tools)
+        guard = ClaimGuard(prompt, self.registry, tools)
         if pending is not None:
-            _remember_claim_targets(known_targets, pending.arguments)
+            guard.remember(pending.arguments)
         tool_rounds = 0
         tainted = bool(context)
         host_line: str | None = None
@@ -361,9 +284,8 @@ class Brain:
                     if confirmation_intent == "confirm":
                         name = "confirm"
                         result = await self.registry.confirm(pending.confirm_id)
-                        tool_results.append((
-                            _tool_evidence_name(pending.name, pending.arguments),
-                            result.status == "ok",
+                        tool_results.append(guard.evidence(
+                            pending.name, pending.arguments, result.status == "ok",
                         ))
                         if result.status == "ok":
                             host_line = f"Done — {pending.name} executed."
@@ -420,28 +342,24 @@ class Brain:
                                 buffer += delta
                                 chunks, buffer = split_spoken(buffer)
                                 for chunk in chunks:
-                                    if _requires_delayed_guard(chunk):
+                                    if guard.delayed(chunk):
                                         guarded_chunks.append(chunk)
                                     else:
                                         spoken.append(chunk)
                                         yield chunk
                             await stream.get_final_message()
                     if buffer:
-                        if _requires_delayed_guard(buffer):
+                        if guard.delayed(buffer):
                             guarded_chunks.append(buffer)
                         else:
                             spoken.append(buffer)
                             yield buffer
                     if not spoken and not guarded_chunks:
                         guarded_chunks.append(host_line)
-                    for chunk in _guarded_turn_chunks(
-                        transcript,
-                        guarded_chunks,
-                        tool_results=tool_results,
-                        known_targets=known_targets,
-                        available_tools=available_tools,
-                    ):
-                        yield chunk
+                    for chunk in guarded_chunks:
+                        verdict = guard.evaluate(chunk, tool_results)
+                        if verdict is not None:
+                            yield verdict
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
@@ -458,7 +376,7 @@ class Brain:
                                 buffer += delta
                                 chunks, buffer = split_spoken(buffer)
                                 for chunk in chunks:
-                                    if _requires_delayed_guard(chunk):
+                                    if guard.delayed(chunk):
                                         guarded_chunks.append(chunk)
                                     else:
                                         spoken.append(chunk)
@@ -490,10 +408,9 @@ class Brain:
                             tainted=tainted,
                             transcript=prompt,
                         )
-                        _remember_claim_targets(known_targets, arguments)
-                        tool_results.append((
-                            _tool_evidence_name(name, arguments),
-                            result.status == "ok",
+                        guard.remember(arguments)
+                        tool_results.append(guard.evidence(
+                            name, arguments, result.status == "ok",
                         ))
                         results.append({
                             "type": "tool_result",
@@ -512,18 +429,15 @@ class Brain:
                     tool_rounds += 1
 
                 if buffer:
-                    if _requires_delayed_guard(buffer):
+                    if guard.delayed(buffer):
                         guarded_chunks.append(buffer)
                     else:
                         spoken.append(buffer)
                         yield buffer
-                final_chunks = _guarded_turn_chunks(
-                    transcript,
-                    guarded_chunks,
-                    tool_results=tool_results,
-                    known_targets=known_targets,
-                    available_tools=available_tools,
-                )
+                final_chunks = [
+                    verdict for chunk in guarded_chunks
+                    if (verdict := guard.evaluate(chunk, tool_results)) is not None
+                ]
                 spoken.extend(final_chunks)
                 self._remember(prompt, "".join(spoken))
                 for chunk in final_chunks:
@@ -558,195 +472,6 @@ def _capability_system_text(schemas: list[dict[str, Any]]) -> str:
         "Before saying you cannot do something, check this list; if a tool covers it, call it."
     )
     return "\n".join(lines)
-
-
-def _requires_delayed_guard(text: str) -> bool:
-    if _ACTION_WORDS.search(text):
-        return True
-    normalized = normalize(text)
-    return any(marker in normalized for marker in _REFUSAL_MARKERS)
-
-
-def _guarded_turn_chunks(
-    transcript: str,
-    chunks: list[str],
-    *,
-    tool_results: list[tuple[str, bool]],
-    known_targets: set[str],
-    available_tools: frozenset[str],
-) -> list[str]:
-    guarded: list[str] = []
-    substituted = False
-    for chunk in chunks:
-        final = _guard_turn_text(
-            transcript,
-            chunk,
-            tool_results=tool_results,
-            known_targets=known_targets,
-            available_tools=available_tools,
-        )
-        if final == UNBACKED_ACTION_REPLY:
-            if substituted:
-                continue
-            substituted = True
-        guarded.append(final)
-    return guarded
-
-
-def _guard_turn_text(
-    transcript: str,
-    text: str,
-    *,
-    tool_results: list[tuple[str, bool]],
-    known_targets: set[str],
-    available_tools: frozenset[str],
-) -> str:
-    capability = _refused_capability(transcript, text, available_tools)
-    if capability is not None:
-        logger.warning("available capability refusal suppressed (tool=%s)", capability)
-        return f"I can do that with {capability} - shall I?"
-    claims = _action_claims(text, known_targets)
-    for claim in claims:
-        if not _claim_has_relevant_success(claim, tool_results):
-            logger.warning("unbacked action claim suppressed (claim=%s)", claim)
-            return UNBACKED_ACTION_REPLY
-    return text
-
-
-def _refused_capability(
-    transcript: str,
-    text: str,
-    available_tools: frozenset[str],
-) -> str | None:
-    normalized_reply = normalize(text)
-    if not any(marker in normalized_reply for marker in _REFUSAL_MARKERS):
-        return None
-    normalized_transcript = normalize(transcript)
-    for name, request_pattern in _REFUSAL_ROUTES:
-        if name in available_tools and request_pattern.search(normalized_transcript):
-            return name
-    return None
-
-
-def _action_claims(text: str, known_targets: set[str]) -> list[str]:
-    claims: list[str] = []
-    for match in re.finditer(r"[^.!?\n]+[.!?]?", text):
-        sentence = match.group(0).strip()
-        if not sentence or sentence.endswith("?"):
-            continue
-        if _DONE.fullmatch(sentence):
-            claims.append("done")
-            continue
-        open_states = list(_IS_OPEN.finditer(sentence))
-        for verb_match in _ACTION_WORDS.finditer(sentence):
-            if any(state.start() <= verb_match.start() < state.end() for state in open_states):
-                continue
-            if _first_person_claim(sentence, verb_match):
-                claims.append(_canonical_claim_verb(verb_match.group(0)))
-        for state in open_states:
-            target_prefix = normalize(sentence[:state.start()])
-            if any(
-                target_prefix == target or target_prefix.endswith(" " + target)
-                for target in known_targets
-            ):
-                claims.append("opened")
-    return claims
-
-
-def _first_person_claim(sentence: str, verb_match: re.Match[str]) -> bool:
-    subjects = list(_FIRST_PERSON.finditer(sentence, 0, verb_match.start()))
-    if not subjects:
-        return False
-    subject = subjects[-1]
-    return _TIED_NEGATION.search(sentence[subject.end():verb_match.start()]) is None
-
-
-def _canonical_claim_verb(verb: str) -> str:
-    folded = verb.casefold()
-    return "opened" if folded == "open" else folded
-
-
-def _remember_claim_targets(targets: set[str], arguments: Mapping[str, Any]) -> None:
-    for key, value in arguments.items():
-        if normalize(str(key)) not in _TARGET_ARGUMENTS or not isinstance(value, str):
-            continue
-        target = normalize(value)
-        if target:
-            targets.add(target)
-
-
-def _registry_claim_targets(registry: _Registry, schemas: list[dict[str, Any]]) -> set[str]:
-    targets: set[str] = set()
-    aliases = getattr(registry, "_open_aliases", ())
-    if isinstance(aliases, (set, frozenset, tuple, list)):
-        for value in aliases:
-            if isinstance(value, str) and normalize(value):
-                targets.add(normalize(value))
-    for schema in schemas:
-        input_schema = schema.get("input_schema")
-        if not isinstance(input_schema, Mapping):
-            continue
-        properties = input_schema.get("properties")
-        if not isinstance(properties, Mapping):
-            continue
-        for key, definition in properties.items():
-            if normalize(str(key)) not in _TARGET_ARGUMENTS or not isinstance(definition, Mapping):
-                continue
-            values = definition.get("enum", ())
-            if isinstance(values, list):
-                for value in values:
-                    if isinstance(value, str) and normalize(value):
-                        targets.add(normalize(value))
-    return targets
-
-
-def _tool_evidence_name(name: str, arguments: Mapping[str, Any]) -> str:
-    folded = name.casefold()
-    if folded == "window_action" and normalize(str(arguments.get("action", ""))) == "close":
-        return "window_action(close)"
-    return folded
-
-
-def _claim_has_relevant_success(
-    claim: str,
-    tool_results: list[tuple[str, bool]],
-) -> bool:
-    return any(ok and _tool_supports_claim(name, claim) for name, ok in tool_results)
-
-
-def _tool_supports_claim(name: str, claim: str) -> bool:
-    if claim == "done":
-        return _mutating_tool(name)
-    return any(
-        fnmatchcase(name, pattern)
-        for pattern in _CLAIM_TOOL_ASSOCIATIONS.get(claim, ())
-    )
-
-
-def _mutating_tool(name: str) -> bool:
-    if name == "cancel_pending":
-        return False
-    if name in {"mutate", "cancel_work", "close", "focus", "open_file"}:
-        return True
-    if any(
-        fnmatchcase(name, pattern)
-        for patterns in _CLAIM_TOOL_ASSOCIATIONS.values()
-        for pattern in patterns
-    ):
-        return True
-    return any(
-        marker in name
-        for marker in (
-            "send",
-            "create",
-            "draft",
-            "delete",
-            "launch",
-            "write",
-            "edit",
-            "update",
-        )
-    )
 
 
 def _content_bearing_tool(name: str) -> bool:

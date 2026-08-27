@@ -175,57 +175,44 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("value", _InputUnion)]
 
 
+def _prototype(library: Any, name: str, arguments: list[Any], result: Any) -> None:
+    function = getattr(library, name)
+    function.argtypes = arguments
+    function.restype = result
+
+
 def _native_user32() -> Any:
     if os.name != "nt":
         raise DesktopControlError("desktop control is available only on Windows")
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
     enum_callback = callback_type(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = [enum_callback, wintypes.LPARAM]
-    user32.EnumWindows.restype = wintypes.BOOL
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.IsWindowVisible.restype = wintypes.BOOL
-    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    user32.GetWindowTextLengthW.restype = ctypes.c_int
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetWindowTextW.restype = ctypes.c_int
-    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetClassNameW.restype = ctypes.c_int
-    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
-    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_Rect)]
-    user32.GetWindowRect.restype = wintypes.BOOL
-    user32.IsIconic.argtypes = [wintypes.HWND]
-    user32.IsIconic.restype = wintypes.BOOL
-    user32.IsZoomed.argtypes = [wintypes.HWND]
-    user32.IsZoomed.restype = wintypes.BOOL
-    user32.GetForegroundWindow.argtypes = []
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-    user32.SetForegroundWindow.restype = wintypes.BOOL
-    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
-    user32.AttachThreadInput.restype = wintypes.BOOL
-    user32.BringWindowToTop.argtypes = [wintypes.HWND]
-    user32.BringWindowToTop.restype = wintypes.BOOL
-    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-    user32.ShowWindow.restype = wintypes.BOOL
-    user32.SetWindowPos.argtypes = [
+    _prototype(user32, "EnumWindows", [enum_callback, wintypes.LPARAM], wintypes.BOOL)
+    _prototype(user32, "IsWindowVisible", [wintypes.HWND], wintypes.BOOL)
+    _prototype(user32, "GetWindowTextLengthW", [wintypes.HWND], ctypes.c_int)
+    _prototype(user32, "GetWindowTextW", [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
+    _prototype(user32, "GetClassNameW", [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int)
+    _prototype(user32, "GetWindowThreadProcessId", [wintypes.HWND, wintypes.LPDWORD], wintypes.DWORD)
+    _prototype(user32, "GetWindowRect", [wintypes.HWND, ctypes.POINTER(_Rect)], wintypes.BOOL)
+    _prototype(user32, "IsIconic", [wintypes.HWND], wintypes.BOOL)
+    _prototype(user32, "IsZoomed", [wintypes.HWND], wintypes.BOOL)
+    _prototype(user32, "GetForegroundWindow", [], wintypes.HWND)
+    _prototype(user32, "SetForegroundWindow", [wintypes.HWND], wintypes.BOOL)
+    _prototype(user32, "AttachThreadInput", [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL)
+    _prototype(user32, "BringWindowToTop", [wintypes.HWND], wintypes.BOOL)
+    _prototype(user32, "ShowWindow", [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+    _prototype(user32, "SetWindowPos", [
         wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, wintypes.UINT,
-    ]
-    user32.SetWindowPos.restype = wintypes.BOOL
-    user32.PostMessageW.argtypes = [
+    ], wintypes.BOOL)
+    _prototype(user32, "PostMessageW", [
         wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-    ]
-    user32.PostMessageW.restype = wintypes.BOOL
-    user32.SystemParametersInfoW.argtypes = [
+    ], wintypes.BOOL)
+    _prototype(user32, "SystemParametersInfoW", [
         wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT,
-    ]
-    user32.SystemParametersInfoW.restype = wintypes.BOOL
-    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-    user32.SetCursorPos.restype = wintypes.BOOL
-    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_Input), ctypes.c_int]
-    user32.SendInput.restype = wintypes.UINT
+    ], wintypes.BOOL)
+    _prototype(user32, "SetCursorPos", [ctypes.c_int, ctypes.c_int], wintypes.BOOL)
+    _prototype(user32, "SendInput", [wintypes.UINT, ctypes.POINTER(_Input), ctypes.c_int], wintypes.UINT)
     return user32
 
 
@@ -233,16 +220,12 @@ def _native_kernel32() -> Any:
     if os.name != "nt":
         raise DesktopControlError("desktop control is available only on Windows")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.QueryFullProcessImageNameW.argtypes = [
+    _prototype(kernel32, "OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE)
+    _prototype(kernel32, "QueryFullProcessImageNameW", [
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, wintypes.LPDWORD,
-    ]
-    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.GetCurrentThreadId.argtypes = []
-    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    ], wintypes.BOOL)
+    _prototype(kernel32, "CloseHandle", [wintypes.HANDLE], wintypes.BOOL)
+    _prototype(kernel32, "GetCurrentThreadId", [], wintypes.DWORD)
     return kernel32
 
 
@@ -493,10 +476,12 @@ def window_action(
         work = _work_area(user32)
         work_width = int(work.right - work.left)
         work_height = int(work.bottom - work.top)
-        if zone == "left-half":
-            placement = (work.left, work.top, work_width // 2, work_height)
-        elif zone == "right-half":
-            placement = (work.left + work_width // 2, work.top, work_width // 2, work_height)
+        if zone in {"left-half", "right-half"}:
+            half_width = work_width // 2
+            placement = (
+                work.left + (half_width if zone == "right-half" else 0),
+                work.top, half_width, work_height,
+            )
         elif zone == "center":
             bounds = record["bounds"]
             window_width = min(bounds["width"], work_width)
@@ -622,11 +607,17 @@ def _vk(key: str) -> int:
     raise DesktopControlError("key chord is not allowed")
 
 
-def _emit_chord(chord: str, user32: Any) -> dict:
+def _emit_chord(
+    chord: str,
+    user32: Any,
+    *,
+    expected_hwnd: int | None = None,
+    focus_error: str = "focused window changed; input not executed",
+) -> dict:
     keys = [_vk(key) for key in chord.split("+")]
     inputs = [_keyboard_input(key) for key in keys]
     inputs.extend(_keyboard_input(key, flags=KEYEVENTF_KEYUP) for key in reversed(keys))
-    _send(user32, inputs)
+    _send(user32, inputs, expected_hwnd=expected_hwnd, focus_error=focus_error)
     return {"pressed": chord}
 
 
@@ -648,17 +639,11 @@ def press_delete(
         raise DesktopControlError("delete chord is not allowed")
     if isinstance(expected_hwnd, bool) or not isinstance(expected_hwnd, int) or expected_hwnd <= 0:
         raise DesktopControlError("invalid pending window identity")
-    user32 = user32 or _native_user32()
-    keys = [_vk(key) for key in normalized.split("+")]
-    inputs = [_keyboard_input(key) for key in keys]
-    inputs.extend(_keyboard_input(key, flags=KEYEVENTF_KEYUP) for key in reversed(keys))
-    _send(
-        user32,
-        inputs,
+    return _emit_chord(
+        normalized, user32 or _native_user32(),
         expected_hwnd=expected_hwnd,
         focus_error="focused window changed; delete not executed",
     )
-    return {"pressed": normalized}
 
 
 def focused_window_identity(

@@ -54,6 +54,10 @@ _DESKTOP_ALLOWED_CHORDS = frozenset({
 _DESKTOP_MEDIA_KEYS = (
     "play_pause", "next", "previous", "volume_up", "volume_down", "mute",
 )
+_WINDOW_PROPERTIES = {
+    "title": {"type": "string"},
+    "pid": {"type": "integer", "minimum": 1},
+}
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
 _NEXT_PAGE_TOKEN = re.compile(
     r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
@@ -433,57 +437,49 @@ def builtin(
         return await files.read_file(path)
 
     async def list_desktop_windows(arguments: dict) -> dict[str, Any]:
-        _only_arguments(arguments, {"limit"})
-        limit = arguments.get("limit", 40)
-        if (
-            isinstance(limit, bool)
-            or not isinstance(limit, int)
-            or not 1 <= limit <= 100
-        ):
+        values = _desktop_arguments(arguments, integers=("limit",))
+        limit = values.get("limit", 40)
+        if not 1 <= limit <= 100:
             raise ValueError("invalid limit")
         inventory = desktop_api().list_windows(limit=limit)
         return _bounded_window_inventory(inventory)
 
     async def focus_desktop_window(arguments: dict) -> dict:
-        return desktop_api().focus_window(**_window_target(arguments))
+        return desktop_api().focus_window(**_desktop_arguments(
+            arguments, window="required",
+        ))
 
     async def desktop_window_action(arguments: dict) -> dict:
-        _only_arguments(
-            arguments, {"action", "title", "pid", "x", "y", "width", "height"},
+        values = _desktop_arguments(
+            arguments,
+            ("action",), integers=("x", "y", "width", "height"), window="required",
         )
         action = _text_argument(arguments, "action", maximum=64).casefold()
-        target = _window_target(arguments, ignored={"action", "x", "y", "width", "height"})
-        extras = {
-            name: _integer_argument(arguments, name)
-            for name in ("x", "y", "width", "height")
-            if name in arguments
-        }
-        return desktop_api().window_action(action, **target, **extras)
+        return desktop_api().window_action(action, **values)
 
     async def desktop_media_key(arguments: dict) -> dict:
-        _only_arguments(arguments, {"key"})
+        _desktop_arguments(arguments, ("key",))
         return desktop_api().media_key(
             _text_argument(arguments, "key", maximum=32).casefold(),
         )
 
     async def desktop_click(arguments: dict) -> dict:
-        _only_arguments(arguments, {"x", "y", "title", "pid"})
-        target = _window_target(arguments, optional=True, ignored={"x", "y"})
+        values = _desktop_arguments(
+            arguments, integers=("x", "y"), required=("x", "y"), window="optional",
+        )
         return desktop_api().click(
-            _integer_argument(arguments, "x"),
-            _integer_argument(arguments, "y"),
-            **target,
+            values.pop("x"), values.pop("y"), **values,
         )
 
     async def desktop_type_text(arguments: dict) -> dict:
-        _only_arguments(arguments, {"text"})
+        _desktop_arguments(arguments, ("text",))
         text = arguments.get("text")
         if not isinstance(text, str) or not text or len(text) > 4000:
             raise ValueError("invalid text")
         return desktop_api().type_text(text)
 
     async def desktop_press_keys(arguments: dict) -> ToolResult | dict:
-        _only_arguments(arguments, {"chord"})
+        _desktop_arguments(arguments, ("chord",))
         api = desktop_api()
         chord = api.normalize_chord(arguments.get("chord"))
         if chord in _DESKTOP_DELETE_CHORDS:
@@ -491,7 +487,7 @@ def builtin(
         return api.press_keys(chord)
 
     def prepare_delete(arguments: dict) -> _PreparedAction:
-        _only_arguments(arguments, {"chord"})
+        _desktop_arguments(arguments, ("chord",))
         api = desktop_api()
         chord = api.normalize_chord(arguments.get("chord"))
         if chord not in _DESKTOP_DELETE_CHORDS:
@@ -524,7 +520,7 @@ def builtin(
         arguments: dict,
         expected_hwnd: Any,
     ) -> ToolResult | dict:
-        _only_arguments(arguments, {"chord", "window", "pid"})
+        _desktop_arguments(arguments, ("chord", "window", "pid"))
         try:
             return desktop_api().press_delete(
                 arguments["chord"], expected_hwnd=expected_hwnd,
@@ -566,31 +562,19 @@ def builtin(
         }
         registry.register(Tool(name, description, schema, run))
 
-    target_properties = {
-        "title": {"type": "string"},
-        "pid": {"type": "integer", "minimum": 1},
-    }
-    target_choice = [{"required": ["title"]}, {"required": ["pid"]}]
     desktop_definitions = (
         (
-            "list_windows",
-            "List visible top-level windows without exposing native handles.",
-            {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
-            [],
+            "list_windows", "List visible top-level windows without exposing native handles.",
+            _desktop_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 100}}),
             list_desktop_windows,
         ),
         (
-            "focus_window",
-            "Focus one host-resolved visible window by title or pid.",
-            target_properties,
-            target_choice,
-            focus_desktop_window,
+            "focus_window", "Focus one host-resolved visible window by title or pid.",
+            _desktop_schema(window="required"), focus_desktop_window,
         ),
         (
-            "window_action",
-            "Minimize, maximize, restore, close, move, or resize a host-resolved window.",
-            {
-                **target_properties,
+            "window_action", "Minimize, maximize, restore, close, move, or resize a host-resolved window.",
+            _desktop_schema({
                 "action": {
                     "type": "string",
                     "enum": [
@@ -602,47 +586,39 @@ def builtin(
                 "y": {"type": "integer"},
                 "width": {"type": "integer", "minimum": 1},
                 "height": {"type": "integer", "minimum": 1},
-            },
-            [{"required": ["title", "action"]}, {"required": ["pid", "action"]}],
+            }, required=("action",), window="required"),
             desktop_window_action,
         ),
         (
-            "media_key",
-            "Press one allowlisted media key.",
-            {"key": {"type": "string", "enum": list(_DESKTOP_MEDIA_KEYS)}},
-            [{"required": ["key"]}],
-            desktop_media_key,
+            "media_key", "Press one allowlisted media key.",
+            _desktop_schema(
+                {"key": {"type": "string", "enum": list(_DESKTOP_MEDIA_KEYS)}},
+                required=("key",),
+            ), desktop_media_key,
         ),
         (
-            "click",
-            "Click screen coordinates, or coordinates relative to a host-resolved window.",
-            {"x": {"type": "integer"}, "y": {"type": "integer"}, **target_properties},
-            [{"required": ["x", "y"]}],
-            desktop_click,
+            "click", "Click screen coordinates, or coordinates relative to a host-resolved window.",
+            _desktop_schema(
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                required=("x", "y"), window="optional",
+            ), desktop_click,
         ),
         (
-            "type_text",
-            "Type Unicode text into the foreground application.",
-            {"text": {"type": "string", "minLength": 1, "maxLength": 4000}},
-            [{"required": ["text"]}],
-            desktop_type_text,
+            "type_text", "Type Unicode text into the foreground application.",
+            _desktop_schema(
+                {"text": {"type": "string", "minLength": 1, "maxLength": 4000}},
+                required=("text",),
+            ), desktop_type_text,
         ),
         (
-            "press_keys",
-            "Press one allowlisted non-delete key chord in the foreground application.",
-            {"chord": {"type": "string", "enum": sorted(_DESKTOP_ALLOWED_CHORDS)}},
-            [{"required": ["chord"]}],
-            desktop_press_keys,
+            "press_keys", "Press one allowlisted non-delete key chord in the foreground application.",
+            _desktop_schema(
+                {"chord": {"type": "string", "enum": sorted(_DESKTOP_ALLOWED_CHORDS)}},
+                required=("chord",),
+            ), desktop_press_keys,
         ),
     )
-    for name, description, properties, choices, run in desktop_definitions:
-        schema = {
-            "type": "object",
-            "properties": properties,
-            "additionalProperties": False,
-        }
-        if choices:
-            schema["oneOf"] = choices
+    for name, description, schema, run in desktop_definitions:
         registry.register(Tool(name, description, schema, run))
 
     delete_schema = {
@@ -758,40 +734,61 @@ def _text_argument(arguments: Mapping[str, Any], name: str, *, maximum: int) -> 
     return value.strip()
 
 
-def _only_arguments(arguments: Mapping[str, Any], allowed: set[str]) -> None:
+def _desktop_arguments(
+    arguments: Mapping[str, Any], fields: tuple[str, ...] = (), *,
+    integers: tuple[str, ...] = (),
+    required: tuple[str, ...] = (),
+    window: Literal["required", "optional"] | None = None,
+) -> dict[str, Any]:
+    allowed = {*fields, *integers}
+    if window:
+        allowed.update(("title", "pid"))
     if set(arguments) - allowed:
         raise ValueError("unexpected argument")
-
-
-def _integer_argument(arguments: Mapping[str, Any], name: str) -> int:
-    value = arguments.get(name)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"invalid {name}")
-    return value
-
-
-def _window_target(
-    arguments: Mapping[str, Any],
-    *,
-    optional: bool = False,
-    ignored: set[str] | None = None,
-) -> dict[str, Any]:
-    ignored = ignored or set()
-    _only_arguments(arguments, {"title", "pid"} | ignored)
+    values = {}
+    for name in integers:
+        value = arguments.get(name)
+        if name in required or name in arguments:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"invalid {name}")
+            values[name] = value
+    if window is None:
+        return values
     has_title = "title" in arguments
     has_pid = "pid" in arguments
     if has_title and has_pid:
         raise ValueError("provide title or pid, not both")
     if not has_title and not has_pid:
-        if optional:
-            return {}
-        raise ValueError("missing title or pid")
+        if window == "required":
+            raise ValueError("missing title or pid")
+        return values
     if has_title:
-        return {"title": _text_argument(arguments, "title", maximum=512)}
-    pid = _integer_argument(arguments, "pid")
-    if pid <= 0:
+        values["title"] = _text_argument(arguments, "title", maximum=512)
+        return values
+    pid = arguments.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise ValueError("invalid pid")
-    return {"pid": pid}
+    values["pid"] = pid
+    return values
+
+
+def _desktop_schema(
+    properties: dict[str, dict[str, Any]] | None = None, *,
+    required: tuple[str, ...] = (),
+    window: Literal["required", "optional"] | None = None,
+) -> dict[str, Any]:
+    target_properties = deepcopy(_WINDOW_PROPERTIES) if window else {}
+    schema: dict[str, Any] = {
+        "type": "object", "properties": {**target_properties, **(properties or {})},
+        "additionalProperties": False,
+    }
+    if window == "required":
+        schema["oneOf"] = [
+            {"required": [target, *required]} for target in ("title", "pid")
+        ]
+    elif required:
+        schema["oneOf"] = [{"required": list(required)}]
+    return schema
 
 
 def _bounded_window_inventory(inventory: Any) -> dict[str, Any]:
@@ -857,19 +854,21 @@ def _serialize(value: Any) -> str:
 
 def _readback_summary(name: str, arguments: Mapping[str, Any]) -> str:
     if name == "press_delete":
-        chord = _CONTROL_CHARACTERS.sub("", str(arguments.get("chord", "")))
-        title = _CONTROL_CHARACTERS.sub("", str(arguments.get("window", "")))
-        pid = arguments.get("pid")
-        return f"press_delete - chord: {chord}; window: {title}; pid: {pid}"
-    details = []
-    for key, value in arguments.items():
-        serialized = _serialize(value)
-        cleaned = _CONTROL_CHARACTERS.sub("", serialized)
-        if len(cleaned) > _READBACK_VALUE_LIMIT:
-            omitted = len(cleaned) - _READBACK_VALUE_LIMIT
-            cleaned = f"{cleaned[:_READBACK_VALUE_LIMIT]} ...(+{omitted} chars)"
-        details.append(f"{key}: {cleaned}")
+        arguments = {key: arguments.get(key, "") for key in ("chord", "window", "pid")}
+        maximum = None
+    else:
+        maximum = _READBACK_VALUE_LIMIT
+    details = [
+        f"{key}: {_readback_value(value, maximum)}" for key, value in arguments.items()
+    ]
     return f"{name} - " + ("; ".join(details) if details else "no arguments")
+
+
+def _readback_value(value: Any, maximum: int | None) -> str:
+    cleaned = _CONTROL_CHARACTERS.sub("", _serialize(value))
+    if maximum is None or len(cleaned) <= maximum:
+        return cleaned
+    return f"{cleaned[:maximum]} ...(+{len(cleaned) - maximum} chars)"
 
 
 def _bound_content(value: str) -> str:
