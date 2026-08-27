@@ -148,6 +148,11 @@ def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
     assert 'publicJson("/health"' in script[2]
     assert '"/mcp"' not in script[2]
     assert "renderMcp(health.mcp);" in script[2]
+    assert 'kbUnlockButton.id = "kb-unlock-button";' in script[2]
+    assert 'callNativeWindow("unlock_kb")' in script[2]
+    assert '"atlas unlock kb"' in script[2]
+    assert '"unlock the dashboard"' in script[2]
+    assert "session ${server.session}" in script[2]
 
 
 def test_jobs_events_and_health_are_fixed_public_projections():
@@ -170,6 +175,9 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     mcp = [{
         "name": "google", "connected": True, "tools": 11, "error": None,
         "env": "must-not-escape",
+    }, {
+        "name": "kb", "connected": True, "tools": 22, "error": None,
+        "session": "held", "token": "must-not-escape",
     }]
 
     async def scenario():
@@ -219,7 +227,13 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert "must-not-escape" not in health_response[2]
     assert json.loads(health_response[2]) == {
         "claude": True,
-        "mcp": [{"name": "google", "connected": True, "tools": 11, "error": None}],
+        "mcp": [
+            {"name": "google", "connected": True, "tools": 11, "error": None},
+            {
+                "name": "kb", "connected": True, "tools": 22, "error": None,
+                "session": "held",
+            },
+        ],
     }
     assert missing_mcp[0] == 404
     assert invalid[0] == 400
@@ -900,6 +914,75 @@ def test_shutdown_requires_exact_launcher_token_before_invoking_provider():
     assert json.loads(accepted[2]) == {"ok": True}
     assert json.loads(repeated[2]) == {"ok": True}
     assert shutdown_calls == ["requested"]
+
+
+def test_kb_session_channel_requires_launcher_token_and_forwards_only_in_memory(monkeypatch):
+    received = []
+
+    class FakeMcp:
+        async def set_session(self, server, token, expires_at):
+            received.append((server, token, expires_at))
+
+        def session_origin(self, server):
+            assert server == "kb"
+            return "http://127.0.0.1:5317"
+
+    from worker import mcp_client
+
+    monkeypatch.setattr(mcp_client, "active_mcp_servers", lambda: FakeMcp())
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            shutdown_token="launcher-token",
+        )
+        body = json.dumps({
+            "token": "private-operator-bearer",
+            "expiresAt": "2099-01-01T00:00:00Z",
+        })
+        origin = f"http://127.0.0.1:{server.port}"
+        try:
+            denied = await _request(
+                server,
+                "POST",
+                "/kb/session",
+                body=body,
+                headers={"Content-Type": "application/json", "Origin": origin},
+            )
+            accepted = await _request(
+                server,
+                "POST",
+                "/kb/session",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin,
+                    stateserver.SHUTDOWN_HEADER: "launcher-token",
+                },
+            )
+            config = await _request(
+                server,
+                path="/kb/config",
+                headers={stateserver.SHUTDOWN_HEADER: "launcher-token"},
+            )
+            return denied, accepted, config
+        finally:
+            await server.stop()
+
+    denied, accepted, config = asyncio.run(scenario())
+    assert denied[0] == 403
+    assert json.loads(accepted[2]) == {"ok": True}
+    assert received == [(
+        "kb",
+        "private-operator-bearer",
+        "2099-01-01T00:00:00Z",
+    )]
+    assert "private-operator-bearer" not in accepted[2]
+    assert json.loads(config[2]) == {
+        "enabled": True,
+        "origin": "http://127.0.0.1:5317",
+    }
 
 
 def test_authorized_shutdown_continues_after_the_request_task_is_cancelled():

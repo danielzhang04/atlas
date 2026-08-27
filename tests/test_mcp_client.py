@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -106,6 +107,62 @@ def test_stdio_session_discards_child_stderr(monkeypatch):
 
     asyncio.run(scenario())
     assert seen["spec"].command == "node"
+    assert seen["errlog"] is subprocess.DEVNULL
+
+
+def test_explicit_command_transport_suppresses_mcp_default_environment(monkeypatch):
+    from mcp.client import stdio as mcp_stdio
+
+    seen = {}
+
+    class FakeStdioClient:
+        async def __aenter__(self):
+            seen["environment"] = {
+                **mcp_stdio.get_default_environment(),
+                **seen["spec"].env,
+            }
+            return "read", "write"
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def fake_stdio_client(spec, *, errlog):
+        seen["spec"] = spec
+        seen["errlog"] = errlog
+        return FakeStdioClient()
+
+    monkeypatch.setattr(
+        mcp_client,
+        "_load_mcp_transport",
+        lambda: (None, SimpleNamespace, fake_stdio_client),
+    )
+    monkeypatch.setattr(
+        mcp_stdio,
+        "get_default_environment",
+        lambda: {"MUST_NOT_ESCAPE": "private", "PATH": "broad"},
+    )
+
+    async def scenario():
+        spec = SimpleNamespace(env={"PATH": "minimal", "SystemRoot": "C:/Windows"})
+        async with mcp_client._PidTrackingStdio(
+            spec,
+            lambda _pid: None,
+            exact_environment=True,
+            enter_lock=asyncio.Lock(),
+        ):
+            pass
+
+    asyncio.run(scenario())
+
+    assert seen["environment"] == {
+        "PATH": "minimal",
+        "SystemRoot": "C:/Windows",
+    }
+    assert not any(
+        value in seen["environment"].values()
+        for name, value in os.environ.items()
+        if name not in {"PATH", "SystemRoot"}
+    )
     assert seen["errlog"] is subprocess.DEVNULL
 
 
@@ -817,7 +874,379 @@ def test_failed_server_task_ends_and_retains_disconnected_status():
     assert done is True
 
 
-def test_load_mcp_config_reads_mapping(tmp_path):
+def test_load_mcp_config_rejects_scalar_command(tmp_path):
     path = tmp_path / "mcp.yaml"
     path.write_text("servers:\n  google:\n    command: node\n", encoding="utf-8")
-    assert load_mcp_config(path) == {"servers": {"google": {"command": "node"}}}
+    with pytest.raises(ValueError, match="invalid MCP command argv"):
+        load_mcp_config(path)
+
+
+def test_command_config_requires_enabled_from(tmp_path):
+    path = tmp_path / "mcp.yaml"
+    path.write_text("servers:\n  kb:\n    command: [node]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid MCP enabled_from"):
+        load_mcp_config(path)
+
+
+def test_command_config_enabled_from_must_resolve_to_bool(tmp_path):
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(
+        "servers:\n  kb:\n    command: [node]\n"
+        "    enabled_from: kb_bridge.enabled\n",
+        encoding="utf-8",
+    )
+    atlas_path.write_text(
+        'kb_bridge:\n  enabled: "yes"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid MCP enabled_from value"):
+        load_mcp_config(mcp_path, atlas_path=atlas_path)
+
+
+def test_command_config_is_dormant_by_default_and_resolves_a_minimal_environment(
+    tmp_path,
+    monkeypatch,
+):
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(
+        """servers:
+  kb:
+    command: [node, "{kb_bridge.path}/dist/server.js"]
+    enabled_from: kb_bridge.enabled
+    session_channel: true
+    env_from:
+      ATLAS_KB_BRIDGE_ENABLED: kb_bridge.enabled
+      ATLAS_KB_MUTATIONS_ENABLED: kb_bridge.mutations
+      ATLAS_KB_ORIGIN: kb_bridge.origin
+""",
+        encoding="utf-8",
+    )
+    atlas_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "minimal-path")
+    monkeypatch.setenv("SystemRoot", "C:/Windows")
+    monkeypatch.setenv("MUST_NOT_ESCAPE", "private")
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    calls = []
+
+    def factory(_name, _spec):
+        calls.append(True)
+        raise AssertionError("disabled command server was spawned")
+
+    async def scenario():
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(FakeRegistry())
+        status = servers.status()
+        await servers.close()
+        return status
+
+    assert asyncio.run(scenario()) == [
+        {
+            "name": "kb",
+            "connected": False,
+            "tools": 0,
+            "error": None,
+            "session": "none",
+        },
+    ]
+    assert calls == []
+
+    atlas_path.write_text(
+        """kb_bridge:
+  enabled: true
+  mutations: true
+  path: C:/bridge
+  origin: http://127.0.0.1:5317
+""",
+        encoding="utf-8",
+    )
+    enabled = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    spawned = []
+
+    @asynccontextmanager
+    async def enabled_factory(name, spec):
+        spawned.append((name, spec))
+        yield SimpleNamespace(list_tools=lambda: asyncio.sleep(
+            0,
+            result=SimpleNamespace(tools=[]),
+        ))
+
+    async def enabled_scenario():
+        enabled_servers = McpServers(enabled, session_factory=enabled_factory)
+        await enabled_servers.connect(FakeRegistry())
+        await enabled_servers.close()
+
+    asyncio.run(enabled_scenario())
+    assert len(spawned) == 1
+    name, spec = spawned[0]
+    assert name == "kb"
+    assert spec.command == "node"
+    assert spec.args == ["C:/bridge/dist/server.js"]
+    assert spec.env == {
+        "ATLAS_KB_BRIDGE_ENABLED": "1",
+        "ATLAS_KB_MUTATIONS_ENABLED": "1",
+        "ATLAS_KB_ORIGIN": "http://127.0.0.1:5317",
+        "PATH": "minimal-path",
+        "SystemRoot": "C:/Windows",
+    }
+
+
+def test_kb_session_is_notified_after_initialize_and_on_refresh_without_logging(caplog):
+    token = "operator-bearer-must-not-be-logged"
+    refreshed = "refreshed-bearer-must-not-be-logged"
+    notifications = []
+
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+        async def send_notification(self, notification):
+            notifications.append(notification)
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {
+                    "kb": {
+                        "command": "unused",
+                        "session_channel": True,
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        await servers.set_session("kb", token, "2099-01-01T00:00:00Z")
+        await servers.connect(FakeRegistry())
+        await servers.set_session("kb", refreshed, "2099-01-01T00:05:00Z")
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+    assert [item.method for item in notifications] == [
+        "notifications/atlas/session",
+        "notifications/atlas/session",
+    ]
+    assert [item.params for item in notifications] == [
+        {"token": token, "expiresAt": "2099-01-01T00:00:00Z"},
+        {"token": refreshed, "expiresAt": "2099-01-01T00:05:00Z"},
+    ]
+    assert status == [{
+        "name": "kb",
+        "connected": True,
+        "tools": 0,
+        "error": None,
+        "session": "held",
+    }]
+    assert token not in caplog.text
+    assert refreshed not in caplog.text
+    assert token not in repr(status)
+    assert refreshed not in repr(status)
+
+
+def test_session_set_during_list_tools_is_notified_exactly_once():
+    notifications = []
+
+    class DelayedSession:
+        def __init__(self):
+            self.listing = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def list_tools(self):
+            self.listing.set()
+            await self.release.wait()
+            return SimpleNamespace(tools=[])
+
+        async def send_notification(self, notification):
+            notifications.append(notification)
+
+    session = DelayedSession()
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield session
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {
+                    "kb": {"command": "unused", "session_channel": True},
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        connecting = asyncio.create_task(servers.connect(FakeRegistry()))
+        await session.listing.wait()
+        await servers.set_session("kb", "private", "2099-01-01T00:00:00Z")
+        session.release.set()
+        await connecting
+        await servers.close()
+
+    asyncio.run(scenario())
+    assert len(notifications) == 1
+    assert notifications[0].params == {
+        "token": "private",
+        "expiresAt": "2099-01-01T00:00:00Z",
+    }
+
+
+def test_kb_session_required_error_is_mapped_to_bounded_unlock_instruction():
+    class FakeErrorSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text='{"type":"session_required"}')],
+                structuredContent={"type": "session_required"},
+                isError=True,
+            )
+
+    servers = McpServers({"servers": {}})
+    with pytest.raises(
+        McpToolError,
+        match="^kb is locked - say: Atlas, unlock kb$",
+    ):
+        asyncio.run(servers._call_session(
+            FakeErrorSession(), {"session_channel": True}, 8, "kb_runs_list", {},
+        ))
+
+
+def test_non_session_server_keeps_generic_session_required_error():
+    class FakeGoogleSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text='{"type":"session_required"}')],
+                structuredContent={"type": "session_required"},
+                isError=True,
+            )
+
+    servers = McpServers({"servers": {}})
+    with pytest.raises(McpToolError) as raised:
+        asyncio.run(servers._call_session(
+            FakeGoogleSession(), {}, 8, "google_search", {},
+        ))
+    assert str(raised.value) == '{"type":"session_required"}'
+
+
+def test_t3_requires_dashboard_error_has_bounded_voice_mapping():
+    class FakeKbSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="bridge refused response")],
+                structuredContent={"type": "t3_requires_dashboard"},
+                isError=True,
+            )
+
+    servers = McpServers({"servers": {}})
+    with pytest.raises(McpToolError) as raised:
+        asyncio.run(servers._call_session(
+            FakeKbSession(), {"session_channel": True}, 8, "kb_human_respond", {},
+        ))
+    assert str(raised.value) == "that needs the dashboard - T3 is never done by voice"
+
+
+def test_kb_session_rejects_expiry_inside_clock_skew_without_retaining_token():
+    now = [1_000.0]
+    servers = McpServers(
+        {
+            "servers": {
+                "kb": {"command": "unused", "session_channel": True},
+            },
+        },
+        wall_clock=lambda: now[0],
+    )
+
+    with pytest.raises(ValueError, match="MCP session expires too soon"):
+        asyncio.run(servers.set_session("kb", "private", 1_030.0))
+    assert servers.status()[0]["session"] == "none"
+    assert servers._session_tokens == {}
+
+
+def test_kb_health_flips_expired_then_erases_session_with_fake_clock():
+    async def scenario():
+        now = [1_000.0]
+        servers = McpServers(
+            {
+                "servers": {
+                    "kb": {"command": "unused", "session_channel": True},
+                },
+            },
+            wall_clock=lambda: now[0],
+        )
+        await servers.set_session("kb", "private", 1_031.0)
+        assert servers.status()[0]["session"] == "held"
+        now[0] = 1_031.0
+        expired = servers.status()
+        assert expired[0]["session"] == "expired"
+        assert servers._session_tokens["kb"][0] is None
+        await asyncio.sleep(0)
+        erased = servers.status()
+        await servers.close()
+        return expired, erased
+
+    expired, erased = asyncio.run(scenario())
+    assert "private" not in repr(expired)
+    assert erased[0]["session"] == "none"
+
+
+def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_tool():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["kb"]
+    defaults = config["defaults"]
+    read_tools = {
+        "kb_capabilities", "kb_agents_list", "kb_agent_get",
+        "kb_workflows_list", "kb_workflow_get", "kb_runs_list", "kb_run_get",
+        "kb_run_events", "kb_run_watch", "kb_inbox_list", "kb_schedules_list",
+        "kb_deployment_inspect", "kb_asset_pull_inspect", "kb_repo_tree",
+        "kb_repo_file", "kb_repo_history", "kb_repo_search",
+        "kb_analytics_snapshot", "kb_trace_list", "kb_trace_get",
+        "kb_terminal_list",
+    }
+    mutation_tools = {
+        "kb_agent_create", "kb_agent_update", "kb_workflow_create",
+        "kb_workflow_update", "kb_workflow_launch", "kb_agent_launch",
+        "kb_human_respond", "kb_review_dispatch", "kb_schedule_create",
+        "kb_schedule_set_armed", "kb_schedule_delete", "kb_deployment_action",
+        "kb_asset_pull_action", "kb_terminal_close", "kb_run_control",
+    }
+
+    assert set(server["instant"]) == read_tools
+    assert all(policy_for(server, defaults, name) == "instant" for name in read_tools)
+    assert all(policy_for(server, defaults, name) == "confirm" for name in mutation_tools)
+    assert policy_for(server, defaults, "kb_future_mutation") == "confirm"
+    assert server["command"] == "node"
+    assert server["args"] == [
+        "C:/Users/danie/kb/dashboard/atlas-bridge/dist/server.js",
+    ]
+    assert server["enabled"] is True
+    assert set(server["env"]) == {
+        "ATLAS_KB_BRIDGE_ENABLED",
+        "ATLAS_KB_MUTATIONS_ENABLED",
+        "ATLAS_KB_ORIGIN",
+        "PATH",
+        "SystemRoot",
+    }
+
+
+def test_kb_tool_descriptions_do_not_claim_to_enforce_t3():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "kb",
+        {"instant": []},
+        {},
+        SimpleNamespace(),
+        SimpleNamespace(
+            name="kb_run_control",
+            description="MUTATION Control a run.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+
+    assert "T3 approvals" not in tool.description
+    assert tool.policy == "confirm"

@@ -24,3 +24,5 @@ wake_patience: 3
 tts_output_device: follow
 
 file_roots: [known:Desktop, known:Documents, known:Downloads, C:/Users/danie/kb]
+
+kb_bridge: {enabled: true, mutations: true, path: "C:/Users/danie/kb/dashboard/atlas-bridge", origin: "http://127.0.0.1:5317"}

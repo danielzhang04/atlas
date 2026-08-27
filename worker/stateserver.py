@@ -254,10 +254,14 @@ def _safe_mcp(value: Any) -> list[dict[str, Any]]:
             and (error is None or isinstance(error, str))
         ):
             continue
-        servers.append({
+        projected = {
             "name": name[:128], "connected": connected, "tools": max(0, tools),
             "error": error[:128] if error is not None else None,
-        })
+        }
+        session = item.get("session")
+        if name == "kb" and session in {"held", "none", "expired"}:
+            projected["session"] = session
+        servers.append(projected)
     return servers
 
 
@@ -503,6 +507,54 @@ class StateServer:
             headers={"cache-control": "no-store"},
         )
 
+    async def _handle_kb_session(self, request: web.Request) -> web.Response:
+        supplied = request.headers.get(SHUTDOWN_HEADER)
+        if (
+            not self._shutdown_token
+            or not supplied
+            or not hmac.compare_digest(supplied, self._shutdown_token)
+        ):
+            raise web.HTTPForbidden(text="valid launcher token required")
+        payload = await self._read_json(request)
+        token, expires_at = payload.get("token"), payload.get("expiresAt")
+        if not isinstance(token, str) or not token or not isinstance(
+            expires_at, (str, int, float),
+        ) or isinstance(expires_at, bool):
+            raise web.HTTPBadRequest(text="invalid kb session")
+        from .mcp_client import active_mcp_servers
+
+        mcp = active_mcp_servers()
+        if mcp is None:
+            raise web.HTTPServiceUnavailable(text="kb session channel unavailable")
+        try:
+            await mcp.set_session("kb", token, expires_at)
+        except ValueError:
+            raise web.HTTPBadRequest(text="invalid kb session") from None
+        except Exception as exc:
+            logger.warning("kb session forwarding failed: %s", type(exc).__name__)
+            raise web.HTTPServiceUnavailable(text="kb session forwarding failed") from None
+        return web.json_response(
+            {"ok": True},
+            headers={"cache-control": "no-store"},
+        )
+
+    async def _handle_kb_config(self, request: web.Request) -> web.Response:
+        supplied = request.headers.get(SHUTDOWN_HEADER)
+        if (
+            not self._shutdown_token
+            or not supplied
+            or not hmac.compare_digest(supplied, self._shutdown_token)
+        ):
+            raise web.HTTPForbidden(text="valid launcher token required")
+        from .mcp_client import active_mcp_servers
+
+        mcp = active_mcp_servers()
+        origin = mcp.session_origin("kb") if mcp is not None else None
+        return web.json_response(
+            {"enabled": origin is not None, "origin": origin},
+            headers={"cache-control": "no-store"},
+        )
+
     async def start(self, port: int) -> "StateServer":
         app = web.Application(middlewares=[_security_middleware(lambda: self.port)])
         app.router.add_get("/", self._handle_index)
@@ -517,6 +569,8 @@ class StateServer:
         app.router.add_get("/jobs/{job_id}/events", self._handle_job_events)
         app.router.add_get("/jobs/{job_id}/result", self._handle_job_result)
         app.router.add_post("/jobs/{job_id}/cancel", self._handle_cancel_job)
+        app.router.add_get("/kb/config", self._handle_kb_config)
+        app.router.add_post("/kb/session", self._handle_kb_session)
         app.router.add_post("/shutdown", self._handle_shutdown)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
