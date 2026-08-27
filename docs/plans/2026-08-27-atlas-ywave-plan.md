@@ -34,13 +34,13 @@ new eager import without importtime/RSS evidence, 9 methods-only js_api); no new
 
 ## Tasklist
 
-- [ ] Y1 caching: ttl 1h on tools[-1] and system[0]; Brain built after MCP settle, rebuilt on real tool-set
+- [x] Y1 caching: ttl 1h on tools[-1] and system[0]; Brain built after MCP settle, rebuilt on real tool-set
       change; lazy count_tokens floor warning. Tests with fakes. (worktree y1)
-- [ ] Y2 traces: worker/traces.py + wiring in the turn loop + /health summary + scripts/traces.py. (y2)
-- [ ] Y3 connector status: mcp_client + desktopapps state/detail; /health; Settings view; capability text. (y3)
-- [ ] Y4 hooks: requirements-dev, scripts/hooks/post_edit_check.py, .claude/settings.json, .codex/hooks.json,
+- [x] Y2 traces: worker/traces.py + wiring in the turn loop + /health summary + scripts/traces.py. (y2)
+- [x] Y3 connector status: mcp_client + desktopapps state/detail; /health; Settings view; capability text. (y3)
+- [x] Y4 hooks: requirements-dev, scripts/hooks/post_edit_check.py, .claude/settings.json, .codex/hooks.json,
       tests with fixture files; boss verifies Claude + Codex firing. (y4)
-- [ ] Y5a assistant loop: /state tool field, TOOL palette + strip, greeting. (y5a)
-- [ ] Y5b quick actions + text input + holo CSS. (y5b)
-- [ ] Per unit: adversarial review -> fix -> boss verify -> merge.
-- [ ] Full suite, importtime + RSS comparison vs 6882436, deploy, live /health + UI probe, handoff, ping Daniel.
+- [x] Y5a assistant loop: /state tool field, TOOL palette + strip, greeting. (y5a)
+- [x] Y5b quick actions + text input + holo CSS. (y5b)
+- [x] Per unit: adversarial review -> fix -> boss verify -> merge.
+- [x] Full suite, importtime + RSS comparison vs 6882436, deploy, live /health + UI probe, handoff, ping Daniel.
