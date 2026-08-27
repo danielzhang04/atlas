@@ -199,7 +199,10 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     local_timezone = datetime.now().astimezone().tzinfo
     clock = lambda: datetime(2026, 8, 22, 9, 41, 29, tzinfo=local_timezone)
     now = clock().astimezone()
-    brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock)
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock,
+        cache_ttl="1h",
+    )
 
     chunks = asyncio.run(collect(brain, "Hello"))
 
@@ -210,7 +213,7 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     ]
     call = client.messages.calls[0]
     assert call["system"][0]["type"] == "text"
-    assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert call["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert call["system"][0]["text"].startswith(
         BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed."
     )
@@ -221,7 +224,7 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
     }
     assert "cache_control" not in call["system"][1]
-    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "cache_control" not in call["tools"][0]
     assert call["tool_choice"] == {"type": "auto"}
 
@@ -500,7 +503,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
         {"role": "user", "content": "yes go ahead and create the draft"},
         {
             "role": "assistant",
-            "content": "Done — google__draft_gmail_message executed.",
+            "content": "Done -- google__draft_gmail_message executed.",
         },
     ]
     request = client.messages.calls[0]
@@ -529,7 +532,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
             }],
         },
     ]
-    assert "Done — google__draft_gmail_message executed." in request["system"][-1]["text"]
+    assert "Done -- google__draft_gmail_message executed." in request["system"][-1]["text"]
 
 
 def test_confirm_error_is_persisted_and_narrated_as_a_real_tool_error():
@@ -714,11 +717,11 @@ def test_confirm_narration_failure_returns_and_remembers_deterministic_host_line
 
     result = asyncio.run(collect(brain, "confirm"))
 
-    assert result == ["Done — mutate executed."]
+    assert result == ["Done -- mutate executed."]
     assert mutation_calls == [{"message": "hello"}]
     assert brain._history == [
         {"role": "user", "content": "confirm"},
-        {"role": "assistant", "content": "Done — mutate executed."},
+        {"role": "assistant", "content": "Done -- mutate executed."},
     ]
 
 
@@ -1191,7 +1194,7 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
     assert (
-        "If read_file reports truncated, do not analyse the preview — "
+        "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM

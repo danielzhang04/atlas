@@ -290,6 +290,7 @@ class ToolRegistry:
         *,
         host_state: Any = None,
     ) -> ToolResult:
+        started = time.perf_counter()
         try:
             async with asyncio.timeout(self._timeout_s):
                 if tool.execute_prepared is not None and host_state is not None:
@@ -297,12 +298,21 @@ class ToolRegistry:
                 else:
                     value = await tool.run(arguments)
         except McpToolError as exc:
-            return ToolResult("error", str(exc))
+            result = ToolResult("error", str(exc))
         except Exception as exc:
-            return ToolResult("error", type(exc).__name__)
-        if isinstance(value, ToolResult):
-            return ToolResult(value.status, _bound_content(value.content), value.confirm_id)
-        return ToolResult("ok", _bound_content(_serialize(value)))
+            result = ToolResult("error", type(exc).__name__)
+        else:
+            if isinstance(value, ToolResult):
+                result = ToolResult(value.status, _bound_content(value.content), value.confirm_id)
+            else:
+                result = ToolResult("ok", _bound_content(_serialize(value)))
+        from worker import traces as traces_mod
+        traces_mod.record_current_tool_call(
+            tool.name,
+            ms=round((time.perf_counter() - started) * 1000),
+            ok=result.status == "ok",
+        )
+        return result
 
 
 def load_apps(path: Path) -> dict[str, AppEntry]:

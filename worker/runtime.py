@@ -100,6 +100,8 @@ def build(
     max_tokens = cfg.get("max_tokens", 400)
     timeout_s = cfg.get("turn_timeout_s", 12.0)
     ceiling_s = cfg.get("turn_ceiling_s", 30.0)
+    pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
+    cache_ttl = pricing.get("cache_ttl", "5m")
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
         raise ValueError("invalid Atlas configuration: max_tokens")
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
@@ -167,5 +169,6 @@ def build(
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
         turn_ceiling_s=float(ceiling_s),
+        cache_ttl=cache_ttl,
     )
     return Runtime(registry, mcp, work, brain, store)

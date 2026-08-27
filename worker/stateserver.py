@@ -265,6 +265,26 @@ def _safe_mcp(value: Any) -> list[dict[str, Any]]:
     return servers
 
 
+def _safe_traces(value: Any) -> dict[str, bool | int | float]:
+    if not isinstance(value, dict):
+        value = {}
+
+    def _number(name: str, maximum: float) -> float:
+        item = value.get(name)
+        return min(max(0.0, float(item)), maximum) if _finite_number(item) else 0.0
+
+    turns = value.get("turns_today")
+    if isinstance(turns, bool) or not isinstance(turns, int):
+        turns = 0
+    return {
+        "enabled": value.get("enabled") is True,
+        "turns_today": min(max(0, turns), 1_000_000),
+        "avg_ms_today": _number("avg_ms_today", 86_400_000.0),
+        "cache_hit_ratio_today": _number("cache_hit_ratio_today", 1.0),
+        "cost_usd_today": _number("cost_usd_today", 1_000_000.0),
+    }
+
+
 class StateServer:
     def __init__(
         self,
@@ -384,6 +404,7 @@ class StateServer:
         payload = {
             "claude": value.get("claude") is True,
             "mcp": _safe_mcp(value.get("mcp", [])),
+            "traces": _safe_traces(value.get("traces")),
         }
         return web.json_response(payload, headers={"cache-control": "no-store"})
 
