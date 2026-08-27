@@ -59,3 +59,4 @@ jarvis-mlx terminal-only + no license) except: cosmos.gl is MIT (not CC-BY-NC); 
 
 Added recommendations: #13 Atlas trace store (S), #14 kb kill-switch tile (S), #15 routing score (S-M), #16 evals split (M),
 #17 Kokoro (S), #18 local routing (M-L, rule-2 gate).
+Rev 2.1: eadmin2 HUD = 14 holo keyframes (not ~20) and pulls Google Fonts (Atlas CSP blocks remote fonts - vendor or drop); Holo <-> justinbuilds.mov attribution is inferred, not confirmed; Pulse also sells a one-time 'Build My Pulse' engagement ($1,500-7,500) alongside the monthly tiers.
