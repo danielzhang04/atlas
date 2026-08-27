@@ -20,6 +20,8 @@ logger = logging.getLogger("atlas.brain")
 
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
+CACHE_FLOOR_TOKENS = 4_096
+CACHE_FLOOR_MAX_CHECKS = 3
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
 
@@ -229,12 +231,131 @@ class Brain:
             rules += "\n\nVoice and personality:\n" + persona.strip()
         self._system_text = rules
         self._history: list[dict[str, str]] = []
+        self.cache_floor_ok: bool | None = None
+        self.last_usage: dict[str, int] | None = None
+        self._first_turn_seen = False
+        self._tools_settled = False
+        self._snapshot_generation = 0
+        self._cache_floor_generations: set[int] = set()
+        self._cache_floor_checks_started = 0
+        self._cache_floor_tasks: set[asyncio.Task[None]] = set()
+        self._tool_names: tuple[str, ...] = ()
+        self._tools: list[dict[str, Any]] = []
+        self._cached_system: dict[str, Any] = {}
+        self._replace_tool_snapshot(self.registry.schemas())
+
+    @staticmethod
+    def _schema_names(schemas: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(sorted({
+            name
+            for schema in schemas
+            if isinstance((name := schema.get("name")), str)
+        }))
+
+    def _replace_tool_snapshot(self, schemas: list[dict[str, Any]]) -> None:
+        tools = [dict(schema) for schema in schemas]
+        if tools:
+            tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        self._tool_names = self._schema_names(schemas)
+        self._tools = tools
+        self._cached_system = {
+            "type": "text",
+            "text": self._system_text + "\n\n" + _capability_system_text(tools),
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+
+    def refresh_tools(self) -> bool:
+        """Rebuild the prompt snapshot only for a changed registered tool name set."""
+        schemas = self.registry.schemas()
+        if self._schema_names(schemas) == self._tool_names:
+            return False
+        self._replace_tool_snapshot(schemas)
+        self._snapshot_generation += 1
+        self.cache_floor_ok = None
+        logger.info("brain prompt snapshot rebuilt (tools=%d)", len(self._tool_names))
+        self._arm_cache_floor_check()
+        return True
+
+    def mark_tools_settled(self) -> None:
+        """Allow cache-floor checks after initial MCP discovery has settled."""
+        if self._tools_settled:
+            return
+        self._tools_settled = True
+        self._arm_cache_floor_check()
 
     def _request_tools(self) -> list[dict[str, Any]]:
-        tools = [dict(schema) for schema in self.registry.schemas()]
-        if tools:
-            tools[-1]["cache_control"] = {"type": "ephemeral"}
-        return tools
+        return [dict(tool) for tool in self._tools]
+
+    async def _check_cache_floor(
+        self,
+        generation: int,
+        tools: list[dict[str, Any]],
+        cached_system: dict[str, Any],
+    ) -> None:
+        try:
+            result = await self.client.messages.count_tokens(
+                model=self.model,
+                system=[cached_system],
+                tools=tools,
+                messages=[],
+            )
+            tokens = _field(result, "input_tokens")
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                raise ValueError("invalid token count")
+            if generation != self._snapshot_generation:
+                return
+            self.cache_floor_ok = tokens >= CACHE_FLOOR_TOKENS
+            if not self.cache_floor_ok:
+                logger.warning("prompt cache floor unmet: %d tokens", tokens)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if generation == self._snapshot_generation:
+                logger.warning("prompt cache floor check failed: %s", type(exc).__name__)
+
+    def _arm_cache_floor_check(self) -> bool:
+        generation = self._snapshot_generation
+        if (
+            not self._first_turn_seen
+            or not self._tools_settled
+            or generation in self._cache_floor_generations
+            or self._cache_floor_checks_started >= CACHE_FLOOR_MAX_CHECKS
+        ):
+            return False
+        self._cache_floor_generations.add(generation)
+        self._cache_floor_checks_started += 1
+        task = asyncio.create_task(self._check_cache_floor(
+            generation,
+            self._request_tools(),
+            dict(self._cached_system),
+        ))
+        self._cache_floor_tasks.add(task)
+        task.add_done_callback(self._cache_floor_tasks.discard)
+        return True
+
+    def _record_usage(self, message: Any) -> None:
+        usage = _field(message, "usage")
+        if usage is None:
+            return
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+        recorded = {}
+        for name in fields:
+            value = _field(usage, name)
+            recorded[name] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        self.last_usage = recorded
+        logger.info(
+            "conversation model usage input_tokens=%d output_tokens=%d "
+            "cache_read_input_tokens=%d cache_creation_input_tokens=%d",
+            recorded["input_tokens"],
+            recorded["output_tokens"],
+            recorded["cache_read_input_tokens"],
+            recorded["cache_creation_input_tokens"],
+        )
 
     def _remember(self, transcript: str, spoken: str) -> None:
         self._history.extend((
@@ -250,6 +371,9 @@ class Brain:
     async def respond(self, transcript: str, *, context: str | None = None) -> AsyncIterator[str]:
         if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > MAX_TRANSCRIPT:
             raise ValueError("transcript must contain 1 to 4096 characters")
+        if not self._first_turn_seen:
+            self._first_turn_seen = True
+            self._arm_cache_floor_check()
         prompt = transcript
         pending = self.registry.pending
         confirmation_intent = _confirmation_intent(prompt, pending) if pending is not None else None
@@ -259,12 +383,8 @@ class Brain:
             turn_content = f"{context}\n\nCurrent addressed utterance:\n{prompt}"
         messages.append({"role": "user", "content": turn_content})
         tools = self._request_tools()
-        system_text = self._system_text + "\n\n" + _capability_system_text(tools)
-        system = [{
-            "type": "text",
-            "text": system_text,
-            "cache_control": {"type": "ephemeral"},
-        }, {
+        cached_system = dict(self._cached_system)
+        system = [cached_system, {
             "type": "text",
             "text": self._now_system_text(),
         }]
@@ -347,7 +467,8 @@ class Brain:
                                     else:
                                         spoken.append(chunk)
                                         yield chunk
-                            await stream.get_final_message()
+                            final = await stream.get_final_message()
+                            self._record_usage(final)
                     if buffer:
                         if guard.delayed(buffer):
                             guarded_chunks.append(buffer)
@@ -382,6 +503,7 @@ class Brain:
                                         spoken.append(chunk)
                                         yield chunk
                             final = await stream.get_final_message()
+                            self._record_usage(final)
 
                     if getattr(final, "stop_reason", None) != "tool_use":
                         break

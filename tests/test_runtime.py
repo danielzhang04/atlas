@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
-from worker import runtime
+from worker import app, runtime
 from worker.brain import Brain
 from worker.jobstore import JobStore
 from worker.mcp_client import McpServers
@@ -87,6 +89,70 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
             "name": "demo", "connected": False, "tools": 0, "error": None,
         }]
         assert factory_calls == []
+    finally:
+        built.store.close()
+
+
+def test_real_settle_path_preserves_google_hook_for_count_mail(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    monkeypatch.setattr(runtime, "ATLAS", root)
+    monkeypatch.setattr(
+        runtime,
+        "load_mcp_config",
+        lambda _path: {
+            "servers": {
+                "google": {
+                    "command": "unused",
+                    "instant": ["search_gmail_messages"],
+                },
+            },
+            "defaults": {"connect_timeout_s": 1},
+        },
+    )
+
+    class GoogleSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(
+                name="search_gmail_messages",
+                description="Search Gmail messages.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            )])
+
+        async def call_tool(self, _tool, *, arguments, read_timeout_seconds):
+            del read_timeout_seconds
+            count = 61 if arguments["query"] == "in:inbox" else 14
+            return SimpleNamespace(
+                content=[SimpleNamespace(
+                    type="text",
+                    text=f"Found {count} messages matching query",
+                )],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def session_factory(_name, _spec):
+        yield GoogleSession()
+
+    built = runtime.build({
+        "fast_model": "claude-test",
+        "google_account": "owner@example.test",
+        "job_store_path": ":memory:",
+        "work_workspace_path": str(tmp_path / "jobs"),
+    }, client=FakeClient(), launcher=FakeLauncher(), session_factory=session_factory)
+
+    async def scenario():
+        try:
+            await app._connect_mcp_and_settle(built.mcp, built.registry, built.brain)
+            return await built.registry.call("count_mail", {"query": "in:inbox"})
+        finally:
+            await built.mcp.close()
+
+    try:
+        result = asyncio.run(scenario())
+        assert result.content == "61 in your inbox, 14 in Primary"
     finally:
         built.store.close()
 

@@ -25,6 +25,19 @@ class FakeBrain:
             yield chunk
 
 
+class FakeSnapshotBrain:
+    def __init__(self) -> None:
+        self.refreshes = 0
+        self.settles = 0
+
+    def refresh_tools(self) -> bool:
+        self.refreshes += 1
+        return True
+
+    def mark_tools_settled(self) -> None:
+        self.settles += 1
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.spoken = []
@@ -93,6 +106,47 @@ def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
         ("user", "tell me something"),
         ("atlas", "First sentence. Second sentence."),
     ]
+
+
+def test_mcp_prompt_snapshot_settles_once_after_two_staggered_servers():
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    class FakeMcp:
+        async def connect(self, registry, *, on_server):
+            registry.append("one")
+            on_server("one", registry)
+            await fake_sleep(1)
+            registry.append("two")
+            on_server("two", registry)
+
+    brain = FakeSnapshotBrain()
+    asyncio.run(app._connect_mcp_and_settle(FakeMcp(), [], brain))
+
+    assert brain.refreshes == 1
+    assert brain.settles == 1
+    assert delays == [1]
+
+
+def test_mcp_prompt_snapshot_refreshes_after_settle_callbacks():
+    class FakeMcp:
+        def __init__(self) -> None:
+            self.on_server = None
+
+        async def connect(self, registry, *, on_server):
+            self.on_server = on_server
+
+    mcp = FakeMcp()
+    brain = FakeSnapshotBrain()
+    asyncio.run(app._connect_mcp_and_settle(mcp, [], brain))
+    assert brain.refreshes == 1
+    assert brain.settles == 1
+
+    mcp.on_server("reconnected", [])
+    assert brain.refreshes == 2
 
 
 def test_submit_voice_turn_does_not_restore_listening_after_dismissal():

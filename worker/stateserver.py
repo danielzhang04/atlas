@@ -383,6 +383,11 @@ class StateServer:
             value = {}
         payload = {
             "claude": value.get("claude") is True,
+            "cache_floor_ok": (
+                value.get("cache_floor_ok")
+                if isinstance(value.get("cache_floor_ok"), bool)
+                else None
+            ),
             "mcp": _safe_mcp(value.get("mcp", [])),
         }
         return web.json_response(payload, headers={"cache-control": "no-store"})

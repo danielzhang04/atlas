@@ -270,6 +270,7 @@ class McpServers:
         self._server_pids: dict[str, int] = {}
         self._server_tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_events: dict[str, asyncio.Event] = {}
+        self._server_tools: dict[str, dict[str, Tool]] = {}
         self._closed = False
         servers = config.get("servers", {})
         self._status = {
@@ -311,7 +312,7 @@ class McpServers:
         servers = self._config.get("servers", {})
         defaults = self._config.get("defaults", {})
         timeout_s = float(defaults.get("connect_timeout_s", 20))
-        server_hook = on_server or self._on_server
+        server_hook = self._compose_server_hooks(on_server)
         ready_events = []
         for name, server_cfg in servers.items():
             if isinstance(server_cfg, Mapping) and server_cfg.get("enabled", True) is not True:
@@ -370,19 +371,12 @@ class McpServers:
                     for tool in listed.tools
                     if tool.name not in blocked
                 ]
-                for tool in mirrored:
-                    registry.register(tool)
             self._call_settings[name] = (
                 server_cfg,
                 float(defaults.get("call_timeout_s", 8)),
             )
             self._status[name].update(connected=True, tools=len(mirrored), error=None)
-            if on_server is not None:
-                try:
-                    on_server(name, registry)
-                except Exception as exc:
-                    _LOGGER.warning("MCP server %s hook failed: %s",
-                                    name, type(exc).__name__)
+            self._replace_server_tools(name, registry, mirrored, on_server)
             ready.set()
             await stop.wait()
         except asyncio.CancelledError:
@@ -393,16 +387,75 @@ class McpServers:
             _LOGGER.warning("MCP server %s connection failed: %s", name, error)
         finally:
             ready.set()
+            self._call_settings.pop(name, None)
+            self._status[name].update(connected=False, tools=0)
+            self._replace_server_tools(name, registry, [], on_server)
             async with self._session_lock:
                 if self._sessions.get(name) is session:
                     self._sessions.pop(name, None)
                 notified = self._session_notifications.get(name)
                 if notified is not None and notified[0] is session:
                     self._session_notifications.pop(name, None)
-            self._call_settings.pop(name, None)
             self._kill_server_tree(name)
             with suppress(Exception):
                 await stack.aclose()
+
+    def _compose_server_hooks(self, extra: ServerHook | None) -> ServerHook | None:
+        hooks = []
+        if self._on_server is not None:
+            hooks.append(self._on_server)
+        if extra is not None and extra is not self._on_server:
+            hooks.append(extra)
+        if not hooks:
+            return None
+
+        def composed(name: str, registry: ToolRegistry) -> None:
+            for hook in hooks:
+                try:
+                    hook(name, registry)
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "MCP server %s hook failed: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+
+        return composed
+
+    def _replace_server_tools(
+        self,
+        name: str,
+        registry: ToolRegistry,
+        tools: list[Tool],
+        on_server: ServerHook | None,
+    ) -> None:
+        replacement = {tool.name: tool for tool in tools}
+        if len(replacement) != len(tools):
+            raise ValueError(f"duplicate MCP tool from server: {name}")
+        previous = self._server_tools.get(name, {})
+        previous_names = frozenset(previous)
+        replacement_names = frozenset(replacement)
+
+        for tool_name in previous:
+            registry.unregister(tool_name)
+        registered = []
+        try:
+            for tool in replacement.values():
+                registry.register(tool)
+                registered.append(tool.name)
+        except Exception:
+            for tool_name in registered:
+                registry.unregister(tool_name)
+            for tool in previous.values():
+                registry.register(tool)
+            raise
+
+        if replacement:
+            self._server_tools[name] = replacement
+        else:
+            self._server_tools.pop(name, None)
+        if replacement_names != previous_names and on_server is not None:
+            on_server(name, registry)
 
     def _resolve_spec(self, server_cfg: Mapping) -> StdioServerParameters:
         _, StdioServerParameters, _ = _load_mcp_transport()

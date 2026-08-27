@@ -83,9 +83,17 @@ class FakeRegistry:
 
 
 class FakeStream:
-    def __init__(self, deltas=(), *, content=(), stop_reason="end_turn", delay=0.0) -> None:
+    def __init__(
+        self,
+        deltas=(),
+        *,
+        content=(),
+        stop_reason="end_turn",
+        delay=0.0,
+        usage=None,
+    ) -> None:
         self.deltas = list(deltas)
-        self.final = SimpleNamespace(content=list(content), stop_reason=stop_reason)
+        self.final = SimpleNamespace(content=list(content), stop_reason=stop_reason, usage=usage)
         self.delay = delay
 
     async def __aenter__(self):
@@ -120,9 +128,11 @@ class ErrorStream:
 
 
 class FakeMessages:
-    def __init__(self, responses) -> None:
+    def __init__(self, responses, token_counts=(4_096,)) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self.token_counts = list(token_counts)
+        self.count_calls: list[dict[str, Any]] = []
 
     def stream(self, **kwargs):
         self.calls.append(kwargs)
@@ -131,10 +141,17 @@ class FakeMessages:
         response = self.responses.pop(0)
         return ErrorStream(response) if isinstance(response, Exception) else response
 
+    async def count_tokens(self, **kwargs):
+        self.count_calls.append(kwargs)
+        result = self.token_counts.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return SimpleNamespace(input_tokens=result)
+
 
 class FakeClient:
-    def __init__(self, *responses) -> None:
-        self.messages = FakeMessages(responses)
+    def __init__(self, *responses, token_counts=(4_096,)) -> None:
+        self.messages = FakeMessages(responses, token_counts)
 
 
 class DelayedFinalStream(FakeStream):
@@ -200,8 +217,14 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     clock = lambda: datetime(2026, 8, 22, 9, 41, 29, tzinfo=local_timezone)
     now = clock().astimezone()
     brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock)
+    brain.mark_tools_settled()
 
-    chunks = asyncio.run(collect(brain, "Hello"))
+    async def scenario():
+        chunks = await collect(brain, "Hello")
+        await asyncio.sleep(0)
+        return chunks
+
+    chunks = asyncio.run(scenario())
 
     assert chunks == ["First sentence. ", "Second sentence! ", "Tail"]
     assert brain._history == [
@@ -210,7 +233,7 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     ]
     call = client.messages.calls[0]
     assert call["system"][0]["type"] == "text"
-    assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert call["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert call["system"][0]["text"].startswith(
         BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed."
     )
@@ -221,9 +244,211 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
     }
     assert "cache_control" not in call["system"][1]
-    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "cache_control" not in call["tools"][0]
     assert call["tool_choice"] == {"type": "auto"}
+    assert client.messages.count_calls == [{
+        "model": "fast",
+        "system": [call["system"][0]],
+        "tools": call["tools"],
+        "messages": [],
+    }]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected", "warning"),
+    [
+        (4_095, False, "prompt cache floor unmet: 4095 tokens"),
+        (4_096, True, None),
+    ],
+)
+def test_first_turn_checks_cache_floor_once_without_blocking(tokens, expected, warning, caplog):
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        token_counts=(tokens,),
+    )
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain.mark_tools_settled()
+
+    async def scenario():
+        first = await collect(brain, "First turn")
+        second = await collect(brain, "Second turn")
+        await asyncio.sleep(0)
+        return first, second
+
+    assert asyncio.run(scenario()) == (["First."], ["Second."])
+    assert brain.cache_floor_ok is expected
+    assert len(client.messages.count_calls) == 1
+    if warning is None:
+        assert "prompt cache floor unmet" not in caplog.text
+    else:
+        assert caplog.text.count(warning) == 1
+
+
+def test_cache_floor_failure_is_logged_once_and_remains_unknown(caplog):
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        token_counts=(RuntimeError("must-not-escape"),),
+    )
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain.mark_tools_settled()
+
+    async def scenario():
+        await collect(brain, "First turn")
+        await collect(brain, "Second turn")
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert brain.cache_floor_ok is None
+    assert len(client.messages.count_calls) == 1
+    assert caplog.text.count("prompt cache floor check failed: RuntimeError") == 1
+    assert "must-not-escape" not in caplog.text
+
+
+def test_cache_floor_waits_for_first_turn_and_settle_then_rearms_per_snapshot():
+    registry = FakeRegistry()
+    client = FakeClient(
+        FakeStream(["Before settle."], content=[text_block("Before settle.")]),
+        token_counts=(4_096, 4_095, 4_096),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        await collect(brain, "Early turn")
+        await asyncio.sleep(0)
+        assert client.messages.count_calls == []
+
+        brain.mark_tools_settled()
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 1
+
+        original = registry.schemas()
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "second_generation",
+                "description": "Second generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        assert brain.refresh_tools() is False
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 2
+
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "third_generation",
+                "description": "Third generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 3
+
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "fourth_generation",
+                "description": "Fourth generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(client.messages.count_calls) == 3
+    assert brain.cache_floor_ok is None
+
+
+def test_cache_floor_count_never_blocks_the_first_stream_chunk():
+    release = asyncio.Event()
+    started = asyncio.Event()
+    client = FakeClient(FakeStream(
+        ["Immediate response."],
+        content=[text_block("Immediate response.")],
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    original_count_tokens = client.messages.count_tokens
+
+    async def gated_count_tokens(**kwargs):
+        started.set()
+        await release.wait()
+        return await original_count_tokens(**kwargs)
+
+    client.messages.count_tokens = gated_count_tokens
+    brain.mark_tools_settled()
+
+    async def scenario():
+        response = brain.respond("Hello")
+        first = await asyncio.wait_for(anext(response), timeout=0.1)
+        assert first == "Immediate response."
+        assert release.is_set() is False
+        await asyncio.sleep(0)
+        assert started.is_set() is True
+        assert release.is_set() is False
+        release.set()
+        await asyncio.sleep(0)
+        await response.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_snapshot_rebuilds_only_when_registered_tool_name_set_changes(caplog):
+    caplog.set_level("INFO", logger="atlas.brain")
+    registry = FakeRegistry()
+    client = FakeClient(FakeStream(["Done."], content=[text_block("Done.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+    original_tools = brain._request_tools()
+
+    assert brain.refresh_tools() is False
+    registry.schemas = lambda: [
+        {**schema, "description": "Reconnected description."}
+        for schema in original_tools
+    ]
+    assert brain.refresh_tools() is False
+    assert brain._request_tools() == original_tools
+
+    registry.schemas = lambda: [
+        *original_tools,
+        {
+            "name": "new_tool",
+            "description": "New capability.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ]
+    assert brain.refresh_tools() is True
+    assert [tool["name"] for tool in brain._request_tools()] == ["lookup", "mutate", "new_tool"]
+    assert caplog.text.count("brain prompt snapshot rebuilt") == 1
+
+
+def test_usage_records_cache_read_and_creation_tokens(caplog):
+    caplog.set_level("INFO", logger="atlas.brain")
+    usage = SimpleNamespace(
+        input_tokens=5_100,
+        output_tokens=23,
+        cache_read_input_tokens=4_000,
+        cache_creation_input_tokens=1_100,
+    )
+    client = FakeClient(FakeStream(["Okay."], content=[text_block("Okay.")], usage=usage))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Hello")) == ["Okay."]
+    assert brain.last_usage == {
+        "input_tokens": 5_100,
+        "output_tokens": 23,
+        "cache_read_input_tokens": 4_000,
+        "cache_creation_input_tokens": 1_100,
+    }
+    assert "cache_read_input_tokens=4000" in caplog.text
+    assert "cache_creation_input_tokens=1100" in caplog.text
 
 
 @pytest.mark.parametrize("claim", ["I opened Spotify.", "I've opened Spotify."])

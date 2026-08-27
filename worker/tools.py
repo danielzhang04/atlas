@@ -160,6 +160,14 @@ class ToolRegistry:
             raise ValueError("tool input schema must describe an object")
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> bool:
+        tool = self._tools.pop(name, None)
+        if tool is None:
+            return False
+        if self._pending is not None and self._pending.name == name:
+            self._pending = None
+        return True
+
     def names(self) -> list[str]:
         return list(self._tools)
 

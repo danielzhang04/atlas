@@ -190,7 +190,7 @@ def test_jobs_events_and_health_are_fixed_public_projections():
             job_event_provider=lambda requested, after: (
                 after_seen.append((requested, after)) or events
             ),
-            health_provider=lambda: {"claude": True, "mcp": mcp},
+            health_provider=lambda: {"claude": True, "mcp": mcp, "cache_floor_ok": False},
         )
         event_headers = {stateserver.HEADER: bearer}
         try:
@@ -227,6 +227,7 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert "must-not-escape" not in health_response[2]
     assert json.loads(health_response[2]) == {
         "claude": True,
+        "cache_floor_ok": False,
         "mcp": [
             {"name": "google", "connected": True, "tools": 11, "error": None},
             {
@@ -238,6 +239,28 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert missing_mcp[0] == 404
     assert invalid[0] == 400
     assert oversized[0] == 400
+
+
+def test_health_projects_unknown_cache_floor_as_null():
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            health_provider=lambda: {"cache_floor_ok": "must-not-escape"},
+        )
+        try:
+            return await _request(server, path="/health")
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert json.loads(response[2]) == {
+        "claude": False,
+        "cache_floor_ok": None,
+        "mcp": [],
+    }
+    assert "must-not-escape" not in response[2]
 
 
 def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypatch):

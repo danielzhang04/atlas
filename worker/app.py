@@ -462,6 +462,20 @@ def _engage_wake(
         session.say(WAKE_LINE, add_to_chat_ctx=False)
 
 
+async def _connect_mcp_and_settle(mcp, registry, brain: brain_mod.Brain) -> None:
+    """Coalesce initial MCP arrivals into one prompt snapshot rebuild."""
+    settled = False
+
+    def _on_server(_name: str, _registry) -> None:
+        if settled:
+            brain.refresh_tools()
+
+    await mcp.connect(registry, on_server=_on_server)
+    settled = True
+    brain.refresh_tools()
+    brain.mark_tools_settled()
+
+
 async def entrypoint(ctx: JobContext) -> None:
     jobobject.assign_current_process()
     wakeword.shutting_down.clear()
@@ -546,7 +560,11 @@ async def entrypoint(ctx: JobContext) -> None:
         job_event_provider=services.store.events,
         result_provider=services.store.result,
         cancel_provider=services.work.cancel,
-        health_provider=lambda: {"claude": services.work.launcher.available, "mcp": services.mcp.status()},
+        health_provider=lambda: {
+            "claude": services.work.launcher.available,
+            "mcp": services.mcp.status(),
+            "cache_floor_ok": services.brain.cache_floor_ok,
+        },
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
     )
@@ -618,7 +636,9 @@ async def entrypoint(ctx: JobContext) -> None:
             lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
         )
 
-        mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
+        mcp_task = asyncio.create_task(
+            _connect_mcp_and_settle(services.mcp, services.registry, services.brain)
+        )
         work_task = asyncio.create_task(services.work.run(stop_work))
         _BG_TASKS.update((mcp_task, work_task))
         mcp_task.add_done_callback(_BG_TASKS.discard)

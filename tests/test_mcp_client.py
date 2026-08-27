@@ -54,6 +54,12 @@ class FakeRegistry:
     def register(self, tool) -> None:
         self.tools.append(tool)
 
+    def unregister(self, name: str) -> bool:
+        remaining = [tool for tool in self.tools if tool.name != name]
+        removed = len(remaining) != len(self.tools)
+        self.tools = remaining
+        return removed
+
 
 def test_import_does_not_load_external_mcp_package():
     root = Path(__file__).resolve().parents[1]
@@ -570,19 +576,20 @@ def test_connect_runs_the_server_hook_after_successful_tool_registration():
                 (name, [tool.name for tool in current.tools]),
             ),
         )
+        connected = list(observations)
         await servers.close()
-        return observations
+        return connected, observations, [tool.name for tool in registry.tools]
 
-    observations = asyncio.run(scenario())
+    connected, observations, remaining = asyncio.run(scenario())
 
-    assert observations == [(
+    assert connected == [(
         "google",
         [
             "google__get_events",
             "google__search_drive_files",
             "google__send_gmail_message",
         ],
-    )] or observations == [(
+    )] or connected == [(
         "google",
         [
             "google__get_events",
@@ -590,6 +597,8 @@ def test_connect_runs_the_server_hook_after_successful_tool_registration():
             "google__search_drive_files",
         ],
     )]
+    assert observations[-1] == ("google", [])
+    assert remaining == []
 
 
 def test_constructor_hook_is_used_when_connect_has_no_override():
@@ -605,10 +614,70 @@ def test_constructor_hook_is_used_when_connect_has_no_override():
             on_server=lambda name, _registry: called.append(name),
         )
         await servers.connect(registry)
+        connected = list(called)
         await servers.close()
-        return called
+        return connected, called
 
-    assert asyncio.run(scenario()) == ["google"]
+    connected, called = asyncio.run(scenario())
+    assert connected == ["google"]
+    assert called == ["google", "google"]
+
+
+def test_constructor_hook_runs_before_connect_hook():
+    async def scenario():
+        registry = FakeRegistry()
+        called = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_server()),
+            on_server=lambda _name, _registry: called.append("configured"),
+        )
+        await servers.connect(
+            registry,
+            on_server=lambda _name, _registry: called.append("settle"),
+        )
+        connected = list(called)
+        await servers.close()
+        return connected
+
+    assert asyncio.run(scenario()) == ["configured", "settle"]
+
+
+def test_reconnect_replaces_server_tools_and_fires_one_rebuild():
+    registry = ToolRegistry()
+    servers = McpServers({"servers": {}})
+    session = SimpleNamespace()
+
+    def mirrored(remote_name):
+        return servers._mirror_tool(
+            "demo",
+            {"instant": [remote_name]},
+            {},
+            session,
+            SimpleNamespace(
+                name=remote_name,
+                description=remote_name,
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        )
+
+    rebuilds = []
+    hook = lambda name, current: rebuilds.append((name, tuple(current.names())))
+    servers._replace_server_tools(
+        "demo",
+        registry,
+        [mirrored("kept"), mirrored("removed")],
+        hook,
+    )
+    rebuilds.clear()
+
+    servers._replace_server_tools("demo", registry, [mirrored("kept")], hook)
+
+    assert registry.names() == ["demo__kept"]
+    assert rebuilds == [("demo", ("demo__kept",))]
 
 
 def test_default_prefix_policy_applies_only_without_explicit_instant_list():
