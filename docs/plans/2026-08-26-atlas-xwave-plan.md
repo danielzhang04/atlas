@@ -30,7 +30,7 @@ live probes -> deploy.
       confirm. CLAUDE.md rule 6 amended, rule 13 added. Review REWORK -> fixed.
 - [x] X4 GitHub: private repo danielzhang04/atlas, secrets audit, main protected (PR required).
 - [x] X5 condense: ClaimGuard -> worker/claims.py, shared desktop schema/validation, ctypes dedup (-150 net).
-- [ ] Deploy + live probes + handoff (handoffs/2026-08-26-atlas-xwave.md).
+- [x] Deploy + live probes + handoff (handoffs/2026-08-27-atlas-xwave.md); X6 hotfix for the MCP env regression.
 - [ ] After the dashboard-v3 workover lands: rebase claude/atlas-bridge, re-run negotiation against v1,
       point kb_bridge.path back at C:/Users/danie/kb/dashboard/atlas-bridge, exercise the unlock flow on a
       win32-desktop daemon.
