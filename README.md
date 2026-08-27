@@ -14,6 +14,9 @@ py -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
+Atlas worktrees share the canonical checkout's virtual environment at
+`C:\Users\danie\Atlas\.venv`; hook configuration uses that absolute interpreter path.
+
 Put voice-provider values in `%USERPROFILE%\.atlas\env`. MCP server commands, arguments, and child
 environment values remain in the user's existing `~/.claude.json`; neither file belongs in this
 repository.
