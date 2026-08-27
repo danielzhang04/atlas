@@ -184,8 +184,10 @@ class StatePublisher:
         self.set_audio_energy(energy)
         self.set_audio_bands(bands)
 
-    def add_line(self, role: str, text: str) -> None:
+    def add_line(self, role: str, text: str, *, source: str | None = None) -> None:
         line = {"t": self._clock().isoformat(), "role": role, "text": text}
+        if source is not None:
+            line["source"] = source
         self._ring.append(line)
         self._emit(("line", line))
 

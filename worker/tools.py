@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -25,12 +26,14 @@ __all__ = [
     "McpToolError",
     "PendingAction",
     "Policy",
+    "QuickAction",
     "Tool",
     "ToolRegistry",
     "ToolResult",
     "WorkLike",
     "builtin",
     "load_apps",
+    "load_quick_actions",
     "register_count_mail",
 ]
 
@@ -64,6 +67,8 @@ _NEXT_PAGE_TOKEN = re.compile(
     r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+logger = logging.getLogger("atlas.tools")
 
 
 class McpToolError(RuntimeError):
@@ -112,6 +117,13 @@ class AppEntry:
     words: tuple[str, ...]
     url: str | None = None
     exe: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QuickAction:
+    label: str
+    tool: str
+    args: dict[str, Any]
 
 
 class _JobLike(Protocol):
@@ -360,6 +372,127 @@ def load_apps(path: Path) -> dict[str, AppEntry]:
             raise ValueError(f"invalid app profile: {name}")
         apps[name] = AppEntry(words=tuple(words), url=url, exe=exe)
     return apps
+
+
+def _schema_accepts(schema: Any, value: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    one_of = schema.get("oneOf")
+    if one_of is not None:
+        if (
+            not isinstance(one_of, list)
+            or sum(_schema_accepts(candidate, value) for candidate in one_of) != 1
+        ):
+            return False
+    any_of = schema.get("anyOf")
+    if any_of is not None:
+        if (
+            not isinstance(any_of, list)
+            or not any(_schema_accepts(candidate, value) for candidate in any_of)
+        ):
+            return False
+    allowed = schema.get("enum")
+    if isinstance(allowed, list) and value not in allowed:
+        return False
+    value_type = schema.get("type")
+    if value_type is None:
+        required = schema.get("required")
+        if required is not None:
+            if (
+                not isinstance(value, dict)
+                or not isinstance(required, list)
+                or not all(isinstance(key, str) and key in value for key in required)
+            ):
+                return False
+        return True
+    if value_type == "object":
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            return False
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return False
+        if not all(isinstance(key, str) and key in value for key in required):
+            return False
+        if schema.get("additionalProperties") is False and any(
+            key not in properties for key in value
+        ):
+            return False
+        return all(
+            key not in properties or _schema_accepts(properties[key], item)
+            for key, item in value.items()
+        )
+    if value_type == "string":
+        if not isinstance(value, str):
+            return False
+        minimum = schema.get("minLength")
+        maximum = schema.get("maxLength")
+        return (
+            (not isinstance(minimum, int) or len(value) >= minimum)
+            and (not isinstance(maximum, int) or len(value) <= maximum)
+        )
+    if value_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    elif value_type == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+    elif value_type == "boolean":
+        return isinstance(value, bool)
+    elif value_type == "array":
+        if not isinstance(value, list):
+            return False
+        items = schema.get("items")
+        return items is None or all(_schema_accepts(items, item) for item in value)
+    elif value_type not in {"integer", "number"}:
+        return False
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    return (
+        (not isinstance(minimum, (int, float)) or value >= minimum)
+        and (not isinstance(maximum, (int, float)) or value <= maximum)
+    )
+
+
+def load_quick_actions(path: Path, registry: ToolRegistry) -> list[QuickAction]:
+    """Load up to fourteen static, registry-validated host actions."""
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        message = f"Dropped quick actions config: {type(exc).__name__}"
+        logger.warning("%s", message[:300])
+        return []
+    if not isinstance(loaded, list):
+        logger.warning("Dropped quick actions config: expected an ordered list")
+        return []
+
+    actions: list[QuickAction] = []
+    dropped = max(0, len(loaded) - 14)
+    registered = getattr(registry, "_tools", {})
+    if not isinstance(registered, dict):
+        registered = {}
+    for raw in loaded[:14]:
+        if not isinstance(raw, dict) or set(raw) != {"label", "tool", "args"}:
+            dropped += 1
+            continue
+        label, name, arguments = raw["label"], raw["tool"], raw["args"]
+        tool = registered.get(name) if isinstance(name, str) else None
+        if (
+            not isinstance(label, str)
+            or not 0 < len(label.strip()) <= 14
+            or tool is None
+            or name in _HOST_ONLY_TOOLS
+            or not isinstance(arguments, dict)
+            or not _schema_accepts(tool.input_schema, arguments)
+        ):
+            dropped += 1
+            continue
+        actions.append(QuickAction(label.strip(), name, deepcopy(arguments)))
+    if dropped:
+        noun = "action" if dropped == 1 else "actions"
+        message = f"Dropped {dropped} invalid quick {noun} from {path.name}"
+        logger.warning("%s", message[:300])
+    return actions
 
 
 def _desktopcontrol() -> Any:

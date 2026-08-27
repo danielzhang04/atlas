@@ -41,9 +41,20 @@ button {
 }
 
 button:focus-visible,
-a:focus-visible {
+a:focus-visible,
+input:focus-visible {
   outline: 2px solid var(--accent-light);
   outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .skip-link {
@@ -283,6 +294,7 @@ main {
 }
 
 .engine-stage {
+  position: relative;
   min-width: 0;
   min-height: 0;
 }
@@ -291,6 +303,104 @@ main {
   display: block;
   width: 100%;
   height: 100%;
+  cursor: default;
+}
+
+.quick-actions {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.quick-action {
+  position: absolute;
+  z-index: 2;
+  max-width: 5.2rem;
+  padding: .18rem .3rem;
+  border: 1px solid rgb(124 92 255 / 24%);
+  border-radius: 3px;
+  overflow: hidden;
+  color: #b9c9de;
+  background: rgb(7 10 16 / 78%);
+  font: 600 .49rem/1.1 ui-monospace, "Cascadia Mono", monospace;
+  letter-spacing: .025em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.quick-action:hover,
+.quick-action:focus-visible,
+.quick-action.is-flashing {
+  border-color: rgb(66 226 255 / 74%);
+  color: #e5fbff;
+  background: rgb(28 48 68 / 88%);
+}
+
+.quick-action:disabled {
+  cursor: wait;
+}
+
+.text-turn-form {
+  position: absolute;
+  bottom: .15rem;
+  left: 50%;
+  z-index: 3;
+  width: min(17rem, 58%);
+  transform: translateX(-50%);
+}
+
+.text-turn-form input {
+  width: 100%;
+  padding: .34rem .55rem;
+  border: 1px solid transparent;
+  border-bottom-color: rgb(168 153 255 / 25%);
+  border-radius: 3px;
+  color: var(--text);
+  background: rgb(7 10 16 / 24%);
+  font: .62rem ui-monospace, "Cascadia Mono", monospace;
+  text-align: center;
+}
+
+.text-turn-form input::placeholder {
+  color: var(--faint);
+}
+
+.text-turn-form input:focus {
+  border-bottom-color: rgb(66 226 255 / 62%);
+  background: rgb(7 10 16 / 68%);
+}
+
+.pending-confirmation {
+  position: absolute;
+  top: .7rem;
+  right: .7rem;
+  z-index: 4;
+  width: min(16rem, 42%);
+  padding: .55rem .65rem;
+  border: 1px solid rgb(255 165 55 / 48%);
+  border-radius: 5px;
+  color: #d8d3c9;
+  background: rgb(20 23 33 / 94%);
+}
+
+.pending-confirmation[hidden] {
+  display: none;
+}
+
+.pending-confirmation span {
+  color: #ffcf83;
+  font: 650 .52rem ui-monospace, "Cascadia Mono", monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.pending-confirmation p {
+  margin: .28rem 0 0;
+  font-size: .62rem;
+  line-height: 1.35;
 }
 
 .engine-status {
@@ -372,6 +482,7 @@ main {
 }
 
 .panel {
+  position: relative;
   display: grid;
   min-width: 0;
   min-height: 0;
@@ -748,6 +859,7 @@ main {
 }
 
 .setting-card {
+  position: relative;
   min-height: 8rem;
   padding: .85rem;
 }
@@ -931,6 +1043,103 @@ main {
 @media (max-height: 560px) and (min-width: 761px) {
   .view-live {
     grid-template-rows: minmax(160px, .8fr) minmax(180px, 1.2fr);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes holoApproach {
+    from {
+      opacity: 0;
+      clip-path: inset(8% 2% 8% 2%);
+      transform: translate3d(0, 5px, 0) scale(.995);
+    }
+    to {
+      opacity: 1;
+      clip-path: inset(0);
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+  }
+
+  @keyframes holoIdle {
+    0%, 100% {
+      opacity: .96;
+      transform: translate3d(0, 0, 0);
+    }
+    50% {
+      opacity: 1;
+      transform: translate3d(0, -.5px, 0);
+    }
+  }
+
+  @keyframes holoDismiss {
+    from {
+      opacity: 1;
+      clip-path: inset(0);
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+    to {
+      opacity: 0;
+      clip-path: inset(48% 0 48% 0);
+      transform: translate3d(0, -3px, 0) scale(.99);
+    }
+  }
+
+  @keyframes holoTrace {
+    0% { clip-path: polygon(0 0, 0 0, 0 100%, 0 100%); }
+    45% { clip-path: polygon(0 0, 100% 0, 100% 2px, 0 2px); }
+    55% { clip-path: polygon(0 calc(100% - 2px), 100% calc(100% - 2px), 100% 100%, 0 100%); }
+    100% { clip-path: polygon(100% 0, 100% 0, 100% 100%, 100% 100%); }
+  }
+
+  @keyframes holoScanSweep {
+    from {
+      opacity: .2;
+      clip-path: inset(0 0 94% 0);
+      transform: translate3d(0, -3px, 0);
+    }
+    to {
+      opacity: 1;
+      clip-path: inset(0);
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  .view:not([hidden]) .panel,
+  .view:not([hidden]) .result-panel,
+  .view:not([hidden]) .setting-card {
+    animation: holoApproach 240ms ease-out both, holoScanSweep 310ms ease-out both;
+  }
+
+  .engine-card {
+    animation: holoIdle 6s ease-in-out infinite;
+  }
+
+  .engine-card::after,
+  .panel::after,
+  .result-panel::after,
+  .setting-card::after {
+    position: absolute;
+    inset: 0;
+    border: 1px solid rgb(66 226 255 / 18%);
+    border-radius: inherit;
+    content: "";
+    pointer-events: none;
+    animation: holoTrace 520ms ease-out both;
+  }
+
+  .panel.is-holo-dismissing,
+  .result-panel.is-holo-dismissing,
+  .setting-card.is-holo-dismissing,
+  .pending-confirmation.is-holo-dismissing {
+    animation: holoDismiss 180ms ease-in both;
+  }
+
+  .pending-confirmation:not([hidden]) {
+    animation: holoScanSweep 260ms ease-out both;
+  }
+
+  .quick-action.is-flashing {
+    animation: holoApproach 220ms ease-out both;
   }
 }
 

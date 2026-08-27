@@ -81,12 +81,152 @@ def _dt(second: int) -> datetime:
     return datetime(2026, 8, 22, 12, 0, second, tzinfo=timezone.utc)
 
 
+def _engage_typed(session, publisher, engagement, addressing, calls):
+    calls.append("engage")
+    engagement.wake()
+    addressing.mark_activity()
+    session.input.set_audio_enabled(True)
+    publisher.start_session()
+    publisher.set_state(LISTENING)
+
+
 def test_wake_model_callback_publishes_runtime_model():
     publisher = StatePublisher()
 
     app._wake_model_callback(publisher)("hey_atlas_v2")
 
     assert publisher.snapshot()["wake_model"] == "hey_atlas_v2"
+
+
+def test_typed_turn_wakes_and_is_addressed_without_spoken_vocabulary():
+    brain = FakeBrain(chunks=("Ready.",))
+    session = FakeSession()
+    session.input.set_audio_enabled(False)
+    publisher = StatePublisher()
+    engagement = Engagement(120)
+    addressing = Addressing(30, ())
+    engage_calls = []
+
+    asyncio.run(app._handle_typed_turn(
+        "show my calendar",
+        ready=True,
+        intents={},
+        brain=brain,
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        engage=lambda: _engage_typed(
+            session, publisher, engagement, addressing, engage_calls,
+        ),
+        sleep=lambda announce=True: None,
+    ))
+
+    assert engage_calls == ["engage"]
+    assert brain.calls == ["show my calendar"]
+    user_line = next(
+        line for line in publisher.snapshot()["transcript"] if line["role"] == "user"
+    )
+    assert user_line["source"] == "typed"
+
+
+def test_typed_reflex_uses_the_reflex_path_without_address_vocabulary():
+    session = FakeSession()
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The previous answer.")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_typed_turn(
+        "repeat that",
+        ready=True,
+        intents={"repeat": {"phrases": ["repeat that"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=Addressing(30, ()),
+        engage=lambda: None,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.spoken == ["The previous answer."]
+    assert publisher.snapshot()["transcript"][-1]["source"] == "typed"
+
+
+def test_pending_confirmation_typed_yes_confirms_after_addressed_wake():
+    calls = []
+    registry = ToolRegistry()
+
+    async def execute(arguments):
+        calls.append(arguments)
+        return "done"
+
+    registry.register(Tool(
+        "confirm_action",
+        "Confirm it.",
+        {
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+        execute,
+        policy="confirm",
+    ))
+
+    class ConfirmingBrain(FakeBrain):
+        async def respond(self, text, *, context=None):
+            self.calls.append(text)
+            assert text == "yes"
+            pending = registry.pending
+            assert pending is not None
+            result = await registry.confirm(pending.confirm_id)
+            assert result.status == "ok"
+            yield "Done."
+
+    async def scenario():
+        pending = await registry.call("confirm_action", {"target": "report"})
+        assert pending.status == "needs_confirmation"
+        session = FakeSession()
+        publisher = StatePublisher()
+        engagement = Engagement(120)
+        addressing = Addressing(30, ())
+        await app._handle_typed_turn(
+            "yes",
+            ready=True,
+            intents={},
+            brain=ConfirmingBrain(),
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            engage=lambda: _engage_typed(
+                session, publisher, engagement, addressing, [],
+            ),
+            sleep=lambda announce=True: None,
+        )
+
+    asyncio.run(scenario())
+
+    assert registry.pending is None
+    assert calls == [{"target": "report"}]
+
+
+def test_typed_turn_rejects_before_the_voice_session_is_ready():
+    with pytest.raises(RuntimeError, match="voice session is not ready"):
+        asyncio.run(app._handle_typed_turn(
+            "hello",
+            ready=False,
+            intents={},
+            brain=FakeBrain(),
+            session=FakeSession(),
+            publisher=StatePublisher(),
+            engagement=Engagement(120),
+            addressing=Addressing(30, ()),
+            engage=lambda: None,
+            sleep=lambda announce=True: None,
+        ))
 
 
 def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():

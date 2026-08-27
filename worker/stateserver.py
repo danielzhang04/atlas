@@ -293,6 +293,18 @@ def _safe_apps(value: Any) -> list[dict[str, str]]:
     return apps
 
 
+def _pending_projection(registry: Any) -> dict[str, str] | None:
+    if registry is None:
+        return None
+    pending = registry.pending
+    if pending is None:
+        return None
+    readback = _bounded_string(getattr(pending, "summary", None), 2_048)
+    if readback is None:
+        readback = "Confirmation required."
+    return {"readback": readback}
+
+
 class StateServer:
     def __init__(
         self,
@@ -305,6 +317,10 @@ class StateServer:
         result_provider=None,
         cancel_provider=None,
         health_provider=None,
+        registry=None,
+        quick_actions=(),
+        quick_result_provider=None,
+        text_turn_provider=None,
         shutdown_token: str | None = None,
         shutdown_provider=None,
     ) -> None:
@@ -316,6 +332,10 @@ class StateServer:
         self._result_provider = result_provider
         self._cancel_provider = cancel_provider
         self._health_provider = health_provider
+        self._registry = registry
+        self._quick_actions = tuple(quick_actions)
+        self._quick_result_provider = quick_result_provider
+        self._text_turn_provider = text_turn_provider
         self._shutdown_token = shutdown_token
         self._shutdown_provider = shutdown_provider
         self._shutdown_task: asyncio.Task | None = None
@@ -325,6 +345,9 @@ class StateServer:
     async def _handle_state(self, _request: web.Request) -> web.Response:
         payload = self._publisher.snapshot()
         payload["wake_model"] = _bounded_string(payload.get("wake_model"), WAKE_MODEL_LIMIT)
+        payload["quick_actions"] = [
+            {"label": action.label} for action in self._quick_actions
+        ]
         payload["heartbeat"] = self._clock().isoformat()
         return web.json_response(payload, headers={"cache-control": "no-store"})
 
@@ -430,6 +453,14 @@ class StateServer:
         except PermissionError as exc:
             raise web.HTTPUnauthorized(text=str(exc)) from None
 
+    def _authorize_action(self, request: web.Request) -> None:
+        if self._authorizer is None:
+            raise web.HTTPServiceUnavailable(text="Atlas UI pairing is unavailable")
+        try:
+            self._authorizer.authorize(request.headers.get(HEADER))
+        except PermissionError as exc:
+            raise web.HTTPForbidden(text=str(exc)) from None
+
     def _same_origin(self, request: web.Request) -> bool:
         host = request.host.rsplit(":", 1)[0].strip("[]").lower()
         origin = request.headers.get("Origin")
@@ -520,6 +551,51 @@ class StateServer:
             raise web.HTTPServiceUnavailable(text="job cancellation returned invalid state")
         return web.json_response({"job": job}, headers={"cache-control": "no-store"})
 
+    async def _handle_quick_action(self, request: web.Request) -> web.Response:
+        self._authorize_action(request)
+        payload = await self._read_json(request)
+        index = payload.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(self._quick_actions)
+        ):
+            raise web.HTTPBadRequest(text="invalid quick action index")
+        if self._registry is None:
+            raise web.HTTPServiceUnavailable(text="quick actions unavailable")
+        action = self._quick_actions[index]
+        result = await self._registry.call(action.tool, action.args)
+        if self._quick_result_provider is not None:
+            try:
+                await _provide(self._quick_result_provider, action.tool, result)
+            except Exception as exc:
+                logger.warning("quick action result provider failed: %s", type(exc).__name__)
+        response: dict[str, Any] = {
+            "ok": result.status != "error",
+            "pending": _pending_projection(self._registry),
+        }
+        if result.status != "needs_confirmation":
+            response["message"] = result.content
+        return web.json_response(response, headers={"cache-control": "no-store"})
+
+    async def _handle_text_turn(self, request: web.Request) -> web.Response:
+        self._authorize_action(request)
+        payload = await self._read_json(request)
+        text = _bounded_string(payload.get("text"), 2_048)
+        if text is None:
+            raise web.HTTPBadRequest(text="text must be a non-empty string")
+        if self._text_turn_provider is None:
+            raise web.HTTPServiceUnavailable(text="text turns unavailable")
+        try:
+            await _provide(self._text_turn_provider, text)
+        except Exception as exc:
+            logger.warning("text turn provider failed: %s", type(exc).__name__)
+            raise web.HTTPServiceUnavailable(text="text turn failed") from None
+        return web.json_response(
+            {"ok": True, "pending": _pending_projection(self._registry)},
+            headers={"cache-control": "no-store"},
+        )
+
     async def _handle_shutdown(self, request: web.Request) -> web.Response:
         supplied = request.headers.get(SHUTDOWN_HEADER)
         if (
@@ -604,6 +680,8 @@ class StateServer:
         app.router.add_get("/jobs/{job_id}/events", self._handle_job_events)
         app.router.add_get("/jobs/{job_id}/result", self._handle_job_result)
         app.router.add_post("/jobs/{job_id}/cancel", self._handle_cancel_job)
+        app.router.add_post("/actions/quick", self._handle_quick_action)
+        app.router.add_post("/turn", self._handle_text_turn)
         app.router.add_get("/kb/config", self._handle_kb_config)
         app.router.add_post("/kb/session", self._handle_kb_session)
         app.router.add_post("/shutdown", self._handle_shutdown)
@@ -640,6 +718,10 @@ async def start(
     result_provider=None,
     cancel_provider=None,
     health_provider=None,
+    registry=None,
+    quick_actions=(),
+    quick_result_provider=None,
+    text_turn_provider=None,
     shutdown_token: str | None = None,
     shutdown_provider=None,
 ) -> StateServer:
@@ -652,6 +734,10 @@ async def start(
         result_provider=result_provider,
         cancel_provider=cancel_provider,
         health_provider=health_provider,
+        registry=registry,
+        quick_actions=quick_actions,
+        quick_result_provider=quick_result_provider,
+        text_turn_provider=text_turn_provider,
         shutdown_token=shutdown_token,
         shutdown_provider=shutdown_provider,
     )
