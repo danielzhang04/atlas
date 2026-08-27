@@ -18,6 +18,7 @@ import weakref
 import yaml
 
 from .jobobject import kill_process_tree
+from .statusdetail import render_status_detail, status_detail_allowed
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -47,12 +48,76 @@ SessionFactory = Callable[
     [str, "StdioServerParameters"], AsyncContextManager["ClientSession"]
 ]
 ServerHook = Callable[[str, "ToolRegistry"], None]
+StateHook = Callable[[str, str, list[dict]], None]
 ProcessTreeKiller = Callable[..., subprocess.CompletedProcess]
 _active_servers: weakref.ReferenceType | None = None
 
 
 class McpSessionError(ValueError):
     """A short-lived MCP session was rejected before retention."""
+
+
+def _exception_leaves(exc: BaseException) -> list[BaseException]:
+    children = getattr(exc, "exceptions", None)
+    if not isinstance(children, tuple):
+        return [exc]
+    leaves = []
+    for child in children:
+        if isinstance(child, BaseException):
+            leaves.extend(_exception_leaves(child))
+    return leaves or [exc]
+
+
+def _failure_status(
+    exc: BaseException,
+    *,
+    stage: str,
+    command: Any,
+    timeout_s: float,
+) -> tuple[str, str]:
+    leaves = _exception_leaves(exc)
+    if isinstance(exc, TimeoutError) or any(isinstance(item, TimeoutError) for item in leaves):
+        return "error", render_status_detail("error", "timeout", timeout_s=timeout_s)
+    if stage == "resolving":
+        if any(isinstance(item, ImportError) for item in leaves):
+            return "error", render_status_detail("error", "transport_unavailable")
+        if any(isinstance(item, FileNotFoundError) for item in leaves):
+            return "not_configured", render_status_detail(
+                "not_configured", "config_file_missing",
+            )
+        if any(isinstance(item, json.JSONDecodeError) for item in leaves):
+            return "error", render_status_detail("error", "config_malformed")
+        if any(isinstance(item, OSError) for item in leaves):
+            return "error", render_status_detail("error", "config_unreadable")
+        if any(isinstance(item, KeyError) for item in leaves):
+            return "not_configured", render_status_detail(
+                "not_configured", "config_entry_missing",
+            )
+        return "error", render_status_detail("error", "config_malformed")
+
+    for item in leaves:
+        message = str(item).casefold()
+        if type(item).__name__ == "McpError" and any(
+            marker in message
+            for marker in (
+                "session required", "authentication required", "unauthorized",
+                "login required", "401",
+            )
+        ):
+            return "error", render_status_detail("error", "session_required")
+    for item in leaves:
+        if type(item).__name__ == "McpError" and "connection closed" in str(item).casefold():
+            return "error", render_status_detail("error", "closed_initialize")
+    if stage == "listing":
+        return "error", render_status_detail("error", "listing_failed")
+    if any(isinstance(item, FileNotFoundError) for item in leaves):
+        return "error", render_status_detail(
+            "error", "executable_missing", executable=command,
+        )
+    return "error", render_status_detail("error", "spawn_failed")
+
+
+_status_detail_allowed = status_detail_allowed
 
 
 def active_mcp_servers() -> "McpServers | None":
@@ -247,6 +312,7 @@ class McpServers:
         claude_config_path: Path = Path.home() / ".claude.json",
         session_factory: SessionFactory | None = None,
         on_server: ServerHook | None = None,
+        on_state: StateHook | None = None,
         account_values: Mapping[str, str] | None = None,
         killer: ProcessTreeKiller = kill_process_tree,
         wall_clock: Callable[[], float] = time.time,
@@ -256,6 +322,7 @@ class McpServers:
         self._claude_config_path = Path(claude_config_path)
         self._session_factory = session_factory or self._default_session
         self._on_server = on_server
+        self._on_state = on_state
         self._account_values = dict(account_values or {})
         self._killer = killer
         self._wall_clock = wall_clock
@@ -272,11 +339,25 @@ class McpServers:
         self._stop_events: dict[str, asyncio.Event] = {}
         self._server_tools: dict[str, dict[str, Tool]] = {}
         self._closed = False
+        self._status_validation_logged = False
         servers = config.get("servers", {})
-        self._status = {
-            name: {"name": name, "connected": False, "tools": 0, "error": None}
-            for name in servers
-        }
+        self._status = {}
+        for name, server_cfg in servers.items():
+            disabled = (
+                isinstance(server_cfg, Mapping)
+                and server_cfg.get("enabled", True) is not True
+            )
+            self._status[name] = {
+                "name": name,
+                "connected": False,
+                "tools": 0,
+                "error": None,
+                "state": "not_configured" if disabled else "connecting",
+                "detail": render_status_detail(
+                    "not_configured" if disabled else "connecting",
+                    "disabled" if disabled else "pending",
+                ),
+            }
         if any(
             isinstance(server_cfg, Mapping)
             and server_cfg.get("session_channel") is True
@@ -309,6 +390,12 @@ class McpServers:
     ) -> None:
         if self._closed:
             raise RuntimeError("MCP servers are closed")
+        if any(not task.done() for task in self._server_tasks.values()):
+            raise RuntimeError("MCP server connection already active")
+        for name, task in tuple(self._server_tasks.items()):
+            if task.done():
+                self._server_tasks.pop(name, None)
+                self._stop_events.pop(name, None)
         servers = self._config.get("servers", {})
         defaults = self._config.get("defaults", {})
         timeout_s = float(defaults.get("connect_timeout_s", 20))
@@ -317,6 +404,14 @@ class McpServers:
         for name, server_cfg in servers.items():
             if isinstance(server_cfg, Mapping) and server_cfg.get("enabled", True) is not True:
                 continue
+            self._set_status(
+                name,
+                state="connecting",
+                detail=render_status_detail("connecting", "pending"),
+                connected=False,
+                tools=0,
+                error=None,
+            )
             ready = asyncio.Event()
             stop = asyncio.Event()
             self._stop_events[name] = stop
@@ -353,14 +448,19 @@ class McpServers:
     ) -> None:
         stack = AsyncExitStack()
         session = None
+        stage = "resolving"
+        command = None
         try:
             async with asyncio.timeout(timeout_s):
                 spec = self._resolve_spec(server_cfg)
+                command = spec.command
+                stage = "starting"
                 session = await stack.enter_async_context(self._session_factory(name, spec))
                 async with self._session_lock:
                     self._sessions[name] = session
                     generation = self._session_generations.get(name, 0)
                     await self._notify_held_session(name, session)
+                stage = "listing"
                 listed = await session.list_tools()
                 async with self._session_lock:
                     if self._session_generations.get(name, 0) != generation:
@@ -375,21 +475,56 @@ class McpServers:
                 server_cfg,
                 float(defaults.get("call_timeout_s", 8)),
             )
-            self._status[name].update(connected=True, tools=len(mirrored), error=None)
-            self._replace_server_tools(name, registry, mirrored, on_server)
+            tools_changed = self._replace_server_tools(name, registry, mirrored, None)
+            self._set_status(
+                name,
+                state="connected",
+                detail=render_status_detail("connected", "ready"),
+                connected=True,
+                tools=len(mirrored),
+                error=None,
+            )
+            if tools_changed and on_server is not None:
+                on_server(name, registry)
             ready.set()
             await stop.wait()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             error = type(exc).__name__
-            self._status[name].update(connected=False, tools=0, error=error)
+            state, detail = _failure_status(
+                exc,
+                stage=stage,
+                command=command if command is not None else server_cfg.get("command"),
+                timeout_s=timeout_s,
+            )
+            tools_changed = self._replace_server_tools(name, registry, [], None)
+            self._set_status(
+                name,
+                state=state,
+                detail=detail,
+                connected=False,
+                tools=0,
+                error=error,
+            )
+            if tools_changed and on_server is not None:
+                on_server(name, registry)
             _LOGGER.warning("MCP server %s connection failed: %s", name, error)
         finally:
             ready.set()
             self._call_settings.pop(name, None)
-            self._status[name].update(connected=False, tools=0)
-            self._replace_server_tools(name, registry, [], on_server)
+            current = self._status[name]
+            tools_changed = self._replace_server_tools(name, registry, [], None)
+            self._set_status(
+                name,
+                state=current["state"],
+                detail=current["detail"],
+                connected=False,
+                tools=0,
+                error=current["error"],
+            )
+            if tools_changed and on_server is not None:
+                on_server(name, registry)
             async with self._session_lock:
                 if self._sessions.get(name) is session:
                     self._sessions.pop(name, None)
@@ -428,7 +563,7 @@ class McpServers:
         registry: ToolRegistry,
         tools: list[Tool],
         on_server: ServerHook | None,
-    ) -> None:
+    ) -> bool:
         replacement = {tool.name: tool for tool in tools}
         if len(replacement) != len(tools):
             raise ValueError(f"duplicate MCP tool from server: {name}")
@@ -456,14 +591,57 @@ class McpServers:
             self._server_tools.pop(name, None)
         if replacement_names != previous_names and on_server is not None:
             on_server(name, registry)
+        return replacement_names != previous_names
+
+    def _set_status(
+        self,
+        name: str,
+        *,
+        state: str,
+        detail: str,
+        connected: bool,
+        tools: int,
+        error: str | None,
+    ) -> None:
+        if not status_detail_allowed(state, detail):
+            if "PYTEST_CURRENT_TEST" in os.environ:
+                raise ValueError("invalid MCP status detail")
+            if not self._status_validation_logged:
+                _LOGGER.error("invalid MCP status pair normalized")
+                self._status_validation_logged = True
+            state = "error"
+            detail = render_status_detail("error", "status_unavailable")
+            connected = False
+            tools = 0
+        previous = self._status[name]["state"]
+        self._status[name].update(
+            state=state,
+            detail=detail[:120],
+            connected=connected,
+            tools=tools,
+            error=error,
+        )
+        if previous == state or self._on_state is None:
+            return
+        try:
+            self._on_state(name, state, self.status())
+        except Exception as exc:
+            _LOGGER.warning("MCP server %s state hook failed: %s", name, type(exc).__name__)
 
     def _resolve_spec(self, server_cfg: Mapping) -> StdioServerParameters:
-        _, StdioServerParameters, _ = _load_mcp_transport()
         source: Mapping = server_cfg
         config_name = server_cfg.get("from_claude_config")
         if config_name:
             claude_config = json.loads(self._claude_config_path.read_text(encoding="utf-8"))
-            source = claude_config["mcpServers"][config_name]
+            if not isinstance(claude_config, Mapping):
+                raise ValueError("invalid MCP config")
+            configured = claude_config.get("mcpServers")
+            if not isinstance(configured, Mapping) or config_name not in configured:
+                raise KeyError(config_name)
+            source = configured[config_name]
+        if not isinstance(source, Mapping) or not isinstance(source.get("command"), str):
+            raise ValueError("invalid MCP server config")
+        _, StdioServerParameters, _ = _load_mcp_transport()
         return StdioServerParameters(
             command=source["command"],
             args=list(source.get("args", ())),

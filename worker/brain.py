@@ -204,6 +204,7 @@ class Brain:
         history_exchanges: int = 8,
         on_tool: Callable[[str, ToolResult], None] | None = None,
         clock: Callable[[], datetime] = datetime.now,
+        mcp_status: list[dict[str, Any]] | None = None,
     ) -> None:
         if (
             isinstance(turn_timeout_s, bool)
@@ -235,12 +236,15 @@ class Brain:
         self.last_usage: dict[str, int] | None = None
         self._first_turn_seen = False
         self._tools_settled = False
+        self._capabilities_settling = False
         self._snapshot_generation = 0
         self._cache_floor_generations: set[int] = set()
         self._cache_floor_checks_started = 0
         self._cache_floor_tasks: set[asyncio.Task[None]] = set()
         self._tool_names: tuple[str, ...] = ()
         self._tools: list[dict[str, Any]] = []
+        self._mcp_status = self._copy_mcp_status(mcp_status or [])
+        self._capability_text = ""
         self._cached_system: dict[str, Any] = {}
         self._replace_tool_snapshot(self.registry.schemas())
 
@@ -252,22 +256,27 @@ class Brain:
             if isinstance((name := schema.get("name")), str)
         }))
 
+    @staticmethod
+    def _copy_mcp_status(mcp_status: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [dict(item) for item in mcp_status if isinstance(item, Mapping)]
+
     def _replace_tool_snapshot(self, schemas: list[dict[str, Any]]) -> None:
         tools = [dict(schema) for schema in schemas]
         if tools:
             tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         self._tool_names = self._schema_names(schemas)
         self._tools = tools
+        self._capability_text = _capability_system_text(tools, self._mcp_status)
         self._cached_system = {
             "type": "text",
-            "text": self._system_text + "\n\n" + _capability_system_text(tools),
+            "text": self._system_text + "\n\n" + self._capability_text,
             "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
 
-    def refresh_tools(self) -> bool:
-        """Rebuild the prompt snapshot only for a changed registered tool name set."""
+    def _refresh_snapshot(self) -> bool:
         schemas = self.registry.schemas()
-        if self._schema_names(schemas) == self._tool_names:
+        capability_text = _capability_system_text(schemas, self._mcp_status)
+        if capability_text == self._capability_text:
             return False
         self._replace_tool_snapshot(schemas)
         self._snapshot_generation += 1
@@ -276,8 +285,24 @@ class Brain:
         self._arm_cache_floor_check()
         return True
 
+    def refresh_tools(self) -> bool:
+        """Rebuild only when the registered tool-name or recorded state set changes."""
+        return self._refresh_snapshot()
+
+    def begin_capability_settle(self) -> None:
+        """Coalesce initial MCP state transitions into the post-connect snapshot."""
+        self._capabilities_settling = True
+
+    def refresh_capabilities(self, mcp_status: list[dict[str, Any]]) -> bool:
+        """Record a host-observed transition and rebuild one coherent snapshot."""
+        self._mcp_status = self._copy_mcp_status(mcp_status)
+        if self._capabilities_settling:
+            return False
+        return self._refresh_snapshot()
+
     def mark_tools_settled(self) -> None:
         """Allow cache-floor checks after initial MCP discovery has settled."""
+        self._capabilities_settling = False
         if self._tools_settled:
             return
         self._tools_settled = True
@@ -579,16 +604,33 @@ class Brain:
         return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
 
 
-def _capability_system_text(schemas: list[dict[str, Any]]) -> str:
+def _capability_system_text(
+    schemas: list[dict[str, Any]],
+    mcp_status: list[dict[str, Any]],
+) -> str:
     lines = ["Available registered capabilities by name:"]
-    for schema in schemas:
-        name = schema.get("name")
-        description = schema.get("description")
-        if not isinstance(name, str) or not isinstance(description, str):
-            continue
-        purpose = " ".join(description.split())[:200]
-        lines.append(f"{name}: {purpose}")
+    names = sorted(
+        schema.get("name")
+        for schema in schemas
+        if isinstance(schema.get("name"), str)
+    )
+    for name in names:
+        lines.append(name)
     if len(lines) == 1:
+        lines.append("none")
+    lines.append("MCP server states:")
+    state_count = 0
+    states = sorted(
+        (item.get("name"), item.get("state"))
+        for item in mcp_status
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and item.get("state") in {"connecting", "connected", "not_configured", "error"}
+    )
+    for name, state in states:
+        lines.append(f"{name}: {state}")
+        state_count += 1
+    if state_count == 0:
         lines.append("none")
     lines.append(
         "Before saying you cannot do something, check this list; if a tool covers it, call it."

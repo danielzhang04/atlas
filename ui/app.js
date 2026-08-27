@@ -36,6 +36,7 @@
     audioInput: document.querySelector("#audio-input"), audioInputMode: document.querySelector("#audio-input-mode"),
     audioOutput: document.querySelector("#audio-output"), audioOutputMode: document.querySelector("#audio-output-mode"),
     claudeStatus: document.querySelector("#claude-status"), mcpList: document.querySelector("#mcp-list"),
+    appsList: document.querySelector("#apps-list"),
     pairingStatus: document.querySelector("#pairing-status"), repairButton: document.querySelector("#repair-button"),
   };
 
@@ -1156,14 +1157,39 @@
     servers.forEach((server) => {
       if (!isRecord(server)) return;
       const row = node("div", "mcp-row");
-      row.append(node("strong", "", stringValue(server.name)));
+      const state = ["connecting", "connected", "not_configured", "error"].includes(server.state)
+        ? server.state : (server.connected ? "connected" : "error");
+      const name = node("strong", "status-name");
+      name.append(node("span", `status-dot is-${state}`));
+      name.append(document.createTextNode(stringValue(server.name)));
+      row.append(name);
       const tools = Number.isInteger(server.tools) ? server.tools : 0;
-      let detail = server.connected ? `${tools} ${tools === 1 ? "tool" : "tools"}` : stringValue(server.error || "disconnected");
+      let detail = stringValue(server.detail || state);
+      if (server.connected) detail = `${detail}, ${tools} ${tools === 1 ? "tool" : "tools"}`;
       if (server.name === "kb" && ["held", "none", "expired"].includes(server.session)) {
         detail = `${detail}, session ${server.session}`;
       }
-      row.append(node("span", server.connected ? "is-connected" : "is-failed", detail));
+      row.append(node("span", `status-detail is-${state}`, detail));
       refs.mcpList.append(row);
+    });
+  }
+  function renderApps(apps) {
+    refs.appsList.replaceChildren();
+    if (!Array.isArray(apps) || apps.length === 0) {
+      refs.appsList.append(node("p", "empty", "No desktop profiles configured."));
+      return;
+    }
+    apps.forEach((app) => {
+      if (!isRecord(app)) return;
+      const state = ["configured", "not_configured", "error"].includes(app.state)
+        ? app.state : "error";
+      const row = node("div", "mcp-row");
+      const name = node("strong", "status-name");
+      name.append(node("span", `status-dot is-${state}`));
+      name.append(document.createTextNode(stringValue(app.name)));
+      row.append(name);
+      row.append(node("span", `status-detail is-${state}`, stringValue(app.detail || state)));
+      refs.appsList.append(row);
     });
   }
   function refreshSettings() {
@@ -1172,6 +1198,7 @@
         const health = await publicJson("/health", {cache: "no-store", ignoreHttpError: true});
         if (health) {
           renderMcp(health.mcp);
+          renderApps(health.apps);
           refs.claudeStatus.textContent = health.claude ? "Available" : "Unavailable";
           refs.claudeStatus.classList.toggle("is-unavailable", !health.claude);
         }

@@ -832,11 +832,41 @@ main {
   font: .61rem ui-monospace, "Cascadia Mono", monospace;
 }
 
-.mcp-row .is-connected {
+.mcp-row .status-name {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+}
+
+.mcp-row .status-dot {
+  width: .48rem;
+  height: .48rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.mcp-row .status-dot.is-connected,
+.mcp-row .status-dot.is-configured {
+  background: var(--accent-light);
+}
+
+.mcp-row .status-dot.is-connecting {
+  background: #d5aa62;
+}
+
+.mcp-row .status-dot.is-not_configured,
+.mcp-row .status-dot.is-error {
+  background: var(--red);
+}
+
+.mcp-row .status-detail.is-connected,
+.mcp-row .status-detail.is-configured {
   color: var(--accent-light);
 }
 
-.mcp-row .is-failed {
+.mcp-row .status-detail.is-not_configured,
+.mcp-row .status-detail.is-error {
   color: var(--red);
 }
 
