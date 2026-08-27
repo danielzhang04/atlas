@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Users/danie/Atlas/.venv/Scripts/python.exe\" \"${CLAUDE_PROJECT_DIR}/scripts/hooks/post_edit_check.py\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
