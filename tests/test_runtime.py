@@ -275,10 +275,14 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
             self.on_server = kwargs["on_server"]
             self.account_values = kwargs["account_values"]
             self.calls = []
+            self.responses = [
+                "Found 61 messages matching 'in:inbox':\n1. first",
+                "Found 14 messages matching 'in:inbox category:primary':\n1. first",
+            ]
 
         async def call_raw(self, server, tool, arguments):
             self.calls.append((server, tool, arguments))
-            return "Found 3 messages matching 'in:inbox':"
+            return self.responses.pop(0)
 
     monkeypatch.setattr(runtime, "McpServers", CapturingMcp)
     built = runtime.build({
@@ -300,20 +304,27 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
         built.mcp.on_server("google", built.registry)
         result = asyncio.run(built.registry.call("count_mail", {"query": "in:inbox"}))
 
-        assert json.loads(result.content) == {
-            "query": "in:inbox",
-            "count": 3,
-            "exact": True,
-        }
-        assert built.mcp.calls == [(
-            "google",
-            "search_gmail_messages",
-            {
-                "query": "in:inbox",
-                "page_size": 500,
-                "include_headers": False,
-            },
-        )]
+        assert result.content == "61 in your inbox, 14 in Primary"
+        assert built.mcp.calls == [
+            (
+                "google",
+                "search_gmail_messages",
+                {
+                    "query": "in:inbox",
+                    "page_size": 500,
+                    "include_headers": False,
+                },
+            ),
+            (
+                "google",
+                "search_gmail_messages",
+                {
+                    "query": "in:inbox category:primary",
+                    "page_size": 500,
+                    "include_headers": False,
+                },
+            ),
+        ]
         assert built.mcp.account_values == {
             "user_google_email": "owner@example.test",
         }
