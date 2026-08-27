@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 import pytest
+import yaml
 
 
 try:
@@ -164,6 +165,90 @@ def test_explicit_command_transport_suppresses_mcp_default_environment(monkeypat
         if name not in {"PATH", "SystemRoot"}
     )
     assert seen["errlog"] is subprocess.DEVNULL
+
+
+def test_default_session_only_uses_exact_environment_for_command_servers(monkeypatch):
+    from mcp.client import stdio as mcp_stdio
+
+    environments = []
+
+    class FakeStdioClient:
+        def __init__(self, spec):
+            self._spec = spec
+
+        async def __aenter__(self):
+            environments.append(
+                {
+                    **mcp_stdio.get_default_environment(),
+                    **self._spec.env,
+                }
+            )
+            return "read", "write"
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FakeClientSession:
+        def __init__(self, _read_stream, _write_stream):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def initialize(self):
+            pass
+
+    def fake_stdio_client(spec, *, errlog):
+        assert errlog is subprocess.DEVNULL
+        return FakeStdioClient(spec)
+
+    monkeypatch.setattr(
+        mcp_client,
+        "_load_mcp_transport",
+        lambda: (FakeClientSession, SimpleNamespace, fake_stdio_client),
+    )
+    monkeypatch.setattr(
+        mcp_stdio,
+        "get_default_environment",
+        lambda: {"PATH": "mcp-default", "APPDATA": "profile"},
+    )
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {"from_claude_config": "google-workspace"},
+                    "kb": {"command": "node", "exact_environment": True},
+                },
+            }
+        )
+        async with servers._default_session(
+            "google",
+            SimpleNamespace(env={"GOOGLE_FEATURE": "enabled"}),
+        ):
+            pass
+        async with servers._default_session(
+            "kb",
+            SimpleNamespace(env={"PATH": "minimal", "SystemRoot": "C:/Windows"}),
+        ):
+            pass
+
+    asyncio.run(scenario())
+
+    assert environments == [
+        {
+            "PATH": "mcp-default",
+            "APPDATA": "profile",
+            "GOOGLE_FEATURE": "enabled",
+        },
+        {
+            "PATH": "minimal",
+            "SystemRoot": "C:/Windows",
+        },
+    ]
 
 
 def test_default_stdio_session_records_pid_and_close_force_kills_tree(monkeypatch):
@@ -1196,7 +1281,12 @@ def test_kb_health_flips_expired_then_erases_session_with_fake_clock():
 
 
 def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_tool():
-    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    config_dir = Path(__file__).parents[1] / "config"
+    atlas_config = yaml.safe_load(
+        (config_dir / "atlas.yaml").read_text(encoding="utf-8"),
+    )
+    bridge_path = atlas_config["kb_bridge"]["path"]
+    config = load_mcp_config(config_dir / "mcp.yaml")
     server = config["servers"]["kb"]
     defaults = config["defaults"]
     read_tools = {
@@ -1220,10 +1310,12 @@ def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_too
     assert all(policy_for(server, defaults, name) == "instant" for name in read_tools)
     assert all(policy_for(server, defaults, name) == "confirm" for name in mutation_tools)
     assert policy_for(server, defaults, "kb_future_mutation") == "confirm"
-    assert server["command"] == "node"
-    assert server["args"] == [
-        "C:/Users/danie/kb/dashboard/atlas-bridge/dist/server.js",
+    assert [server["command"], *server["args"]] == [
+        "node", f"{bridge_path}/dist/server.js",
     ]
+    assert "\\" not in bridge_path
+    assert bridge_path[0].isalpha() and bridge_path[1:3] == ":/"
+    assert bridge_path.endswith("/atlas-bridge")
     assert server["enabled"] is True
     assert set(server["env"]) == {
         "ATLAS_KB_BRIDGE_ENABLED",

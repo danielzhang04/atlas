@@ -17,10 +17,10 @@ Non-negotiable rules:
 5. A mutating MCP tool cannot execute on a model assertion. The host holds one expiring, single-use
    pending action, and only a matching later `confirm` call may consume it.
 6. MCP child environments are never logged and never the host's full environment.
-   `from_claude_config` servers take exactly their named entry from `~/.claude.json`; `command:`
-   servers take a fixed argv from config plus ONLY the non-secret flags named in `env_from`
-   (resolved from `atlas.yaml`) and a minimal PATH/SystemRoot. Secrets never travel in env for
-   command servers; the kb session token travels only over the private notification channel.
+   `from_claude_config` servers are spawned with mcp's default child environment plus the env of
+   their `~/.claude.json` entry; `command:` servers are spawned with an exact environment: only the
+   flags named in `env_from` plus PATH and SystemRoot. Secrets never travel in env for command
+   servers; the kb session token travels only over the private notification channel.
 7. `open` accepts configured aliases and HTTPS URLs only. Executables come only from signed desktop
    profiles; the model never supplies an executable path.
 8. Run focused tests, the full standalone suite, `git diff --check`, and adversarial code/security

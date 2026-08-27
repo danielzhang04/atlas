@@ -295,10 +295,7 @@ class McpServers:
             on_pid=lambda pid: self._server_pids.__setitem__(server_name, pid),
             exact_environment=(
                 isinstance(server_cfg, Mapping)
-                and (
-                    server_cfg.get("exact_environment") is True
-                    or "from_claude_config" in server_cfg
-                )
+                and server_cfg.get("exact_environment") is True
             ),
             enter_lock=self._stdio_enter_lock,
         )
