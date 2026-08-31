@@ -10,7 +10,7 @@ from queue import Queue
 import subprocess
 import sys
 from threading import Event, Thread
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -894,6 +894,7 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once(desktop_log
         create_mutex=lambda: (111, False),
         assign_job=lambda child: assigned.append(child) or 222,
         close_handle=closed_handles.append,
+        patch_webview=lambda: None,
         token_factory=lambda: "shutdown-token",
     )
 
@@ -973,6 +974,7 @@ def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch
         create_mutex=lambda: (111, False),
         assign_job=lambda _child: 222,
         close_handle=lambda _handle: None,
+        patch_webview=lambda: None,
         token_factory=lambda: "shutdown-token",
     )
 
@@ -1083,6 +1085,7 @@ def test_run_replaces_exit_21_child_and_loads_new_worker_url_in_same_window():
         create_mutex=lambda: (111, False),
         assign_job=lambda child: assigned.append(child) or next(handles),
         close_handle=closed_handles.append,
+        patch_webview=lambda: None,
         token_factory=lambda: "shutdown-token",
     )
 
@@ -1592,3 +1595,247 @@ def test_shortcut_installer_targets_pythonw_desktop_module():
     assert 'new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")' in script
     assert "PropertyId = 5" in script
     assert "WindowStyle = 7" in script
+
+
+class FakeCreationProperties:
+    AdditionalBrowserArguments = ""
+
+
+class FakeWebView2Control:
+    def __init__(self, props) -> None:
+        self.CreationProperties = props
+
+
+EDGECHROMIUM = "webview.platforms.edgechromium"
+
+
+class EdgeChromeTemplate:
+    """Shaped like pywebview 6.2.1: the browser arguments are one constant in the constructor."""
+
+    def __init__(self, form, window, cache_dir):
+        self.constructed = (form, window, cache_dir)
+        props = FakeCreationProperties()
+        props.AdditionalBrowserArguments = "--disable-features=ElasticOverscroll"
+        self.webview = FakeWebView2Control(props)
+
+
+class RenamedLiteralTemplate:
+    def __init__(self, form, window, cache_dir):
+        self.constructed = (form, window, cache_dir)
+        props = FakeCreationProperties()
+        props.AdditionalBrowserArguments = "--disable-features=Overscroll"
+        self.webview = FakeWebView2Control(props)
+
+
+class FailingTemplate:
+    def __init__(self, form, window, cache_dir):
+        props = FakeCreationProperties()
+        props.AdditionalBrowserArguments = "--disable-features=ElasticOverscroll"
+        self.webview = FakeWebView2Control(props)
+        raise RuntimeError("browser unavailable")
+
+
+def _fake_edgechromium(monkeypatch, template=EdgeChromeTemplate, *, attribute="EdgeChrome",
+                       metaclass=type):
+    """Install a fake edgechromium module holding a throwaway copy of `template`."""
+    module = ModuleType(EDGECHROMIUM)
+    setattr(module, attribute, metaclass("EdgeChrome", (), dict(vars(template))))
+    monkeypatch.setitem(sys.modules, EDGECHROMIUM, module)
+    return module
+
+
+def test_merge_disable_features_appends_to_the_single_existing_flag():
+    merged = desktop._merge_disable_features(
+        "--disable-features=ElasticOverscroll", "CalculateNativeWinOcclusion")
+
+    assert merged == "--disable-features=ElasticOverscroll,CalculateNativeWinOcclusion"
+
+
+def test_merge_disable_features_keeps_other_arguments_and_collapses_duplicate_flags():
+    merged = desktop._merge_disable_features(
+        "--disable-features=ElasticOverscroll --allow-file-access-from-files "
+        "--remote-debugging-port=9222 --disable-features=Translate",
+        "CalculateNativeWinOcclusion",
+    )
+
+    assert merged == (
+        "--disable-features=ElasticOverscroll,Translate,CalculateNativeWinOcclusion "
+        "--allow-file-access-from-files --remote-debugging-port=9222"
+    )
+
+
+def test_merge_disable_features_adds_the_flag_when_none_is_present():
+    merged = desktop._merge_disable_features(
+        "--allow-file-access-from-files", "CalculateNativeWinOcclusion")
+
+    assert merged == (
+        "--allow-file-access-from-files --disable-features=CalculateNativeWinOcclusion")
+
+
+def test_merge_disable_features_refuses_a_quoted_value_instead_of_corrupting_it():
+    quoted = '--disable-features=ElasticOverscroll --user-agent="Atlas Voice"'
+
+    assert desktop._merge_disable_features(quoted, "CalculateNativeWinOcclusion") is None
+
+
+def test_webview_occlusion_patch_merges_the_flag_into_the_constructor_constant(
+    monkeypatch, desktop_log,
+):
+    module = _fake_edgechromium(monkeypatch)
+
+    desktop._patch_webview_occlusion()
+    browser = module.EdgeChrome("form", "window", "cache")
+
+    assert browser.webview.CreationProperties.AdditionalBrowserArguments == (
+        "--disable-features=ElasticOverscroll,CalculateNativeWinOcclusion")
+    assert browser.constructed == ("form", "window", "cache")
+    assert desktop_log.getvalue() == ""
+
+
+def test_webview_occlusion_patch_keeps_the_constructor_signature_and_identity(
+    monkeypatch, desktop_log,
+):
+    module = _fake_edgechromium(monkeypatch)
+    original = module.EdgeChrome.__init__
+
+    desktop._patch_webview_occlusion()
+    patched = module.EdgeChrome.__init__
+
+    assert patched is not original
+    assert patched.__name__ == original.__name__
+    assert patched.__qualname__ == original.__qualname__
+    assert patched.__defaults__ == original.__defaults__
+    assert patched.__code__.co_argcount == original.__code__.co_argcount
+    assert patched.__code__.co_varnames == original.__code__.co_varnames
+    assert desktop_log.getvalue() == ""
+
+
+def test_webview_occlusion_patch_is_idempotent(monkeypatch, desktop_log):
+    module = _fake_edgechromium(monkeypatch)
+
+    desktop._patch_webview_occlusion()
+    patched = module.EdgeChrome.__init__
+    desktop._patch_webview_occlusion()
+    desktop._patch_webview_occlusion()
+    browser = module.EdgeChrome("form", "window", "cache")
+
+    assert module.EdgeChrome.__init__ is patched
+    assert browser.webview.CreationProperties.AdditionalBrowserArguments == (
+        "--disable-features=ElasticOverscroll,CalculateNativeWinOcclusion")
+    assert desktop_log.getvalue() == ""
+
+
+def test_webview_occlusion_patch_lets_a_failing_constructor_propagate(monkeypatch, desktop_log):
+    module = _fake_edgechromium(monkeypatch, FailingTemplate)
+
+    desktop._patch_webview_occlusion()
+
+    with pytest.raises(RuntimeError, match="browser unavailable"):
+        module.EdgeChrome("form", "window", "cache")
+    assert desktop_log.getvalue() == ""
+
+
+def test_webview_occlusion_patch_skips_a_constructor_without_the_known_literal(
+    monkeypatch, desktop_log,
+):
+    module = _fake_edgechromium(monkeypatch, RenamedLiteralTemplate)
+
+    desktop._patch_webview_occlusion()
+    browser = module.EdgeChrome("form", "window", "cache")
+
+    assert browser.webview.CreationProperties.AdditionalBrowserArguments == (
+        "--disable-features=Overscroll")
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: literal\n"
+
+
+def test_webview_occlusion_patch_skips_a_missing_module(monkeypatch, desktop_log):
+    monkeypatch.setitem(sys.modules, EDGECHROMIUM, None)
+
+    desktop._patch_webview_occlusion()
+
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: ModuleNotFoundError\n"
+
+
+def test_webview_occlusion_patch_skips_a_renamed_class(monkeypatch, desktop_log):
+    _fake_edgechromium(monkeypatch, attribute="EdgeChromium")
+
+    desktop._patch_webview_occlusion()
+
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: class\n"
+
+
+def test_webview_occlusion_patch_skips_a_class_without_its_own_constructor(
+    monkeypatch, desktop_log,
+):
+    module = ModuleType(EDGECHROMIUM)
+    module.EdgeChrome = type("EdgeChrome", (), {})
+    monkeypatch.setitem(sys.modules, EDGECHROMIUM, module)
+
+    desktop._patch_webview_occlusion()
+
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: constructor\n"
+
+
+def test_webview_occlusion_patch_skips_a_constructor_that_is_not_python(monkeypatch, desktop_log):
+    module = ModuleType(EDGECHROMIUM)
+    module.EdgeChrome = type("EdgeChrome", (), {"__init__": object.__init__})
+    monkeypatch.setitem(sys.modules, EDGECHROMIUM, module)
+
+    desktop._patch_webview_occlusion()
+
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: constructor\n"
+
+
+def test_webview_occlusion_patch_reports_an_unassignable_constructor(monkeypatch, desktop_log):
+    class FrozenClass(type):
+        def __setattr__(cls, name, value):
+            raise TypeError("read-only class")
+
+    _fake_edgechromium(monkeypatch, metaclass=FrozenClass)
+
+    desktop._patch_webview_occlusion()
+
+    assert desktop_log.getvalue() == "webview occlusion patch skipped: TypeError\n"
+
+
+def test_installed_pywebview_constructor_still_hardcodes_the_known_literal():
+    # Canary: parses the installed pywebview without importing it, so an upgrade that moves or
+    # renames this literal fails here instead of silently skipping the occlusion patch.
+    import ast
+
+    import webview
+
+    source = (Path(webview.__file__).parent / "platforms" / "edgechromium.py").read_text(
+        encoding="utf-8")
+    classes = [node for node in ast.parse(source).body
+               if isinstance(node, ast.ClassDef) and node.name == "EdgeChrome"]
+    assert len(classes) == 1
+    constructors = [node for node in classes[0].body
+                    if isinstance(node, ast.FunctionDef) and node.name == "__init__"]
+    assert len(constructors) == 1
+    assignments = [
+        node for node in ast.walk(constructors[0])
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Attribute)
+                and target.attr == "AdditionalBrowserArguments" for target in node.targets)
+        and isinstance(node.value, ast.Constant)
+        and node.value.value == desktop.WEBVIEW_BROWSER_ARGUMENTS
+    ]
+    assert len(assignments) == 1
+
+
+def test_webview_occlusion_patch_rewrites_the_installed_pywebview_constructor():
+    # The only test that imports the real platform module (pythonnet, WinForms and the WebView2
+    # interop assemblies, about 0.7s and 41MB of RSS). No window is created.
+    from importlib import import_module
+
+    module = import_module("webview.platforms.edgechromium")
+    original = vars(module.EdgeChrome).get("__init__")
+    try:
+        desktop._patch_webview_occlusion()
+        constants = vars(module.EdgeChrome)["__init__"].__code__.co_consts
+
+        assert "--disable-features=ElasticOverscroll,CalculateNativeWinOcclusion" in constants
+        assert desktop.WEBVIEW_BROWSER_ARGUMENTS not in constants
+    finally:
+        module.EdgeChrome.__init__ = original
