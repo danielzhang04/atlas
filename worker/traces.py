@@ -89,7 +89,7 @@ class TraceRecorder:
         self.path = configured_path(path)
         self.enabled = bool(enabled)
         self._pricing = dict(pricing or {})
-        self._cache_write_multiplier = 2.0 if cache_ttl == "1h" else 1.0
+        self._long_cache_write = cache_ttl == "1h"
         self._tool_names = frozenset(tool_names)
         self._model_names = frozenset(model_names)
         self._retention_days = max(1, int(retention_days))
@@ -270,7 +270,10 @@ class TraceRecorder:
         rates = [prices.get(key) for key in
                  ("input_per_mtok", "output_per_mtok", "cache_read_per_mtok",
                   "cache_write_per_mtok")]
-        rates[3] = self._price(rates[3]) * self._cache_write_multiplier
+        # A 1-hour cache write is billed at 2x base input, not 2x the 5-minute
+        # cache-write rate; see the cache_ttl comment in config/atlas.yaml.
+        rates[3] = (self._price(rates[0]) * 2.0 if self._long_cache_write
+                    else self._price(rates[3]))
         cost = sum(total * self._price(rate) for total, rate in zip(totals, rates)) / 1e6
         return (turn.turn_id, turn.started_at, ended_at, self._count(elapsed),
                 int(addressed is True), self._enum(wake_kind, _WAKE_KINDS),

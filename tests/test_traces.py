@@ -142,13 +142,13 @@ def test_unresolved_configured_path_falls_back_without_localappdata(monkeypatch,
     assert traces.configured_path("$MISSING_ATLAS_HOME/trace.db") == expected
 
 
-def test_one_hour_cache_write_pricing_uses_double_standard_rate(tmp_path):
+def test_one_hour_cache_write_pricing_uses_double_base_input_rate(tmp_path):
     recorder = _recorder(tmp_path / "traces.db", cache_ttl="1h")
     _record_turn(recorder, tokens=(100, 20, 300, 40))
     summary = recorder.summary(days=1)
     recorder.close()
     assert summary["cost_usd"] == pytest.approx(
-        (100 + 20 * 5 + 300 * 0.1 + 40 * 1.25 * 2) / 1e6
+        (100 + 20 * 5 + 300 * 0.1 + 40 * 1.0 * 2) / 1e6
     )
 
 
