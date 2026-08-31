@@ -81,8 +81,9 @@ def test_state_signal_assets_and_security_headers():
     assert 'id="greeting"' in page[2]
     assert 'id="tool-strip" hidden' in page[2]
     assert 'id="tool-strip" aria-hidden' not in page[2]
-    assert 'id="quick-actions"' in page[2]
+    assert 'id="quick-actions"' not in page[2]
     assert 'id="text-turn-input"' in page[2]
+    assert 'class="text-turn-form"' in page[2]
     assert "autofocus" not in page[2]
     assert 'class="core"' not in page[2]
     assert styles[0] == 200 and "--header: 40px" in styles[2]
@@ -121,8 +122,8 @@ def test_state_signal_assets_and_security_headers():
     assert "window.setInterval(renderGreeting, 60_000)" in live_activity
     assert "window.clearInterval(greetingTimer)" in live_activity
     assert script[2].count("window.setInterval(renderGreeting, 60_000)") == 1
-    assert "root.__atlasEngineGeometry" in script[2]
-    assert 'authenticatedJson("/actions/quick"' in script[2]
+    assert "root.__atlasEngineGeometry" not in script[2]
+    assert 'authenticatedJson("/actions/quick"' not in script[2]
     assert 'authenticatedJson("/turn"' in script[2]
     assert "renderPendingConfirmation(payload.pending)" in script[2]
     assert 'classList.add("is-holo-dismissing")' in script[2]
@@ -1210,6 +1211,88 @@ def test_pairing_returns_expiry_and_renewal_requires_live_bearer_and_loopback_ho
     assert expired[0] == 403
 
 
+def test_text_turn_endpoint_forwards_bounded_text_and_requires_action_authorization():
+    turns = []
+
+    async def scenario():
+        authorizer = stateserver.PairingAuthorizer(token="pair-token")
+        bearer = authorizer.pair("pair-token")
+        server = await stateserver.start(
+            StatePublisher(),
+            0,
+            authorizer=authorizer,
+            text_turn_provider=lambda text: turns.append(text),
+        )
+        origin = f"http://127.0.0.1:{server.port}"
+        base = {"content-type": "application/json", "origin": origin}
+        authorized = {**base, stateserver.HEADER: bearer}
+        try:
+            missing = await _request(server, "POST", "/turn", body='{"text": "hello"}', headers=base)
+            blank = await _request(server, "POST", "/turn", body='{"text": "  "}', headers=authorized)
+            accepted = await _request(
+                server, "POST", "/turn", body='{"text": "  hello Atlas  "}', headers=authorized,
+            )
+            return missing, blank, accepted
+        finally:
+            await server.stop()
+
+    missing, blank, accepted = asyncio.run(scenario())
+
+    assert missing[0] == 403
+    assert blank[0] == 400
+    assert json.loads(accepted[2]) == {"ok": True, "pending": None}
+    assert turns == ["hello Atlas"]
+
+
+def test_text_turn_response_projects_existing_pending_confirmation():
+    async def _confirm_action(_arguments):
+        return "done"
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "confirm_action",
+        "Wait for confirmation.",
+        {
+            "type": "object",
+            "properties": {"target": {"type": "string", "maxLength": 20}},
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+        _confirm_action,
+        policy="confirm",
+    ))
+
+    async def scenario():
+        pending = await registry.call("confirm_action", {"target": "report"})
+        assert pending.status == "needs_confirmation"
+        authorizer = stateserver.PairingAuthorizer(token="pair-token")
+        bearer = authorizer.pair("pair-token")
+        server = await stateserver.start(
+            StatePublisher(),
+            0,
+            authorizer=authorizer,
+            registry=registry,
+            text_turn_provider=lambda _text: None,
+        )
+        origin = f"http://127.0.0.1:{server.port}"
+        headers = {
+            "content-type": "application/json",
+            "origin": origin,
+            stateserver.HEADER: bearer,
+        }
+        try:
+            return await _request(server, "POST", "/turn", body='{"text": "status"}', headers=headers)
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert json.loads(response[2]) == {
+        "ok": True,
+        "pending": {"readback": "confirm_action - target: report"},
+    }
+
+
 def test_host_allowlist_rejects_every_method_and_route_before_dispatch():
     async def scenario():
         server = await stateserver.start(StatePublisher(clock=lambda: _dt(0)), 0)
@@ -1404,14 +1487,14 @@ def test_removed_routes_and_unknown_assets_are_absent():
         server = await stateserver.start(StatePublisher(clock=lambda: _dt(0)), 0)
         try:
             paths = [
-                "/capabilities", "/actions", "/receipts", "/guided-setups/browser",
+                "/capabilities", "/actions", "/actions/quick", "/receipts", "/guided-setups/browser",
                 "/ui/not-present.txt", "/ui/../../worker/stateserver.py",
             ]
             return [await _request(server, path=path) for path in paths]
         finally:
             await server.stop()
 
-    assert [response[0] for response in asyncio.run(scenario())] == [404] * 6
+    assert [response[0] for response in asyncio.run(scenario())] == [404] * 7
 
 
 def test_stop_is_idempotent():

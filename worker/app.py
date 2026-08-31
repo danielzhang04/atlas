@@ -678,9 +678,6 @@ async def entrypoint(ctx: JobContext) -> None:
     user_name = user.get("name") if isinstance(user, dict) else None
     publisher = state.StatePublisher(voice=cfg.get("active_voice"), user_name=user_name)
     services.registry.set_execution_observer(publisher.set_tool)
-    quick_actions = tools_mod.load_quick_actions(
-        ATLAS / "config" / "quick_actions.yaml", services.registry,
-    )
     intents = _load_intents()
     loop = asyncio.get_running_loop()
     session: Any | None = None
@@ -728,16 +725,6 @@ async def entrypoint(ctx: JobContext) -> None:
             turn_ownership=turn_ownership,
             trace_recorder=_traces(),
         )
-
-    async def _handle_quick_result(name: str, result: tools_mod.ToolResult) -> None:
-        _record_tool(publisher, name, result)
-        if result.status != "needs_confirmation":
-            return
-        pending = services.registry.pending
-        readback = f"{pending.summary}." if pending is not None else result.content
-        publisher.add_line("atlas", readback)
-        if session is not None:
-            session.say(readback, add_to_chat_ctx=False)
 
     async def _request_shutdown() -> None:
         nonlocal shutdown_jobs_requested
@@ -824,8 +811,6 @@ async def entrypoint(ctx: JobContext) -> None:
         cancel_provider=services.work.cancel,
         health_provider=_health,
         registry=services.registry,
-        quick_actions=quick_actions,
-        quick_result_provider=_handle_quick_result,
         text_turn_provider=_submit_text_turn,
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
