@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 
 from worker import brain as brain_mod
-from worker.brain import BASE_SYSTEM, Brain, split_spoken
+from worker.brain import BASE_SYSTEM, PROVIDER_REPLY, TIMEOUT_REPLY, Brain, split_spoken
+from worker.claims import UNBACKED_ACTION_REPLY, ClaimGuard
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
 
@@ -510,7 +511,7 @@ def test_unbacked_action_claim_is_suppressed_by_the_host(caplog, claim):
     brain = Brain(client, FakeRegistry(), model="fast", persona="")
 
     assert "".join(asyncio.run(collect(brain, "Open Spotify"))) == (
-        "I did not actually do that - I have no tool result. Want me to?"
+        "I did not actually do that - I have no tool result. Want me to? "
     )
     assert caplog.text.count("unbacked action claim suppressed") == 1
 
@@ -530,6 +531,11 @@ def test_action_claim_after_ok_tool_result_passes_through():
 
 
 def test_known_registry_target_state_claim_requires_a_relevant_call():
+    # The guard is restricted to perfective, first-person claims (item 3): a bare
+    # state description like "Spotify is open." has no "I"/"we" subject, so it is
+    # not an attributed claim even when the target is a known registry alias --
+    # the dead open_state/target-tracking machinery that used to intercept this
+    # sentence has been removed.
     registry = ToolRegistry()
     builtin(
         registry,
@@ -541,9 +547,7 @@ def test_known_registry_target_state_claim_requires_a_relevant_call():
     client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Is Spotify open?")) == [
-        "I did not actually do that - I have no tool result. Want me to?"
-    ]
+    assert asyncio.run(collect(brain, "Is Spotify open?")) == [reply]
 
 
 def test_unrelated_ok_read_does_not_license_failed_open_claim():
@@ -557,12 +561,12 @@ def test_unrelated_ok_read_does_not_license_failed_open_claim():
             content=[tool_block(name="open", arguments={"target": "spotify"})],
             stop_reason="tool_use",
         ),
-        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+        FakeStream(["I opened Spotify."], content=[text_block("I opened Spotify.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
     assert asyncio.run(collect(brain, "Read the note, then open Spotify")) == [
-        "I did not actually do that - I have no tool result. Want me to?"
+        "I did not actually do that - I have no tool result. Want me to? "
     ]
 
 
@@ -576,12 +580,12 @@ def test_cancel_pending_does_not_license_open_claim():
         expires=float("inf"),
     )
     client = FakeClient(
-        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+        FakeStream(["I opened Spotify."], content=[text_block("I opened Spotify.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
     assert asyncio.run(collect(brain, "no")) == [
-        "I did not actually do that - I have no tool result. Want me to?"
+        "I did not actually do that - I have no tool result. Want me to? "
     ]
 
 
@@ -590,17 +594,17 @@ def test_cancel_pending_does_not_license_open_claim():
     [
         (
             "No problem, I opened Spotify.",
-            "I did not actually do that - I have no tool result. Want me to?",
+            "I did not actually do that - I have no tool result. Want me to? ",
         ),
         ("I did not open Spotify.", "I did not open Spotify."),
         (
             "I couldn't open X, but I opened Y.",
-            "I did not actually do that - I have no tool result. Want me to?",
+            "I did not actually do that - I have no tool result. Want me to? ",
         ),
         ("I couldn't open Spotify.", "I couldn't open Spotify."),
         (
             "The task is done.",
-            "I did not actually do that - I have no tool result. Want me to?",
+            "I did not actually do that - I have no tool result. Want me to? ",
         ),
     ],
 )
@@ -609,6 +613,31 @@ def test_action_claim_negation_is_clause_local(reply, expected):
     brain = Brain(client, FakeRegistry(), model="fast", persona="")
 
     assert "".join(asyncio.run(collect(brain, "Help me"))) == expected
+
+
+def test_done_glued_to_a_short_sentence_is_still_delayed_and_substituted():
+    # Item 1 fix: _sentence_end (brain.py) refuses a boundary on "Done." (5
+    # stripped chars, under the 12-char minimum), so it glues to the next
+    # sentence inside the same chunk. delayed() must match _PATTERNS["done"]
+    # per sentence within the chunk, not against the whole (now longer)
+    # chunk -- otherwise this glued "Done." is never held and streams
+    # verbatim after a failed tool call.
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(
+            ["Done. I will keep an eye on that for you."],
+            content=[text_block("Done. I will keep an eye on that for you.")],
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == [
+        "I did not actually do that - I have no tool result. Want me to? "
+    ]
 
 
 @pytest.mark.parametrize(
@@ -702,7 +731,14 @@ def test_capability_text_is_stable_across_snapshot_permutations():
     assert brain_mod._capability_system_text(list(reversed(schemas)), states[1:] + states[:1]) == expected
 
 
-def test_refusal_of_registered_capability_is_suppressed(caplog):
+def test_refusal_sentence_streams_through_undelayed_and_unchanged(caplog):
+    # The host must NEVER fabricate "I can do that with X - shall I?" (item 1):
+    # the capability-refusal substitution is gone, so a refusal-shaped
+    # sentence is not an action claim, is never held by guard.delayed(), and
+    # streams through verbatim -- even when a matching tool is registered.
+    # Item 7: detection is kept (markers + route check against registered
+    # tool names) purely to log a bounded, tool-name-only WARNING -- that
+    # log is the only observable signal of a false capability refusal.
     registry = ToolRegistry()
     registry.register(registry_tool(
         "open_folder",
@@ -712,10 +748,43 @@ def test_refusal_of_registered_capability_is_suppressed(caplog):
     client = FakeClient(FakeStream([refusal], content=[text_block(refusal)]))
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "open my kb folder")) == [
-        "I can do that with open_folder - shall I?",
-    ]
+    assert asyncio.run(collect(brain, "open my kb folder")) == [refusal]
     assert "available capability refusal suppressed (tool=open_folder)" in caplog.text
+
+
+@pytest.mark.parametrize("refusal", [
+    "I can't do that right now.",
+    "I don't have access to that.",
+    "I'm unable to reach that folder.",
+])
+def test_refusal_sentences_are_never_delayed(refusal):
+    assert ClaimGuard().delayed(refusal) is False
+
+
+def test_delayed_distinguishes_state_description_from_attributed_claim():
+    guard = ClaimGuard()
+    assert guard.delayed("Spotify's open.") is False
+    assert guard.delayed("I opened Spotify.") is True
+
+
+def test_successful_open_evidence_licenses_started_but_not_played():
+    # Item 4 (boss amendment): a successful `open` licenses "I've started
+    # Spotify" -- before this, the guard falsely called a successful open a
+    # lie. But a successful open launches; it does not play. "I played the
+    # song." backed by open alone must still fail evaluation -- the plan
+    # asked for both associations; the plan was wrong.
+    guard = ClaimGuard()
+    evidence = [("open", True)]
+    assert guard.evaluate("I started Spotify.", evidence) == "I started Spotify."
+    assert guard.evaluate("I played the song.", evidence) == UNBACKED_ACTION_REPLY
+
+
+def test_host_speech_constants_end_in_whitespace():
+    # Word-boundary contract (worker/sanitize.py:1-4): a host-emitted constant
+    # that gets concatenated with a following streamed chunk must supply its own
+    # trailing word boundary.
+    for constant in (TIMEOUT_REPLY, PROVIDER_REPLY, UNBACKED_ACTION_REPLY):
+        assert constant[-1].isspace(), constant
 
 
 def test_ambient_context_reaches_provider_taints_tools_and_is_not_remembered():
@@ -1350,12 +1419,18 @@ def test_streamed_text_is_yielded_before_tool_runs():
 
 
 def test_claim_sentence_waits_while_safe_sentence_streams_first():
+    # Item 2 (order preservation): once anything has been held, every later
+    # chunk is held too, so held chunks re-emit contiguously instead of
+    # letting a later safe sentence ("It's playing now.") leak out live
+    # ahead of the still-pending verdict for the held claim. Item 3: the
+    # rebuttal for the held claim is emitted LAST, after the passing
+    # sentence that followed it in the model's own text.
     seen: list[str] = []
     registry = FakeRegistry(ToolResult("error", "could not open"))
     registry.when_called = lambda: seen.append("called")
     client = FakeClient(
         FakeStream(
-            ["Let me check. ", "I opened Spotify."],
+            ["Let me check. ", "I opened Spotify. ", "It's playing now."],
             content=[tool_block(name="open", arguments={"target": "spotify"})],
             stop_reason="tool_use",
         ),
@@ -1372,8 +1447,183 @@ def test_claim_sentence_waits_while_safe_sentence_streams_first():
 
     first, rest = asyncio.run(scenario())
     assert first == "Let me check. "
-    assert rest == ["I did not actually do that - I have no tool result. Want me to?"]
+    assert rest == [
+        "It's playing now.",
+        " I did not actually do that - I have no tool result. Want me to? ",
+    ]
     assert seen == ["called"]
+    # Full output must match model order with clean word boundaries -- no
+    # jammed "a.B" joins from a dropped or misplaced space.
+    assert first + "".join(rest) == (
+        "Let me check. It's playing now. I did not actually do that - "
+        "I have no tool result. Want me to? "
+    )
+
+
+def test_main_loop_stream_classification_order_preserved_for_a_later_safe_sentence():
+    # Item 2, site C (brain.py's main tool-loop stream classification): a
+    # SUCCESSFUL tool result means no substitution and no item-3 reordering,
+    # so this isolates pure classification-order-preservation -- a passing
+    # sentence after a held claim must not leak out live ahead of it.
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            ["Let me check. ", "I opened Spotify. ", "It's playing now."],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == [
+        "Let me check. ",
+        "I opened Spotify. ",
+        "It's playing now.",
+    ]
+
+
+def test_main_loop_buffer_flush_order_preserved_without_terminal_punctuation():
+    # Item 2, site D (brain.py's final buffer flush): a reply with no
+    # terminal punctuation on its last sentence never forms a chunk via
+    # split_spoken and is only seen at the post-loop "if buffer:" flush.
+    # SUCCESSFUL evidence avoids item 3's reorder so this isolates the flush
+    # site's own order-preservation.
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            ["I opened Spotify. ", "It is playing now"],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == [
+        "I opened Spotify. ",
+        "It is playing now",
+    ]
+
+
+def test_narration_stream_order_preserved_for_failed_confirm():
+    # Item 2, site A (brain.py's confirm/narration-path stream
+    # classification): a failed confirm's narration streams a claim, then a
+    # reassurance -- the reassurance must not leak out live ahead of the
+    # still-pending claim's verdict. Unlike the main loop, the confirm-path
+    # tail does not reorder (item 3 applies only to the main loop -- see its
+    # test), so the caveat must precede the reassurance in plain stream
+    # order here.
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    registry._pending = PendingAction(
+        confirm_id="confirm-123",
+        name="open",
+        arguments={"target": "spotify"},
+        summary="open Spotify",
+        expires=float("inf"),
+    )
+    client = FakeClient(
+        FakeStream(
+            ["I opened Spotify. ", "Everything is ready for you now."],
+            content=[text_block("I opened Spotify. Everything is ready for you now.")],
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "confirm")) == [
+        "I did not actually do that - I have no tool result. Want me to? ",
+        "Everything is ready for you now.",
+    ]
+
+
+def test_narration_buffer_flush_order_preserved_without_terminal_punctuation():
+    # Item 2, site B (brain.py's confirm/narration-path buffer flush): the
+    # reassurance has no terminal punctuation, so it is only seen at that
+    # path's own "if buffer:" flush, not the stream classification loop.
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    registry._pending = PendingAction(
+        confirm_id="confirm-123",
+        name="open",
+        arguments={"target": "spotify"},
+        summary="open Spotify",
+        expires=float("inf"),
+    )
+    client = FakeClient(
+        FakeStream(
+            ["I opened Spotify. ", "Everything is ready for you now"],
+            content=[text_block("I opened Spotify. Everything is ready for you now")],
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "confirm")) == [
+        "I did not actually do that - I have no tool result. Want me to? ",
+        "Everything is ready for you now",
+    ]
+
+
+def test_substitution_is_the_final_yielded_chunk_when_later_chunks_pass():
+    # Item 3: the substitution (the host's rebuttal) must be the last thing
+    # spoken, even when multiple held chunks after the unbacked claim each
+    # pass evaluation individually -- a buried rebuttal followed by more
+    # (falsely reassuring) sentences is exactly the bug being fixed.
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    client = FakeClient(
+        FakeStream(
+            [
+                "I opened Spotify. ",
+                "It is playing music now. ",
+                "Everything is ready for you now.",
+            ],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    result = asyncio.run(collect(brain, "Open Spotify"))
+
+    assert result == [
+        "It is playing music now. ",
+        "Everything is ready for you now.",
+        " I did not actually do that - I have no tool result. Want me to? ",
+    ]
+    assert result[-1].strip() == UNBACKED_ACTION_REPLY.strip()
+
+
+def test_history_remembers_only_the_prefix_actually_yielded_when_closed_mid_flush():
+    # Item 5: a barge-in that closes the generator partway through the final
+    # flush must not remember sentences Daniel never heard. All three
+    # sentences are held (the first is a claim, the rest follow it), so
+    # nothing streams live and the whole reply is only produced by the
+    # flush's try/finally -- closing after the first item proves history
+    # reflects only what was actually yielded.
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(
+            ["I opened Spotify. ", "It's playing now. ", "Enjoy the music."],
+            content=[text_block("I opened Spotify. It's playing now. Enjoy the music.")],
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        iterator = brain.respond("do three things")
+        first = await anext(iterator)
+        await iterator.aclose()
+        return first
+
+    first = asyncio.run(scenario())
+    assert first == "I opened Spotify. "
+    assert brain._history == [
+        {"role": "user", "content": "do three things"},
+        {"role": "assistant", "content": "I opened Spotify. "},
+    ]
 
 
 def test_fifth_model_round_disables_tools():
@@ -1437,7 +1687,7 @@ def test_model_call_timeout_returns_only_fixed_sentence():
         turn_ceiling_s=0.1,
     )
 
-    assert asyncio.run(collect(brain, "hello")) == ["I lost that one to a timeout. Still here."]
+    assert asyncio.run(collect(brain, "hello")) == ["I lost that one to a timeout. Still here. "]
     assert brain._history == []
 
 
@@ -1460,7 +1710,7 @@ def test_turn_ceiling_covers_tool_rounds():
     )
 
     assert asyncio.run(collect(brain, "loop")) == [
-        "I lost that one to a timeout. Still here.",
+        "I lost that one to a timeout. Still here. ",
     ]
 
 
@@ -1471,7 +1721,7 @@ def test_provider_exception_is_sanitized(caplog):
     client = FakeClient(ProviderFailure("private token must not escape"))
     brain = Brain(client, FakeRegistry(), model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
+    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here. "]
     assert "status=500" in caplog.text
     assert "private token" not in caplog.text
     assert "detail=n/a" in caplog.text
@@ -1493,7 +1743,7 @@ def test_provider_exception_detail_surfaces_bounded_api_error_message(caplog):
     client = FakeClient(ProviderFailure(long_message))
     brain = Brain(client, FakeRegistry(), model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
+    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here. "]
     assert "status=400" in caplog.text
     assert len(long_message) > 120
     assert f"detail={long_message[:120]}" in caplog.text
@@ -1515,7 +1765,7 @@ def test_provider_exception_message_is_ignored_without_int_status_code(caplog):
     client = FakeClient(NotAnApiError("must not leak into detail"))
     brain = Brain(client, FakeRegistry(), model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
+    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here. "]
     assert "status=unknown" in caplog.text
     assert "detail=n/a" in caplog.text
     assert "must not leak into detail" not in caplog.text
