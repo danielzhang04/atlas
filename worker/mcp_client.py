@@ -841,11 +841,16 @@ class McpServers:
             call_arguments = _normalize_recipients(call_arguments, account_value)
             call_arguments.pop(account_param, None)
             call_arguments[account_param] = account_value
-        result = await session.call_tool(
-            tool,
-            arguments=call_arguments,
-            read_timeout_seconds=timedelta(seconds=timeout_s),
-        )
+        try:
+            result = await session.call_tool(
+                tool,
+                arguments=call_arguments,
+                read_timeout_seconds=timedelta(seconds=timeout_s),
+            )
+        except ValueError:
+            # pydantic ValidationError subclasses ValueError; a malformed remote
+            # payload must not surface remote text through the ValueError path.
+            raise McpToolError("malformed MCP response") from None
         text = "".join(
             block.text
             for block in result.content

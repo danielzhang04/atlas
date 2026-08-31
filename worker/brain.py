@@ -10,7 +10,13 @@ from typing import Any, Protocol
 
 from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
-from .tools import PendingAction, ToolRegistry, ToolResult, api_incompatible_tool_names
+from .tools import (
+    PendingAction,
+    ToolRegistry,
+    ToolResult,
+    _CONTROL_CHARACTERS,
+    api_incompatible_tool_names,
+)
 
 
 
@@ -673,7 +679,10 @@ class Brain:
             # int status_code), so an unrelated future dependency's .message
             # attribute never becomes an uncontrolled log sink.
             message = getattr(exc, "message", None) if has_status_code else None
-            detail = message[:120] if isinstance(message, str) else "n/a"
+            detail = (
+                _CONTROL_CHARACTERS.sub("", message)[:120]
+                if isinstance(message, str) else "n/a"
+            )
             logger.warning(
                 "conversation model request failed (type=%s, status=%s, detail=%s)",
                 type(exc).__name__,
