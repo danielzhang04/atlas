@@ -48,6 +48,7 @@ _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
 _TRUNCATED = "...[truncated]"
 _DESKTOP_DELETE_CHORDS = ("delete", "ctrl+d", "ctrl+x", "shift+delete")
+_OPEN_DEDUPE_WINDOW_S = 15.0
 _DESKTOP_ALLOWED_CHORDS = frozenset({
     "alt+tab", "backspace", "ctrl+a", "ctrl+c", "ctrl+f", "ctrl+l", "ctrl+p",
     "ctrl+s", "ctrl+t", "ctrl+v", "ctrl+w", "ctrl+y", "ctrl+z", "down", "end",
@@ -399,12 +400,23 @@ def builtin(
     paired_url: Callable[[], str | None] | None = None,
     files: LocalFiles | None = None,
     desktop: Any | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     aliases = _aliases(apps)
     registry._configure_open_aliases(aliases)
+    recent_web_opens: dict[str, float] = {}
 
     def desktop_api() -> Any:
         return desktop if desktop is not None else _desktopcontrol()
+
+    def open_web(name: str, url: str) -> dict:
+        now = clock()
+        last = recent_web_opens.get(name)
+        recent_web_opens[name] = now
+        if last is not None and now - last < _OPEN_DEDUPE_WINDOW_S:
+            return {"opened": name, "via": "web", "already": True}
+        opener(url)
+        return {"opened": name, "via": "web"}
 
     async def open_target(arguments: dict) -> ToolResult | dict:
         target = _text_argument(arguments, "target", maximum=2048)
@@ -417,7 +429,7 @@ def builtin(
                 except desktopapps.DesktopAppError:
                     if app.url is None:
                         raise
-                    opener(app.url)
+                    return open_web(name, app.url)
                 else:
                     if (
                         isinstance(opened, Mapping)
@@ -425,12 +437,12 @@ def builtin(
                         and opened.get("existing") is True
                     ):
                         return ToolResult("ok", "focused existing window")
+                    return {"opened": name, "via": "desktop"}
             elif app.url is not None:
                 dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
-                opener(dynamic_url or app.url)
+                return open_web(name, dynamic_url or app.url)
             else:
                 return ToolResult("error", "unknown app")
-            return {"opened": name}
         if _direct_https(target):
             opener(target)
             return {"opened": target}
@@ -585,7 +597,7 @@ def builtin(
             return ToolResult("error", "focused window changed; delete not executed")
 
     definitions = (
-        ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
+        ("open", _open_description(aliases), {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
         ("launch_work", "Launch longer work in the background.", {
             "title": {"type": "string"}, "brief": {"type": "string"},
@@ -785,6 +797,22 @@ def _aliases(apps: Mapping[str, AppEntry]) -> dict[str, tuple[str, AppEntry]]:
                 raise ValueError(f"duplicate app alias: {word}")
             aliases[folded] = (name, app)
     return aliases
+
+
+_OPEN_DESCRIPTION_NAME_LIMIT = 60
+
+
+def _open_description(aliases: Mapping[str, tuple[str, AppEntry]]) -> str:
+    names = sorted({name for name, _ in aliases.values()})
+    listed = ", ".join(names[:_OPEN_DESCRIPTION_NAME_LIMIT])
+    if len(names) > _OPEN_DESCRIPTION_NAME_LIMIT:
+        listed += ", ..."
+    if not listed:
+        return "Open an allowlisted app or HTTPS URL."
+    return (
+        "Open an allowlisted app or HTTPS URL. Aliases open the real desktop app "
+        f"when configured: {listed}."
+    )
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str, *, maximum: int) -> str:
