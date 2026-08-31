@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
 
-from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
+from .claims import UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
 from .tools import (
     PendingAction,
@@ -29,8 +29,8 @@ MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
 CACHE_FLOOR_TOKENS = 4_096
 CACHE_FLOOR_MAX_CHECKS = 3
-TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
-PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
+TIMEOUT_REPLY = "I lost that one to a timeout. Still here. "
+PROVIDER_REPLY = "I couldn't reach my model just now. Still here. "
 
 _AFFIRM = frozenset({
     "confirm",
@@ -476,9 +476,7 @@ class Brain:
         spoken: list[str] = []
         guarded_chunks: list[str] = []
         tool_results: list[tuple[str, bool]] = []
-        guard = ClaimGuard(prompt, self.registry, tools)
-        if pending is not None:
-            guard.remember(pending.arguments)
+        guard = ClaimGuard(prompt, tools)
         tool_rounds = 0
         tainted = bool(context)
         host_line: str | None = None
@@ -550,7 +548,7 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
-                                        if guard.delayed(chunk):
+                                        if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
                                             spoken.append(chunk)
@@ -565,7 +563,7 @@ class Brain:
                             ok=final is not None,
                         )
                     if buffer:
-                        if guard.delayed(buffer):
+                        if guarded_chunks or guard.delayed(buffer):
                             guarded_chunks.append(buffer)
                         else:
                             spoken.append(buffer)
@@ -596,7 +594,7 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
-                                        if guard.delayed(chunk):
+                                        if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
                                             spoken.append(chunk)
@@ -636,7 +634,6 @@ class Brain:
                             tainted=tainted,
                             transcript=prompt,
                         )
-                        guard.remember(arguments)
                         tool_results.append(guard.evidence(
                             name, arguments, result.status == "ok",
                         ))
@@ -657,19 +654,36 @@ class Brain:
                     tool_rounds += 1
 
                 if buffer:
-                    if guard.delayed(buffer):
+                    if guarded_chunks or guard.delayed(buffer):
                         guarded_chunks.append(buffer)
                     else:
                         spoken.append(buffer)
                         yield buffer
+                verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
                 final_chunks = [
-                    verdict for chunk in guarded_chunks
-                    if (verdict := guard.evaluate(chunk, tool_results)) is not None
+                    verdict for verdict in verdicts
+                    if verdict is not None and verdict is not UNBACKED_ACTION_REPLY
                 ]
-                spoken.extend(final_chunks)
-                self._remember(prompt, "".join(spoken))
-                for chunk in final_chunks:
-                    yield chunk
+                # Item 3: the rebuttal is always the last word. Sentences that
+                # passed evaluation after the unbacked claim move ahead of it
+                # here; further unbacked claims after the first are dropped
+                # by ClaimGuard.evaluate (see its comment) rather than spoken
+                # again. Re-establish the word-boundary space at this new
+                # seam when the last passing chunk did not already end in
+                # whitespace -- it may be the model's true final sentence
+                # and so never had one to begin with.
+                if any(verdict is UNBACKED_ACTION_REPLY for verdict in verdicts):
+                    boundary = "" if not final_chunks or final_chunks[-1][-1:].isspace() else " "
+                    final_chunks.append(boundary + UNBACKED_ACTION_REPLY)
+                try:
+                    for chunk in final_chunks:
+                        spoken.append(chunk)
+                        yield chunk
+                finally:
+                    # Item 5: record only what was actually yielded, so a
+                    # generator closed mid-flush (barge-in) remembers just
+                    # the spoken prefix, not sentences Daniel never heard.
+                    self._remember(prompt, "".join(spoken))
         except TimeoutError:
             yield host_line or TIMEOUT_REPLY
         except Exception as exc:
