@@ -14,6 +14,8 @@ from worker.tools import (
     Tool,
     ToolRegistry,
     ToolResult,
+    _desktop_arguments,
+    api_incompatible_tool_names,
     builtin,
     load_apps,
     register_count_mail,
@@ -405,6 +407,103 @@ def test_desktop_tools_have_typed_schemas_and_required_policies():
     ]
     assert "ctrl+x" not in schemas["press_keys"]["properties"]["chord"]["enum"]
     assert "backspace" in schemas["press_keys"]["properties"]["chord"]["enum"]
+
+    # The Anthropic Messages API rejects a tool input_schema with a
+    # top-level oneOf/allOf/anyOf. None of the desktop-control schemas may
+    # use that shape, including the two (focus_window, window_action) whose
+    # "exactly one of title or pid" constraint used to be expressed with it.
+    desktop_names = (
+        "list_windows", "focus_window", "window_action", "media_key",
+        "click", "type_text", "press_keys", "press_delete",
+    )
+    for name in desktop_names:
+        schema = schemas[name]
+        assert "oneOf" not in schema
+        assert "allOf" not in schema
+        assert "anyOf" not in schema
+    descriptions = {
+        item["name"]: item["description"] for item in registry.schemas()
+    }
+    for name in ("focus_window", "window_action"):
+        assert "exactly one of title or pid" in descriptions[name]
+    # No top-level required for the title/pid pair (unexpressable as XOR);
+    # window_action's own "action" requirement is still surfaced.
+    assert "required" not in schemas["focus_window"]
+    assert schemas["window_action"]["required"] == ["action"]
+    assert schemas["media_key"]["required"] == ["key"]
+    assert schemas["click"]["required"] == ["x", "y"]
+    assert schemas["type_text"]["required"] == ["text"]
+    assert schemas["press_keys"]["required"] == ["chord"]
+    assert api_incompatible_tool_names(registry.schemas()) == []
+
+
+def test_api_incompatible_tool_names_flags_top_level_oneof_allof_anyof():
+    schemas = [
+        {"name": "clean", "input_schema": {"type": "object", "properties": {}}},
+        {"name": "has_oneof", "input_schema": {"type": "object", "oneOf": [{}]}},
+        {"name": "has_allof", "input_schema": {"type": "object", "allOf": [{}]}},
+        {"name": "has_anyof", "input_schema": {"type": "object", "anyOf": [{}]}},
+        # Nested oneOf inside a property value is a different, API-legal
+        # shape and must not be flagged.
+        {
+            "name": "nested_only",
+            "input_schema": {
+                "type": "object",
+                "properties": {"x": {"oneOf": [{"type": "string"}]}},
+            },
+        },
+    ]
+    assert api_incompatible_tool_names(schemas) == [
+        "has_oneof", "has_allof", "has_anyof",
+    ]
+
+
+@pytest.mark.parametrize("window", ["required", "optional"])
+def test_desktop_arguments_rejects_both_title_and_pid(window):
+    # Mutation-resistant: asserts on the ValueError's own message, not just
+    # that "some exception" was raised (ToolRegistry._execute flattens every
+    # exception to an error ToolResult, so a bare status/type check would
+    # still pass even if the "not both" guard in _desktop_arguments were
+    # deleted by a mutation).
+    with pytest.raises(ValueError, match="not both"):
+        _desktop_arguments({"title": "Notepad", "pid": 101}, window=window)
+
+
+def test_desktop_arguments_rejects_missing_target_when_window_required():
+    with pytest.raises(ValueError, match="missing title or pid"):
+        _desktop_arguments({}, window="required")
+
+
+def test_desktop_arguments_allows_missing_target_when_window_optional():
+    assert _desktop_arguments({}, window="optional") == {}
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("focus_window", {}),
+    ("focus_window", {"title": "Notepad", "pid": 101}),
+    ("window_action", {"action": "maximize"}),
+    ("window_action", {"action": "maximize", "title": "Notepad", "pid": 101}),
+])
+def test_focus_and_window_action_reject_bad_targets_at_registry_call(tool, args):
+    """Registry-level companion to the direct _desktop_arguments tests above.
+
+    Asserts result.content is the specific guard message (not just
+    status == "error"), so this is distinguishable from any other exception
+    a mutated/broken tool.run might raise -- ToolRegistry._execute flattens
+    every ValueError the same way, so a test that only checked status would
+    stay green even if the title/pid XOR guard were deleted entirely.
+    """
+    desktop = _FakeDesktopControl()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+
+    result = _call(registry, tool, args)
+    assert result.status == "error"
+    expected = "provide title or pid, not both" if "pid" in args and "title" in args else (
+        "missing title or pid"
+    )
+    assert result.content == expected
+    assert desktop.calls == []
 
 
 def test_desktop_tools_resolve_targets_host_side_and_execute_instantly():
@@ -932,9 +1031,15 @@ def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
         assert json.loads(result.content) == {"opened": str(accepted.resolve())}
     assert launched == [str(root.resolve()), str(allowed.resolve())]
 
-    for refused in (outside, document):
-        result = _call(registry, "open_folder", {"path": str(refused)})
-        assert result == ToolResult("error", "ValueError")
+    # ValueError content now surfaces the host-authored message (bounded,
+    # capped at 200 chars) instead of the bare exception class name, so a
+    # retrying model gets something it can act on.
+    assert _call(registry, "open_folder", {"path": str(outside)}) == (
+        ToolResult("error", "outside roots")
+    )
+    assert _call(registry, "open_folder", {"path": str(document)}) == (
+        ToolResult("error", "not a directory")
+    )
     assert launched == [str(root.resolve()), str(allowed.resolve())]
 
 

@@ -1,23 +1,6 @@
 (root => {
   "use strict";
 
-  function hitTestQuickAction(x, y, geometry, actionCount = Number.POSITIVE_INFINITY) {
-    if (!geometry || !Array.isArray(geometry.segments)) return -1;
-    const dx = x - geometry.centerX;
-    const dy = y - geometry.centerY;
-    const radius = Math.hypot(dx, dy);
-    if (radius < geometry.innerRadius || radius > geometry.outerRadius) return -1;
-    let angle = Math.atan2(dy, dx);
-    if (angle < 0) angle += Math.PI * 2;
-    for (const segment of geometry.segments) {
-      if (segment.index >= actionCount) continue;
-      const comparable = angle < segment.start ? angle + Math.PI * 2 : angle;
-      if (comparable >= segment.start && comparable <= segment.end) return segment.index;
-    }
-    return -1;
-  }
-
-  if (root.__ATLAS_TEST__ === true) root.__atlasHitTest = hitTestQuickAction;
   if (typeof document === "undefined") return;
 
   const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
@@ -46,7 +29,6 @@
     canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
     greeting: document.querySelector("#greeting"), toolStrip: document.querySelector("#tool-strip"),
     toolAnnouncer: document.querySelector("#tool-announcer"),
-    engineStage: document.querySelector(".engine-stage"), quickActions: document.querySelector("#quick-actions"),
     textForm: document.querySelector("#text-turn-form"), textInput: document.querySelector("#text-turn-input"),
     pendingCard: document.querySelector("#pending-confirmation"), pendingText: document.querySelector("#pending-confirmation-text"),
     audioLine: document.querySelector("#audio-line"), transcript: document.querySelector("#transcript"),
@@ -66,7 +48,7 @@
   let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
   let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
   let greetingTimer = 0, userName = "", activeToolIdentity = "";
-  let quickActionSignature = "", quickActions = [], pendingDismissTimer = 0, pendingDismissEnd = null;
+  let pendingDismissTimer = 0, pendingDismissEnd = null;
   const pendingRequests = new Set();
   const eventsByJob = new Map();
   const resultsByJob = new Map();
@@ -170,13 +152,6 @@
     const INPUT_BANDS = 24;
     const PARTICLE_COUNT = 42;
     const TAU = Math.PI * 2;
-    const OUTER_SEGMENT_COUNT = 14;
-    const OUTER_SEGMENT_RADIUS = .417;
-    const outerSegments = Array.from({length: OUTER_SEGMENT_COUNT}, (_value, index) => {
-      const start = index / OUTER_SEGMENT_COUNT * TAU;
-      const length = TAU / OUTER_SEGMENT_COUNT * (.48 + (index % 3) * .08);
-      return {index, start, end: start + length, middle: start + length / 2};
-    });
     const palettes = {
       ASLEEP: {
         primary: [105, 119, 137], secondary: [139, 151, 166], core: [114, 130, 148],
@@ -249,11 +224,6 @@
     let majorTickPath = new Path2D();
     let minorTickPath = new Path2D();
     let innerSegmentPath = new Path2D();
-    let outerSegmentPath = new Path2D();
-    let outerSegmentPaths = [];
-    let quickActionHover = -1;
-    let quickActionFlash = -1;
-    let quickActionFlashUntil = 0;
 
     for (let index = 0; index < BAR_COUNT; index += 1) {
       const angle = -Math.PI / 2 + index * TAU / BAR_COUNT;
@@ -347,17 +317,6 @@
       }
 
       innerSegmentPath = new Path2D();
-      outerSegmentPath = new Path2D();
-      outerSegmentPaths = outerSegments.map((segment) => {
-        const path = new Path2D();
-        path.moveTo(
-          Math.cos(segment.start) * OUTER_SEGMENT_RADIUS * scale,
-          Math.sin(segment.start) * OUTER_SEGMENT_RADIUS * scale,
-        );
-        path.arc(0, 0, OUTER_SEGMENT_RADIUS * scale, segment.start, segment.end);
-        outerSegmentPath.addPath(path);
-        return path;
-      });
       for (let index = 0; index < 18; index += 1) {
         const start = index / 18 * TAU;
         const length = TAU / 18 * (.62 + (index % 3) * .08);
@@ -516,19 +475,6 @@
       const speed = .000035 + motion[0] * .00016;
       const visibility = visualState === "OFFLINE" ? .16 : 1;
       context.lineCap = "round";
-      context.save();
-      context.translate(centerX, centerY);
-      context.lineWidth = Math.max(.75, scale * .0032);
-      context.strokeStyle = colorString(primaryColor, (.22 + motion[1] * .3) * visibility);
-      context.stroke(outerSegmentPath);
-      const activeIndex = now < quickActionFlashUntil ? quickActionFlash : quickActionHover;
-      if (activeIndex >= 0 && outerSegmentPaths[activeIndex]) {
-        context.lineWidth = Math.max(1.5, scale * .006);
-        context.strokeStyle = colorString(secondaryColor, .82 * visibility);
-        context.stroke(outerSegmentPaths[activeIndex]);
-      }
-      context.restore();
-
       context.save();
       context.translate(centerX, centerY);
       context.rotate(-now * speed * 1.32);
@@ -733,26 +679,6 @@
       animationFrame = 0;
     }
 
-    function quickActionGeometry() {
-      return {
-        centerX,
-        centerY,
-        innerRadius: .385 * scale,
-        outerRadius: .45 * scale,
-        labelRadius: .417 * scale,
-        segments: outerSegments.map((segment) => ({...segment})),
-      };
-    }
-
-    function setQuickActionHover(index) {
-      quickActionHover = Number.isInteger(index) ? index : -1;
-    }
-
-    function flashQuickAction(index) {
-      quickActionFlash = Number.isInteger(index) ? index : -1;
-      quickActionFlashUntil = performance.now() + 420;
-    }
-
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver(resize);
       observer.observe(canvas);
@@ -765,23 +691,10 @@
     canvas.dataset.frameMaxMs = "0.000";
     canvas.dataset.animation = "paused";
     window.__atlasEngineMetrics = metrics;
-    return {
-      setSignal, setState, start, stop, quickActionGeometry, setQuickActionHover, flashQuickAction,
-    };
+    return {setSignal, setState, start, stop};
   }
 
   const engine = createEngine(refs.canvas);
-  root.__atlasEngineGeometry = {snapshot: () => engine.quickActionGeometry()};
-
-  function positionQuickActions() {
-    const geometry = engine.quickActionGeometry();
-    refs.quickActions.querySelectorAll(".quick-action").forEach((button) => {
-      const segment = geometry.segments[Number(button.dataset.index)];
-      if (!segment) return;
-      button.style.left = `${geometry.centerX + Math.cos(segment.middle) * geometry.labelRadius}px`;
-      button.style.top = `${geometry.centerY + Math.sin(segment.middle) * geometry.labelRadius}px`;
-    });
-  }
 
   function showPendingConfirmation(readback) {
     if (pendingDismissTimer) window.clearTimeout(pendingDismissTimer);
@@ -821,81 +734,6 @@
     } else {
       hidePendingConfirmation();
     }
-  }
-
-  async function activateQuickAction(index) {
-    if (!Number.isInteger(index) || index < 0 || index >= quickActions.length) return;
-    if (!actionToken) {
-      showPendingConfirmation("Pair Atlas before running quick actions.");
-      return;
-    }
-    const button = refs.quickActions.querySelector(`[data-index="${index}"]`);
-    if (button) button.disabled = true;
-    try {
-      const payload = await authenticatedJson("/actions/quick", {
-        method: "POST",
-        headers: {"content-type": "application/json"},
-        body: JSON.stringify({index}),
-      });
-      if (!payload) return;
-      engine.flashQuickAction(index);
-      if (button) {
-        button.classList.remove("is-flashing");
-        void button.offsetWidth;
-        button.classList.add("is-flashing");
-      }
-      renderPendingConfirmation(payload.pending);
-    } catch (_error) {
-      showPendingConfirmation("Quick action unavailable.");
-    } finally {
-      if (button) button.disabled = false;
-    }
-  }
-
-  function renderQuickActions(actions) {
-    const safeActions = Array.isArray(actions)
-      ? actions.filter((action) => isRecord(action) && typeof action.label === "string").slice(0, 14)
-      : [];
-    const signature = JSON.stringify(safeActions);
-    if (signature === quickActionSignature) return;
-    quickActionSignature = signature;
-    quickActions = safeActions;
-    refs.quickActions.replaceChildren();
-    safeActions.forEach((action, index) => {
-      const button = node("button", "quick-action", action.label);
-      button.type = "button";
-      button.dataset.index = String(index);
-      button.setAttribute("aria-label", `Quick action: ${action.label}`);
-      button.addEventListener("mouseenter", () => engine.setQuickActionHover(index));
-      button.addEventListener("mouseleave", () => engine.setQuickActionHover(-1));
-      button.addEventListener("focus", () => engine.setQuickActionHover(index));
-      button.addEventListener("blur", () => engine.setQuickActionHover(-1));
-      button.addEventListener("click", () => activateQuickAction(index));
-      refs.quickActions.append(button);
-    });
-    positionQuickActions();
-  }
-
-  function canvasQuickActionIndex(event) {
-    const bounds = refs.canvas.getBoundingClientRect();
-    return hitTestQuickAction(
-      event.clientX - bounds.left,
-      event.clientY - bounds.top,
-      engine.quickActionGeometry(),
-      quickActions.length,
-    );
-  }
-
-  refs.canvas.addEventListener("pointermove", (event) => {
-    engine.setQuickActionHover(canvasQuickActionIndex(event));
-  });
-  refs.canvas.addEventListener("pointerleave", () => engine.setQuickActionHover(-1));
-  refs.canvas.addEventListener("click", (event) => activateQuickAction(canvasQuickActionIndex(event)));
-  if (typeof ResizeObserver === "function") {
-    const quickActionObserver = new ResizeObserver(positionQuickActions);
-    quickActionObserver.observe(refs.engineStage);
-  } else {
-    window.addEventListener("resize", positionQuickActions);
   }
 
   refs.textForm.addEventListener("submit", async (event) => {
@@ -1087,7 +925,6 @@
         renderTool(payload.state, payload.tool);
         renderGreeting(payload.user);
         renderTranscript(payload.transcript);
-        renderQuickActions(payload.quick_actions);
         renderVoice(payload);
         renderAudio(payload.audio);
       } catch (_error) {
