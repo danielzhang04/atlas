@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
 
-from .claims import UNBACKED_ACTION_REPLY, ClaimGuard
+from .claims import FAILED_ATTEMPT_REPLY, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
 from .tools import (
     PendingAction,
@@ -27,8 +27,13 @@ logger = logging.getLogger("atlas.brain")
 
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
-CACHE_FLOOR_TOKENS = 4_096
+# Minimum cacheable prefix is model-dependent: 4096 tokens on Haiku-class
+# models, 1024 on Sonnet/Opus-class. Measured prefix on the sonnet-5 lane is
+# ~3.8k, so the haiku floor would false-alarm on every run.
+_CACHE_FLOOR_BY_MODEL = {"claude-haiku-4-5": 4_096}
+CACHE_FLOOR_TOKENS_DEFAULT = 1_024
 CACHE_FLOOR_MAX_CHECKS = 3
+CACHE_FLOOR_PROBE_MESSAGE = {"role": "user", "content": "hi"}
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here. "
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here. "
 
@@ -175,6 +180,26 @@ def split_spoken(buffer: str) -> tuple[list[str], str]:
         chunks.append(chunk)
         remainder = remainder[end:]
     return chunks, remainder
+
+
+def _substitution_last(verdicts: list[str | None], rebuttal: str) -> list[str]:
+    """Order a held flush so the host's rebuttal is always the last word.
+
+    Item 3: sentences that passed evaluation AFTER an unbacked claim move ahead
+    of the rebuttal; further unbacked claims after the first are dropped by
+    ClaimGuard.evaluate (see its comment) rather than spoken again. The
+    word-boundary space is re-established at this new seam when the last
+    passing chunk does not already end in whitespace -- it may be the model's
+    true final sentence and so never had one to begin with.
+    """
+    ordered = [
+        verdict for verdict in verdicts
+        if verdict is not None and verdict is not UNBACKED_ACTION_REPLY
+    ]
+    if any(verdict is UNBACKED_ACTION_REPLY for verdict in verdicts):
+        boundary = "" if not ordered or ordered[-1][-1:].isspace() else " "
+        ordered.append(boundary + rebuttal)
+    return ordered
 
 
 def _field(block: Any, name: str) -> Any:
@@ -385,14 +410,20 @@ class Brain:
                 model=self.model,
                 system=[cached_system],
                 tools=tools,
-                messages=[],
+                # count_tokens 400s on an empty messages list on every model,
+                # so the Y1 floor check silently never ran. One minimal user
+                # message makes the request valid; it costs a couple of tokens
+                # against a 4096-token floor and is not part of the cached
+                # prefix being measured.
+                messages=[CACHE_FLOOR_PROBE_MESSAGE],
             )
             tokens = _field(result, "input_tokens")
             if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
                 raise ValueError("invalid token count")
             if generation != self._snapshot_generation:
                 return
-            self.cache_floor_ok = tokens >= CACHE_FLOOR_TOKENS
+            floor = _CACHE_FLOOR_BY_MODEL.get(self.model, CACHE_FLOOR_TOKENS_DEFAULT)
+            self.cache_floor_ok = tokens >= floor
             if not self.cache_floor_ok:
                 logger.warning("prompt cache floor unmet: %d tokens", tokens)
         except asyncio.CancelledError:
@@ -553,6 +584,10 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
+                                        # Item 7 log runs for every chunk: the
+                                        # hold short-circuit below used to mute
+                                        # it for the rest of the turn.
+                                        guard.observe(chunk)
                                         if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
@@ -568,6 +603,7 @@ class Brain:
                             ok=final is not None,
                         )
                     if buffer:
+                        guard.observe(buffer)
                         if guarded_chunks or guard.delayed(buffer):
                             guarded_chunks.append(buffer)
                         else:
@@ -575,10 +611,19 @@ class Brain:
                             yield buffer
                     if not spoken and not guarded_chunks:
                         guarded_chunks.append(host_line)
-                    for chunk in guarded_chunks:
-                        verdict = guard.evaluate(chunk, tool_results)
-                        if verdict is not None:
-                            yield verdict
+                    verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
+                    # The narration flush substituted IN PLACE, so a rebuttal
+                    # landed mid-reply and the reassurance after it was spoken
+                    # last ("I did not actually do that - ... Want me to? It
+                    # failed though."). Same ordering as the main flush; and
+                    # when the host really did attempt the action and it
+                    # failed, the offer variant is wrong -- it was tried.
+                    attempted_and_failed = any(not ok for _name, ok in tool_results)
+                    for chunk in _substitution_last(
+                        verdicts,
+                        FAILED_ATTEMPT_REPLY if attempted_and_failed else UNBACKED_ACTION_REPLY,
+                    ):
+                        yield chunk
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
@@ -599,6 +644,10 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
+                                        # Item 7 log runs for every chunk: the
+                                        # hold short-circuit below used to mute
+                                        # it for the rest of the turn.
+                                        guard.observe(chunk)
                                         if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
@@ -657,29 +706,27 @@ class Brain:
                         {"role": "user", "content": results},
                     ))
                     tool_rounds += 1
+                    # Seam between tool rounds: split_spoken only carries
+                    # whitespace the model actually streamed, so a round that
+                    # ended on its last sentence leaves no trailing space and
+                    # the next round's first chunk glues onto it
+                    # ("...for you.Music's playing."). Seed one boundary space
+                    # into the buffer; sanitize's _MULTISPACE collapses it if
+                    # the next round opens with its own space.
+                    if not buffer:
+                        emitted = (guarded_chunks or spoken or [""])[-1]
+                        if emitted and not emitted[-1].isspace():
+                            buffer = " "
 
-                if buffer:
+                if buffer.strip():
+                    guard.observe(buffer)
                     if guarded_chunks or guard.delayed(buffer):
                         guarded_chunks.append(buffer)
                     else:
                         spoken.append(buffer)
                         yield buffer
                 verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
-                final_chunks = [
-                    verdict for verdict in verdicts
-                    if verdict is not None and verdict is not UNBACKED_ACTION_REPLY
-                ]
-                # Item 3: the rebuttal is always the last word. Sentences that
-                # passed evaluation after the unbacked claim move ahead of it
-                # here; further unbacked claims after the first are dropped
-                # by ClaimGuard.evaluate (see its comment) rather than spoken
-                # again. Re-establish the word-boundary space at this new
-                # seam when the last passing chunk did not already end in
-                # whitespace -- it may be the model's true final sentence
-                # and so never had one to begin with.
-                if any(verdict is UNBACKED_ACTION_REPLY for verdict in verdicts):
-                    boundary = "" if not final_chunks or final_chunks[-1][-1:].isspace() else " "
-                    final_chunks.append(boundary + UNBACKED_ACTION_REPLY)
+                final_chunks = _substitution_last(verdicts, UNBACKED_ACTION_REPLY)
                 try:
                     for chunk in final_chunks:
                         spoken.append(chunk)

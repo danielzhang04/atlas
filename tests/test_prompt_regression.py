@@ -13,8 +13,11 @@ and is not run here.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
-from tests.promptharness import ATLAS, build_recording_registry, build_system_text
+import pytest
+
+from tests.promptharness import ATLAS, Recorder, build_recording_registry, build_system_text
 from worker.tools import AppEntry, ToolRegistry, builtin
 
 
@@ -121,3 +124,72 @@ def _call(registry, name, arguments):
     import asyncio
 
     return asyncio.run(registry.call(name, arguments))
+
+
+def test_prompt_ab_desktop_stub_records_instead_of_acting(monkeypatch):
+    # F3: the script's "nothing actually launches" claim must be enforced, not
+    # asserted. The stub replaces worker.desktopcontrol in sys.modules, so the
+    # lazy importlib lookup inside worker/tools.py resolves to it.
+    import importlib
+    import sys
+
+    from scripts import prompt_ab
+
+    monkeypatch.setitem(
+        sys.modules, "worker.desktopcontrol",
+        importlib.import_module("worker.desktopcontrol"),
+    )
+    recorder = Recorder()
+    stub = prompt_ab.install_desktop_stub(recorder)
+
+    assert importlib.import_module("worker.desktopcontrol") is stub
+    assert stub.media_key("play_pause") == {"stubbed": True}
+    assert stub.normalize_chord(" Ctrl + C ") == "ctrl+c"
+    with pytest.raises(AttributeError):
+        stub.some_future_key_presser
+    assert ("desktopcontrol.media_key", ("play_pause",), {}) in recorder.calls
+
+
+def test_prompt_ab_stubs_launch_work_and_the_shell_opening_file_tools():
+    # F3: launch_work is real paid background work; open_file/open_folder shell
+    # out. The probe script must be unable to reach any of them.
+    registry, recorder = build_recording_registry()
+    from scripts import prompt_ab
+
+    prompt_ab.stub_side_effecting_tools(registry, recorder)
+    launched = _call(registry, "launch_work", {"title": "t", "brief": "b"})
+
+    assert json.loads(launched.content) == {
+        "stubbed": "launch_work", "arguments": {"title": "t", "brief": "b"},
+    }
+    assert ("tool:launch_work", {"title": "t", "brief": "b"}) in recorder.calls
+    assert recorder.calls.count(("launch_work", "t", "b")) == 0
+
+    # The file tools exist only when file_roots is configured (as it is in the
+    # real config the script loads), so cover that shape too.
+    def _never(*_args, **_kwargs):
+        raise AssertionError("real file tool reached")
+
+    with_files = ToolRegistry()
+    builtin(
+        with_files, {"gmail": AppEntry(url="https://mail.test/", words=("gmail",))},
+        _DummyWork(), opener=lambda _url: None,
+        files=SimpleNamespace(
+            find=_never, open=_never, open_folder=_never, read_file=_never, folders={},
+        ),
+    )
+    prompt_ab.stub_side_effecting_tools(with_files, recorder)
+    opened = _call(with_files, "open_folder", {"path": "C:/Users/danie/kb"})
+
+    assert json.loads(opened.content)["stubbed"] == "open_folder"
+
+
+def test_prompt_ab_refuses_to_probe_when_a_stubbed_tool_is_missing():
+    registry = ToolRegistry()
+    builtin(registry, {"gmail": AppEntry(url="https://mail.test/", words=("gmail",))},
+            _DummyWork(), opener=lambda _url: None)
+    registry.unregister("launch_work")
+
+    with pytest.raises(SystemExit):
+        from scripts import prompt_ab
+        prompt_ab.stub_side_effecting_tools(registry, Recorder())

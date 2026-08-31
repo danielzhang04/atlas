@@ -298,6 +298,29 @@ def test_open_schema_lists_sorted_alias_names():
     assert "chrome, gmail, spotify" in open_schema["description"]
 
 
+def test_open_schema_alias_list_is_capped_by_length_and_truncated_at_whole_names():
+    # The count cap alone does not bound the text: alias NAMES are unbounded,
+    # so a handful of very long ones could still blow up the schema. The cut
+    # is deterministic and never lands inside a name.
+    registry = ToolRegistry()
+    apps = {
+        f"{index:02d}" + "x" * 90: AppEntry(url="https://example.test/", words=(f"w{index}",))
+        for index in range(10)
+    }
+    builtin(registry, apps, _FakeWork())
+
+    description = next(
+        schema for schema in registry.schemas() if schema["name"] == "open"
+    )["description"]
+    listed = description.split(": ", 1)[1][:-1]  # drop the sentence period only
+
+    assert len(listed) <= 600 + len(", ...")
+    assert listed.endswith(", ...")
+    names = listed[: -len(", ...")].split(", ")
+    assert names == sorted(apps)[: len(names)]
+    assert all(name in apps for name in names)
+
+
 def test_open_url_alias_dedupes_within_the_window_but_not_after_it():
     opened = []
     now = [0.0]
@@ -316,6 +339,52 @@ def test_open_url_alias_dedupes_within_the_window_but_not_after_it():
     assert json.loads(first.content) == {"opened": "gmail", "via": "web"}
     assert json.loads(second.content) == {"opened": "gmail", "via": "web", "already": True}
     assert json.loads(third.content) == {"opened": "gmail", "via": "web"}
+    assert opened == ["https://mail.google.com/", "https://mail.google.com/"]
+
+
+def test_failed_web_open_leaves_no_dedupe_stamp_so_a_retry_really_retries():
+    # The reviewer's live repro: the stamp used to be written BEFORE the
+    # opener ran, so a failed launch poisoned the window -- "yes, try again"
+    # inside 15s answered already=True (status ok) without retrying, and
+    # Atlas then pressed play into nothing.
+    attempts = []
+    now = [0.0]
+    registry = ToolRegistry()
+    apps = {"gmail": AppEntry(url="https://mail.google.com/", words=("gmail",))}
+
+    def flaky(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise OSError("launch failed")
+
+    builtin(registry, apps, _FakeWork(), opener=flaky, clock=lambda: now[0])
+
+    failed = _call(registry, "open", {"target": "gmail"})
+    now[0] = 1.0
+    retry = _call(registry, "open", {"target": "gmail"})
+
+    assert failed.status == "error"
+    assert json.loads(retry.content) == {"opened": "gmail", "via": "web"}
+    assert attempts == ["https://mail.google.com/", "https://mail.google.com/"]
+
+
+def test_dedupe_hit_does_not_slide_the_window_forward():
+    # A dedupe hit must not rewrite the stamp: otherwise repeated asks inside
+    # the window kept pushing the deadline out and a real retry never came.
+    opened = []
+    now = [0.0]
+    registry = ToolRegistry()
+    apps = {"gmail": AppEntry(url="https://mail.google.com/", words=("gmail",))}
+    builtin(registry, apps, _FakeWork(), opener=opened.append, clock=lambda: now[0])
+
+    _call(registry, "open", {"target": "gmail"})
+    now[0] = 10.0
+    held = _call(registry, "open", {"target": "gmail"})
+    now[0] = 16.0
+    after = _call(registry, "open", {"target": "gmail"})
+
+    assert json.loads(held.content) == {"opened": "gmail", "via": "web", "already": True}
+    assert json.loads(after.content) == {"opened": "gmail", "via": "web"}
     assert opened == ["https://mail.google.com/", "https://mail.google.com/"]
 
 

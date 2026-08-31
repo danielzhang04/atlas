@@ -16,12 +16,23 @@ ACTION_CLAIM_VERBS = (
 _ACTION_EXPRESSION = "|".join(re.escape(verb) for verb in ACTION_CLAIM_VERBS)
 _PATTERNS = {
     "action": re.compile(r"\b(?:" + _ACTION_EXPRESSION + r")\b", re.I),
-    "done": re.compile(r"^\s*(?:done|all done|(?:it|that|this|the (?:task|job)) (?:is|'s) done)\s*[.!]?\s*$", re.I),
+    # Perfective "done" claims are matched per sentence with fullmatch, so the
+    # first-person forms ("I have done that.") are safe to add here: a negated
+    # sentence ("I have not done that.", "I haven't done that.") simply fails
+    # the fullmatch and is never treated as a claim.
+    "done": re.compile(
+        r"^\s*(?:done|all done|(?:it|that|this|the (?:task|job)) (?:is|'s) done"
+        r"|(?:I|we)(?:'ve| have| had)? done (?:that|it|this|so))\s*[.!]?\s*$", re.I),
     "subject": re.compile(r"\b(?:I(?:'ve| have)?|we(?:'ve| have)?)\b", re.I),
     "negation": re.compile(r"\b(?:not|never|cannot|can't|couldn't|didn't|haven't|hasn't|wasn't|weren't)\b", re.I),
     "sentence": re.compile(r"[^.!?\n]+[.!?]?"),
 }
 _ASSOCIATIONS = {
+    # `open` licenses "opened" because, after the open-dedupe fix
+    # (tools.py open_web), an ok `open` result -- including the
+    # `already: true` shape -- only ever follows a real, successful open by
+    # this host inside the last 15 seconds. A failed launch leaves no stamp,
+    # so a retry re-invokes the opener instead of reporting already-open.
     "opened": ("open", "open_folder", "focus_window"), "sent": ("*send*",),
     "launched": ("launch_work", "kb_*launch*", "window_action", "media_key"),
     # A successful `open` launches; it does not play (item 4 -- boss
@@ -35,6 +46,9 @@ _ASSOCIATIONS = {
 _MUTATION_MARKERS = ("send", "create", "draft", "delete", "launch", "write", "edit", "update")
 _MUTATION_NAMES = frozenset({"mutate", "cancel_work", "close", "focus", "open_file"})
 UNBACKED_ACTION_REPLY = "I did not actually do that - I have no tool result. Want me to? "
+# Same rebuttal, minus the offer: used when the host DID attempt the action and
+# the attempt failed. "Want me to?" is wrong there -- it was already tried.
+FAILED_ATTEMPT_REPLY = "That did not go through - the confirmation failed. "
 
 # Detection-only (item 7): a refusal-shaped reply is never delayed and never
 # rewritten -- the host must NEVER fabricate "I can do that with X - shall
@@ -69,8 +83,17 @@ class ClaimGuard:
         )
         self._substituted = False
 
-    def delayed(self, text: str) -> bool:
+    def observe(self, text: str) -> None:
+        """Run detection-only side effects (the refusal WARNING) on a chunk.
+
+        Kept separate from `delayed()` so the caller can run it for EVERY
+        streamed chunk: brain.py short-circuits `delayed()` once anything is
+        held, which used to mute the false-refusal log for the rest of the
+        turn.
+        """
         self._log_refused_capability(text)
+
+    def delayed(self, text: str) -> bool:
         if _PATTERNS["action"].search(text):
             return True
         # A short "Done." glues to the next sentence in the same chunk

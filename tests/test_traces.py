@@ -188,3 +188,25 @@ def test_disabled_recorder_is_a_no_op(tmp_path: Path):
     _record_turn(recorder)
     assert recorder.summary(days=1)["turns"] == 0
     assert not (tmp_path / "traces.db").exists()
+
+
+def test_configured_fast_model_has_a_pricing_row():
+    # F8: traces.py prices a turn with self._pricing.get(model, {}) and
+    # _price() treats a missing rate as 0.0, so switching fast_model to a lane
+    # with no pricing row bills every turn at $0.00 in silence. Pin the two
+    # together: a lane switch must fail here instead.
+    import yaml
+
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "atlas.yaml").read_text(
+            encoding="utf-8",
+        ),
+    )
+    pricing = config["pricing"]
+    rates = pricing[config["fast_model"]]
+
+    assert set(rates) == {
+        "input_per_mtok", "output_per_mtok",
+        "cache_read_per_mtok", "cache_write_per_mtok",
+    }
+    assert all(isinstance(rate, (int, float)) and rate > 0 for rate in rates.values())

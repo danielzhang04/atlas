@@ -11,7 +11,7 @@ import pytest
 
 from worker import brain as brain_mod
 from worker.brain import BASE_SYSTEM, PROVIDER_REPLY, TIMEOUT_REPLY, Brain, split_spoken
-from worker.claims import UNBACKED_ACTION_REPLY, ClaimGuard
+from worker.claims import FAILED_ATTEMPT_REPLY, UNBACKED_ACTION_REPLY, ClaimGuard
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
 
@@ -257,24 +257,28 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         "model": "fast",
         "system": [call["system"][0]],
         "tools": call["tools"],
-        "messages": [],
+        "messages": [{"role": "user", "content": "hi"}],
     }]
 
 
 @pytest.mark.parametrize(
-    ("tokens", "expected", "warning"),
+    ("model", "tokens", "expected", "warning"),
     [
-        (4_095, False, "prompt cache floor unmet: 4095 tokens"),
-        (4_096, True, None),
+        # Unknown models use the default (Sonnet/Opus-class) 1024 floor.
+        ("fast", 1_023, False, "prompt cache floor unmet: 1023 tokens"),
+        ("fast", 1_024, True, None),
+        # Haiku-class models keep the 4096 floor.
+        ("claude-haiku-4-5", 4_095, False, "prompt cache floor unmet: 4095 tokens"),
+        ("claude-haiku-4-5", 4_096, True, None),
     ],
 )
-def test_first_turn_checks_cache_floor_once_without_blocking(tokens, expected, warning, caplog):
+def test_first_turn_checks_cache_floor_once_without_blocking(model, tokens, expected, warning, caplog):
     client = FakeClient(
         FakeStream(["First."], content=[text_block("First.")]),
         FakeStream(["Second."], content=[text_block("Second.")]),
         token_counts=(tokens,),
     )
-    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain = Brain(client, FakeRegistry(), model=model, persona="")
     brain.mark_tools_settled()
 
     async def scenario():
@@ -290,6 +294,32 @@ def test_first_turn_checks_cache_floor_once_without_blocking(tokens, expected, w
         assert "prompt cache floor unmet" not in caplog.text
     else:
         assert caplog.text.count(warning) == 1
+
+
+def test_cache_floor_probe_sends_a_valid_non_empty_messages_payload():
+    # Y1 regression: the check sent messages=[], which the Messages API 400s on
+    # for every model, so cache_floor_ok had been dead since the Y wave -- the
+    # failure was swallowed by the check's own except branch.
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        token_counts=(9_000,),
+    )
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain.mark_tools_settled()
+
+    async def scenario():
+        await collect(brain, "First turn")
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    messages = client.messages.count_calls[0]["messages"]
+    assert messages and all(
+        message["role"] in {"user", "assistant"} and message["content"]
+        for message in messages
+    )
+    assert messages[0]["role"] == "user"
+    assert brain.cache_floor_ok is True
 
 
 def test_cache_floor_failure_is_logged_once_and_remains_unknown(caplog):
@@ -523,19 +553,19 @@ def test_action_claim_after_ok_tool_result_passes_through():
             content=[tool_block(name="open", arguments={"target": "spotify"})],
             stop_reason="tool_use",
         ),
-        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+        FakeStream(["I opened Spotify."], content=[text_block("I opened Spotify.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Open Spotify")) == ["Spotify is open."]
+    assert asyncio.run(collect(brain, "Open Spotify")) == ["I opened Spotify."]
 
 
-def test_known_registry_target_state_claim_requires_a_relevant_call():
-    # The guard is restricted to perfective, first-person claims (item 3): a bare
-    # state description like "Spotify is open." has no "I"/"we" subject, so it is
-    # not an attributed claim even when the target is a known registry alias --
-    # the dead open_state/target-tracking machinery that used to intercept this
-    # sentence has been removed.
+def test_perfective_claim_about_a_known_alias_requires_a_relevant_call():
+    # F6: this used to assert on "Spotify is open.", which stopped being a
+    # claim at all when bare "open"/open_state were removed -- the test passed
+    # without ever reaching evaluate(). The real invariant is that a
+    # perfective, first-person claim about a registered alias is suppressed
+    # when no tool actually ran, even though the host could have run one.
     registry = ToolRegistry()
     builtin(
         registry,
@@ -543,11 +573,11 @@ def test_known_registry_target_state_claim_requires_a_relevant_call():
         BrainWork(),
         opener=lambda _target: None,
     )
-    reply = "Spotify is open."
+    reply = "I opened Spotify."
     client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Is Spotify open?")) == [reply]
+    assert asyncio.run(collect(brain, "Open Spotify")) == [UNBACKED_ACTION_REPLY]
 
 
 def test_unrelated_ok_read_does_not_license_failed_open_claim():
@@ -596,16 +626,24 @@ def test_cancel_pending_does_not_license_open_claim():
             "No problem, I opened Spotify.",
             "I did not actually do that - I have no tool result. Want me to? ",
         ),
-        ("I did not open Spotify.", "I did not open Spotify."),
+        # F6: the negation cases now use LIVE verbs. With bare "open" removed
+        # from the verb set, "I did not open Spotify." exercised nothing --
+        # there was no claim there to negate.
+        ("I have not opened Spotify.", "I have not opened Spotify."),
         (
             "I couldn't open X, but I opened Y.",
             "I did not actually do that - I have no tool result. Want me to? ",
         ),
-        ("I couldn't open Spotify.", "I couldn't open Spotify."),
+        ("I couldn't get Spotify opened.", "I couldn't get Spotify opened."),
         (
             "The task is done.",
             "I did not actually do that - I have no tool result. Want me to? ",
         ),
+        (
+            "I have done that.",
+            "I did not actually do that - I have no tool result. Want me to? ",
+        ),
+        ("I have not done that.", "I have not done that."),
     ],
 )
 def test_action_claim_negation_is_clause_local(reply, expected):
@@ -643,10 +681,14 @@ def test_done_glued_to_a_short_sentence_is_still_delayed_and_substituted():
 @pytest.mark.parametrize(
     "reply",
     [
+        # F6: every param carries a LIVE claim verb with a third-person
+        # subject, so the subject check is what keeps them out of the guard.
+        # The old "The store is open today." / "open source" / "open-ended"
+        # params stopped exercising anything once bare "open" was removed.
         "Spotify was created in 2006.",
-        "The store is open today.",
-        "This project is open source.",
-        "The question is open-ended.",
+        "The store opened at nine this morning.",
+        "That song played on the radio yesterday.",
+        "The window closed by itself.",
     ],
 )
 def test_factual_action_words_are_not_treated_as_attributed_claims(reply):
@@ -752,6 +794,50 @@ def test_refusal_sentence_streams_through_undelayed_and_unchanged(caplog):
     assert "available capability refusal suppressed (tool=open_folder)" in caplog.text
 
 
+def test_refusal_is_still_logged_when_an_earlier_chunk_is_being_held(caplog):
+    # F9: the "guarded_chunks or guard.delayed(chunk)" short-circuit skipped
+    # delayed() -- and with it the item-7 refusal detector -- for every chunk
+    # after the first hold, so a false refusal that followed a held claim was
+    # never logged. The detector now runs for every chunk (guard.observe).
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "open_folder",
+        lambda _arguments: return_value({"opened": "C:/Users/danie/kb"}),
+    ))
+    deltas = ["I opened the folder for you. ", "Actually I don't have access to that folder."]
+    client = FakeClient(FakeStream(deltas, content=[text_block("".join(deltas))]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    result = asyncio.run(collect(brain, "open my kb folder"))
+
+    assert result[-1].strip() == UNBACKED_ACTION_REPLY.strip()
+    assert "available capability refusal suppressed (tool=open_folder)" in caplog.text
+
+
+def test_tool_round_seam_keeps_a_word_boundary_space():
+    # F11: split_spoken only carries whitespace the model actually streamed,
+    # so a round ending on its final sentence leaves none -- the next round's
+    # first chunk used to glue on ("...for you.Music's playing.").
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            ["I will put something on for you."],
+            content=[
+                text_block("I will put something on for you."),
+                tool_block(name="open", arguments={"target": "spotify"}),
+            ],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Music's playing."], content=[text_block("Music's playing.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    result = asyncio.run(collect(brain, "put on music"))
+
+    assert result == ["I will put something on for you.", " Music's playing."]
+    assert "you.Music" not in "".join(result)
+
+
 @pytest.mark.parametrize("refusal", [
     "I can't do that right now.",
     "I don't have access to that.",
@@ -779,11 +865,53 @@ def test_successful_open_evidence_licenses_started_but_not_played():
     assert guard.evaluate("I played the song.", evidence) == UNBACKED_ACTION_REPLY
 
 
+def test_live_verb_negation_after_a_failed_open_streams_unrewritten():
+    # F6: the negation check (claims.py _claims) must survive with the verbs
+    # that are actually live. Inverting that check turns this honest sentence
+    # into the rebuttal, so this test is what pins it.
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    reply = "I have not opened Spotify - the launch failed."
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream([reply], content=[text_block(reply)]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == [reply]
+
+
+@pytest.mark.parametrize("claim", ["I have done that.", "I've done that.", "We have done it."])
+def test_perfective_done_claims_are_gated_like_bare_done(claim):
+    # F6 decide-and-implement: "I have done that." after a failed tool used to
+    # stream verbatim -- the anchored "done" pattern only matched "Done." and
+    # "That is done.". It is now gated both ways: unbacked it is suppressed,
+    # and a successful mutating call licenses it.
+    guard = ClaimGuard()
+    assert guard.evaluate(claim, [("open", False)]) == UNBACKED_ACTION_REPLY
+    assert ClaimGuard().evaluate(claim, [("mutate", True)]) == claim
+
+
+def test_perfective_done_claim_is_delayed_and_substituted_after_a_failed_tool():
+    registry = FakeRegistry(ToolResult("error", "could not send"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["I have done that."], content=[text_block("I have done that.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Send the draft")) == [UNBACKED_ACTION_REPLY]
+
+
 def test_host_speech_constants_end_in_whitespace():
     # Word-boundary contract (worker/sanitize.py:1-4): a host-emitted constant
     # that gets concatenated with a following streamed chunk must supply its own
     # trailing word boundary.
-    for constant in (TIMEOUT_REPLY, PROVIDER_REPLY, UNBACKED_ACTION_REPLY):
+    for constant in (
+        TIMEOUT_REPLY, PROVIDER_REPLY, UNBACKED_ACTION_REPLY, FAILED_ATTEMPT_REPLY,
+    ):
         assert constant[-1].isspace(), constant
 
 
@@ -1506,14 +1634,13 @@ def test_main_loop_buffer_flush_order_preserved_without_terminal_punctuation():
     ]
 
 
-def test_narration_stream_order_preserved_for_failed_confirm():
+def test_narration_rebuttal_is_last_and_drops_the_offer_for_a_failed_confirm():
     # Item 2, site A (brain.py's confirm/narration-path stream
     # classification): a failed confirm's narration streams a claim, then a
     # reassurance -- the reassurance must not leak out live ahead of the
-    # still-pending claim's verdict. Unlike the main loop, the confirm-path
-    # tail does not reorder (item 3 applies only to the main loop -- see its
-    # test), so the caveat must precede the reassurance in plain stream
-    # order here.
+    # still-pending claim's verdict. F5: this path now reorders like the main
+    # flush (substitution LAST), and because the host really did attempt the
+    # action and it failed, the rebuttal drops the "Want me to?" offer.
     registry = FakeRegistry(ToolResult("error", "could not open"))
     registry._pending = PendingAction(
         confirm_id="confirm-123",
@@ -1531,15 +1658,16 @@ def test_narration_stream_order_preserved_for_failed_confirm():
     brain = Brain(client, registry, model="fast", persona="")
 
     assert asyncio.run(collect(brain, "confirm")) == [
-        "I did not actually do that - I have no tool result. Want me to? ",
         "Everything is ready for you now.",
+        " That did not go through - the confirmation failed. ",
     ]
 
 
 def test_narration_buffer_flush_order_preserved_without_terminal_punctuation():
     # Item 2, site B (brain.py's confirm/narration-path buffer flush): the
     # reassurance has no terminal punctuation, so it is only seen at that
-    # path's own "if buffer:" flush, not the stream classification loop.
+    # path's own "if buffer:" flush, not the stream classification loop. F5:
+    # ordered substitution-last, with the failed-attempt rebuttal variant.
     registry = FakeRegistry(ToolResult("error", "could not open"))
     registry._pending = PendingAction(
         confirm_id="confirm-123",
@@ -1557,8 +1685,8 @@ def test_narration_buffer_flush_order_preserved_without_terminal_punctuation():
     brain = Brain(client, registry, model="fast", persona="")
 
     assert asyncio.run(collect(brain, "confirm")) == [
-        "I did not actually do that - I have no tool result. Want me to? ",
         "Everything is ready for you now",
+        " That did not go through - the confirmation failed. ",
     ]
 
 

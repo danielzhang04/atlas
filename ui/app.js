@@ -1245,9 +1245,16 @@
         jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
         const active = jobs.map((job) => jobView(job)).filter((view) => view.active);
         if (!document.hidden) await Promise.all(active.map((view) => refreshEvents(view.job)));
+        // The gate exists to skip a full rebuild every 2s while nothing
+        // changes. Jobs alone were not enough: rendered rows also depend on
+        // the clock ("just now" pinned forever once jobs stopped changing) and
+        // on pairing (stale "Pair to cancel" buttons survived pairing). The
+        // 30s bucket keeps the idle-rebuild rate at ~1 per 30s, not 1 per 2s.
         const signature = JSON.stringify({
           jobs,
           events: active.map((view) => [view.job.id, eventStore(view.job.id).length]),
+          paired: Boolean(actionToken),
+          clockBucket: Math.floor(Date.now() / 30000),
         });
         if (signature === jobsSignature) return;
         jobsSignature = signature;

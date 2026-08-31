@@ -115,6 +115,10 @@ def test_state_signal_assets_and_security_headers():
     assert "const shrinkFactor = 1 - Math.pow(1 - .1, rate);" in script[2]
     assert "Math.min(1, .32" not in script[2]
     assert "Math.min(1, .1" not in script[2]
+    # Jobs-signature gate must not freeze pairing-derived UI or relative
+    # timestamps: pairing state and a 30s clock bucket are part of the signature.
+    assert "paired: Boolean(actionToken)," in script[2]
+    assert "clockBucket: Math.floor(Date.now() / 30000)," in script[2]
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]

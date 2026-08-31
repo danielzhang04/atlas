@@ -410,12 +410,18 @@ def builtin(
         return desktop if desktop is not None else _desktopcontrol()
 
     def open_web(name: str, url: str) -> dict:
+        # The stamp is written only AFTER a successful open, and a dedupe hit
+        # never refreshes it. Stamping first poisoned the window: a failed
+        # launch left a stamp, so "yes, try again" inside 15s answered
+        # already=True without retrying, and each repeat slid the window
+        # forward so the retry never came. `already` now means exactly "this
+        # host really opened it, less than 15s ago".
         now = clock()
         last = recent_web_opens.get(name)
-        recent_web_opens[name] = now
         if last is not None and now - last < _OPEN_DEDUPE_WINDOW_S:
             return {"opened": name, "via": "web", "already": True}
         opener(url)
+        recent_web_opens[name] = now
         return {"opened": name, "via": "web"}
 
     async def open_target(arguments: dict) -> ToolResult | dict:
@@ -800,13 +806,20 @@ def _aliases(apps: Mapping[str, AppEntry]) -> dict[str, tuple[str, AppEntry]]:
 
 
 _OPEN_DESCRIPTION_NAME_LIMIT = 60
+# Alias names are host-configured but unbounded in LENGTH, so the count cap
+# alone does not bound the schema text. Truncate the joined list too, always
+# at a whole name (deterministic for the same config, and never a half name).
+_OPEN_DESCRIPTION_CHARACTER_LIMIT = 600
 
 
 def _open_description(aliases: Mapping[str, tuple[str, AppEntry]]) -> str:
     names = sorted({name for name, _ in aliases.values()})
-    listed = ", ".join(names[:_OPEN_DESCRIPTION_NAME_LIMIT])
-    if len(names) > _OPEN_DESCRIPTION_NAME_LIMIT:
-        listed += ", ..."
+    kept = names[:_OPEN_DESCRIPTION_NAME_LIMIT]
+    while kept and len(", ".join(kept)) > _OPEN_DESCRIPTION_CHARACTER_LIMIT:
+        kept.pop()
+    listed = ", ".join(kept)
+    if len(names) > len(kept):
+        listed += ", ..." if listed else "..."
     if not listed:
         return "Open an allowlisted app or HTTPS URL."
     return (

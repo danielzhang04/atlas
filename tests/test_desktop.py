@@ -942,6 +942,35 @@ def test_run_spawns_console_worker_opens_exact_window_and_stops_once(desktop_log
     assert "window created" in desktop_log.getvalue()
 
 
+def test_run_patches_webview_exactly_once_before_starting_the_gui_loop():
+    # F2: the patch_webview() call in run() had no integration coverage --
+    # deleting it, or moving it after start(), left the whole suite green. The
+    # occlusion patch must be installed BEFORE webview.start takes over the
+    # thread, or the first window is created unpatched.
+    process = FakeProcess("ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n")
+    window = FakeWindow()
+    order = []
+
+    def start(_function, _args):
+        order.append("start")
+        window.events.closed.fire()
+
+    result = desktop.run(
+        spawn=lambda _command, **_kwargs: process,
+        window_factory=lambda _title, _url, **_kwargs: window,
+        start=start,
+        terminate=lambda _child, _url, _token: None,
+        create_mutex=lambda: (111, False),
+        assign_job=lambda _child: 222,
+        close_handle=lambda _handle: None,
+        patch_webview=lambda: order.append("patch"),
+        token_factory=lambda: "shutdown-token",
+    )
+
+    assert result == 0
+    assert order == ["patch", "start"]
+
+
 def test_native_window_api_minimizes_and_requests_the_graceful_close(monkeypatch):
     process = FakeProcess("ATLAS_UI http://127.0.0.1:4360/#pair=one-use\n")
     window = FakeWindow()
