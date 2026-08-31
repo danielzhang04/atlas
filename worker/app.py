@@ -726,16 +726,6 @@ async def entrypoint(ctx: JobContext) -> None:
             trace_recorder=_traces(),
         )
 
-    async def _handle_quick_result(name: str, result: tools_mod.ToolResult) -> None:
-        _record_tool(publisher, name, result)
-        if result.status != "needs_confirmation":
-            return
-        pending = services.registry.pending
-        readback = f"{pending.summary}." if pending is not None else result.content
-        publisher.add_line("atlas", readback)
-        if session is not None:
-            session.say(readback, add_to_chat_ctx=False)
-
     async def _request_shutdown() -> None:
         nonlocal shutdown_jobs_requested
         shutdown_jobs_requested = True

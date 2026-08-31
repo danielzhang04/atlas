@@ -306,62 +306,20 @@ main {
   cursor: default;
 }
 
-.quick-actions {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
-.quick-action {
-  position: absolute;
-  z-index: 2;
-  max-width: 5.2rem;
-  padding: .18rem .3rem;
-  border: 1px solid rgb(124 92 255 / 24%);
-  border-radius: 3px;
-  overflow: hidden;
-  color: #b9c9de;
-  background: rgb(7 10 16 / 78%);
-  font: 600 .49rem/1.1 ui-monospace, "Cascadia Mono", monospace;
-  letter-spacing: .025em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  transform: translate(-50%, -50%);
-  pointer-events: auto;
-  cursor: pointer;
-}
-
-.quick-action:hover,
-.quick-action:focus-visible,
-.quick-action.is-flashing {
-  border-color: rgb(66 226 255 / 74%);
-  color: #e5fbff;
-  background: rgb(28 48 68 / 88%);
-}
-
-.quick-action:disabled {
-  cursor: wait;
-}
-
 .text-turn-form {
-  position: absolute;
-  bottom: .15rem;
-  left: 50%;
-  z-index: 3;
-  width: min(17rem, 58%);
-  transform: translateX(-50%);
+  padding: .5rem .85rem;
+  border-top: 1px solid var(--line);
 }
 
 .text-turn-form input {
   width: 100%;
-  padding: .34rem .55rem;
-  border: 1px solid transparent;
-  border-bottom-color: rgb(168 153 255 / 25%);
-  border-radius: 3px;
+  padding: .4rem .6rem;
+  border: 1px solid var(--line-bright);
+  border-radius: 5px;
   color: var(--text);
-  background: rgb(7 10 16 / 24%);
-  font: .62rem ui-monospace, "Cascadia Mono", monospace;
-  text-align: center;
+  background: rgb(7 10 16 / 55%);
+  font: .68rem ui-monospace, "Cascadia Mono", monospace;
+  text-align: left;
 }
 
 .text-turn-form input::placeholder {
@@ -369,8 +327,8 @@ main {
 }
 
 .text-turn-form input:focus {
-  border-bottom-color: rgb(66 226 255 / 62%);
-  background: rgb(7 10 16 / 68%);
+  border-color: rgb(66 226 255 / 62%);
+  background: rgb(7 10 16 / 82%);
 }
 
 .pending-confirmation {
@@ -492,6 +450,10 @@ main {
 
 .workers-panel {
   grid-template-rows: 38px auto minmax(0, 1fr);
+}
+
+.transcript-panel {
+  grid-template-rows: 38px minmax(0, 1fr) auto;
 }
 
 .panel-heading {
@@ -1136,10 +1098,6 @@ main {
 
   .pending-confirmation:not([hidden]) {
     animation: holoScanSweep 260ms ease-out both;
-  }
-
-  .quick-action.is-flashing {
-    animation: holoApproach 220ms ease-out both;
   }
 }
 
