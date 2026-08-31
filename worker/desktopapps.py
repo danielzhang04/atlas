@@ -78,6 +78,12 @@ _KNOWN_FOLDER_IDS = {
         0x4FCF,
         (0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
     ),
+    "roaming_app_data": (
+        0x3EB685DB,
+        0x65F9,
+        0x4CF6,
+        (0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D),
+    ),
     "program_files": (
         0x905E63B6,
         0xC1BF,
@@ -93,6 +99,7 @@ _KNOWN_FOLDER_IDS = {
 }
 _LEGACY_FOLDER_IDS = {
     "local_app_data": 0x001C,
+    "roaming_app_data": 0x001A,
     "program_files": 0x0026,
     "program_files_x86": 0x002A,
 }
@@ -105,6 +112,35 @@ _EXPECTED_PUBLISHERS = {
     "Spotify.exe": "Spotify AB",
     "explorer.exe": "Microsoft Windows",
 }
+
+# A Store app installs a zero-byte app-execution alias into WindowsApps; the real signed
+# image lives behind an APPEXECLINK reparse point. Reading that link only redirects which
+# file the mandatory Authenticode publisher check runs against.
+#
+# The alias file itself is writable by the signed-in user, so its target is untrusted
+# input. A remote target would let an SMB server answer the signature check with a signed
+# image and the later launch with a payload, so a target is accepted only when it is a
+# local drive-letter path contained in one of these admin-only roots. Containment is
+# re-checked after resolution, before the Authenticode gate runs.
+_ALIAS_TARGET_ROOTS = (
+    ("program_files", "WindowsApps"),
+    ("windows", "SystemApps"),
+    ("windows", "System32"),
+)
+_LOCAL_DRIVE = re.compile(r"[A-Za-z]:")
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
+_FSCTL_GET_REPARSE_POINT = 0x000900A8
+_OPEN_EXISTING = 3
+_FILE_SHARE_READ_WRITE_DELETE = 0x00000007
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_MAXIMUM_REPARSE_DATA_BUFFER_SIZE = 16 * 1024
+_REPARSE_HEADER_SIZE = 8
+_APPEXECLINK_VERSION_SIZE = 4
+# packageId, entryPoint, executable target, applicationType
+_APPEXECLINK_TARGET_INDEX = 2
 
 
 class _Guid(ctypes.Structure):
@@ -364,7 +400,10 @@ def _resolve_executable(executable: str) -> str:
         ],
         "wt.exe": [("local_app_data", "Microsoft/WindowsApps/wt.exe")],
         "notepad.exe": [("windows", "System32/notepad.exe")],
-        "Spotify.exe": [("local_app_data", "Microsoft/WindowsApps/Spotify.exe")],
+        "Spotify.exe": [
+            ("local_app_data", "Microsoft/WindowsApps/Spotify.exe"),
+            ("roaming_app_data", "Spotify/Spotify.exe"),
+        ],
         "explorer.exe": [("windows", "System32/explorer.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
@@ -382,15 +421,152 @@ def _resolve_executable(executable: str) -> str:
             )
         except DesktopAppError:
             continue
-        item = root / relative
-        if not item.is_file():
+        resolved = _candidate_image(root / relative)
+        if resolved is None:
             continue
-        resolved = item.resolve()
         if _verify_authenticode_publisher(resolved, expected_publisher):
             return str(resolved)
     raise DesktopAppError(
         "configured desktop application is unavailable at an approved location"
     )
+
+
+def _candidate_image(item: Path) -> Path | None:
+    """Resolve one candidate to a real file, following an app-execution alias."""
+    candidate = item
+    reparse = _read_reparse_data(item)
+    if reparse is not None and _reparse_tag(reparse) == _IO_REPARSE_TAG_APPEXECLINK:
+        target = _parse_app_execution_link(reparse)
+        if target is None:
+            return None
+        candidate = _contained_alias_target(target)
+        if candidate is None:
+            return None
+    try:
+        if not candidate.is_file():
+            return None
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
+def _alias_target_roots() -> tuple[Path, ...]:
+    """Resolve the admin-only roots an app-execution alias is allowed to point into."""
+    roots = []
+    for root_name, relative in _ALIAS_TARGET_ROOTS:
+        try:
+            base = (
+                _windows_directory()
+                if root_name == "windows"
+                else _known_folder_path(root_name)
+            )
+            roots.append((base / relative).resolve())
+        except (DesktopAppError, OSError):
+            continue
+    return tuple(roots)
+
+
+def _is_local_drive_path(path: Path) -> bool:
+    """Reject UNC shares and the \\\\?\\ and \\\\.\\ device namespaces."""
+    return path.is_absolute() and bool(_LOCAL_DRIVE.fullmatch(path.drive))
+
+
+def _contained_alias_target(target: str) -> Path | None:
+    """Accept an alias target only as a local file inside an admin-only root."""
+    roots = _alias_target_roots()
+    if not roots:
+        return None
+    candidate = Path(target)
+    if not _is_local_drive_path(candidate):
+        return None
+    if not any(candidate.is_relative_to(root) for root in roots):
+        return None
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if not _is_local_drive_path(resolved):
+        return None
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None
+    return resolved
+
+
+def _reparse_tag(buffer: bytes) -> int | None:
+    """Read the reparse tag of a raw REPARSE_DATA_BUFFER."""
+    if len(buffer) < _REPARSE_HEADER_SIZE:
+        return None
+    return int.from_bytes(buffer[0:4], "little")
+
+
+def _parse_app_execution_link(buffer: bytes) -> str | None:
+    """Return the executable target of an APPEXECLINK buffer, or None if unusable."""
+    if _reparse_tag(buffer) != _IO_REPARSE_TAG_APPEXECLINK:
+        return None
+    data_length = int.from_bytes(buffer[4:6], "little")
+    data = buffer[_REPARSE_HEADER_SIZE:_REPARSE_HEADER_SIZE + data_length]
+    if len(data) != data_length or data_length <= _APPEXECLINK_VERSION_SIZE:
+        return None
+    try:
+        fields = data[_APPEXECLINK_VERSION_SIZE:].decode("utf-16-le").split("\x00")
+    except UnicodeDecodeError:
+        return None
+    if len(fields) <= _APPEXECLINK_TARGET_INDEX:
+        return None
+    target = fields[_APPEXECLINK_TARGET_INDEX].strip()
+    if not target or not Path(target).is_absolute():
+        return None
+    return target
+
+
+def _read_reparse_data(path: Path) -> bytes | None:
+    """Read a file's raw reparse buffer through Win32 without following the link."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        attributes = kernel32.GetFileAttributesW(ctypes.c_wchar_p(str(path)))
+        if attributes & _INVALID_FILE_ATTRIBUTES == _INVALID_FILE_ATTRIBUTES:
+            return None
+        if not attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            ctypes.c_wchar_p(str(path)),
+            0,
+            _FILE_SHARE_READ_WRITE_DELETE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not handle or handle == _invalid_handle_value():
+        return None
+    try:
+        buffer = ctypes.create_string_buffer(_MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        returned = ctypes.c_ulong(0)
+        if not kernel32.DeviceIoControl(
+            ctypes.c_void_p(handle),
+            _FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            buffer,
+            _MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            ctypes.byref(returned),
+            None,
+        ):
+            return None
+        return buffer.raw[:returned.value]
+    except (OSError, ValueError):
+        return None
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _invalid_handle_value() -> int:
+    return (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
 
 
 def known_folder_path(name: str) -> Path:
