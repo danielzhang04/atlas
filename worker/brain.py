@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
-from .tools import PendingAction, ToolRegistry, ToolResult
+from .tools import PendingAction, ToolRegistry, ToolResult, api_incompatible_tool_names
 
 
 
@@ -287,11 +287,35 @@ class Brain:
     def _copy_mcp_status(mcp_status: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [dict(item) for item in mcp_status if isinstance(item, Mapping)]
 
+    @staticmethod
+    def _usable_schemas(
+        schemas: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Split off tools whose schema the Messages API would 400 on.
+
+        A tool the registry accepted (e.g. a remote MCP tool mirrored
+        verbatim) can still carry a top-level oneOf/allOf/anyOf that the API
+        rejects. Excluding just that tool from what is sent to the model
+        loses one capability instead of every turn; it stays registered and
+        callable through the registry directly.
+        """
+        incompatible = api_incompatible_tool_names(schemas)
+        if not incompatible:
+            return schemas, []
+        blocked = frozenset(incompatible)
+        return [s for s in schemas if s.get("name") not in blocked], incompatible
+
     def _replace_tool_snapshot(self, schemas: list[dict[str, Any]]) -> None:
-        tools = [dict(schema) for schema in schemas]
+        usable_schemas, incompatible = self._usable_schemas(schemas)
+        if incompatible:
+            logger.warning(
+                "tool schema uses API-incompatible shape, excluded from model (tools=%s)",
+                ",".join(sorted(incompatible))[:300],
+            )
+        tools = [dict(schema) for schema in usable_schemas]
         if tools:
             tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        self._tool_names = self._schema_names(schemas)
+        self._tool_names = self._schema_names(usable_schemas)
         self._tools = tools
         self._capability_text = _capability_system_text(tools, self._mcp_status)
         self._cached_system = {
@@ -302,7 +326,8 @@ class Brain:
 
     def _refresh_snapshot(self) -> bool:
         schemas = self.registry.schemas()
-        capability_text = _capability_system_text(schemas, self._mcp_status)
+        usable_schemas, _incompatible = self._usable_schemas(schemas)
+        capability_text = _capability_system_text(usable_schemas, self._mcp_status)
         if capability_text == self._capability_text:
             return False
         self._replace_tool_snapshot(schemas)
@@ -643,9 +668,17 @@ class Brain:
             yield host_line or TIMEOUT_REPLY
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            has_status_code = isinstance(status, int) and not isinstance(status, bool)
+            # Only trust .message when the exception is API-error-shaped (an
+            # int status_code), so an unrelated future dependency's .message
+            # attribute never becomes an uncontrolled log sink.
+            message = getattr(exc, "message", None) if has_status_code else None
+            detail = message[:120] if isinstance(message, str) else "n/a"
             logger.warning(
-                "conversation model request failed (type=%s, status=%s)",
-                type(exc).__name__, status if isinstance(status, (int, float)) else "unknown",
+                "conversation model request failed (type=%s, status=%s, detail=%s)",
+                type(exc).__name__,
+                status if isinstance(status, (int, float)) else "unknown",
+                detail,
             )
             yield host_line or PROVIDER_REPLY
 

@@ -434,6 +434,51 @@ def test_prompt_snapshot_rebuilds_only_when_registered_tool_name_set_changes(cap
     assert caplog.text.count("brain prompt snapshot rebuilt") == 1
 
 
+def test_tool_snapshot_excludes_api_incompatible_tool_but_keeps_it_registered(caplog):
+    """Regression test for the tools.11.custom.input_schema 400.
+
+    api_incompatible_tool_names only detected a top-level oneOf/allOf/anyOf;
+    it did not stop it from being sent to the model, so a third-party (e.g.
+    remote MCP) tool with that shape would still 400 every conversational
+    turn. _replace_tool_snapshot must exclude just that tool from what is
+    sent to the model -- and from the capability-text tool listing -- while
+    leaving it registered and directly callable through the registry.
+    """
+    caplog.set_level("WARNING", logger="atlas.brain")
+
+    async def run(_arguments):
+        return {"ok": True}
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "good_tool", "A normal tool.", {"type": "object", "properties": {}}, run,
+    ))
+    registry.register(Tool(
+        "bad_tool",
+        "A tool with an API-incompatible schema.",
+        {
+            "type": "object",
+            "properties": {},
+            "oneOf": [{"required": ["a"]}, {"required": ["b"]}],
+        },
+        run,
+    ))
+
+    brain = Brain(FakeClient(), registry, model="fast", persona="")
+
+    outbound_names = {tool["name"] for tool in brain._request_tools()}
+    assert outbound_names == {"good_tool"}
+    assert "good_tool" in brain._capability_text
+    assert "bad_tool" not in brain._capability_text
+
+    assert set(registry.names()) == {"good_tool", "bad_tool"}
+    assert asyncio.run(registry.call("bad_tool", {})).status == "ok"
+
+    assert caplog.text.count(
+        "tool schema uses API-incompatible shape, excluded from model (tools=bad_tool)"
+    ) == 1
+
+
 def test_usage_records_cache_read_and_creation_tokens(caplog):
     caplog.set_level("INFO", logger="atlas.brain")
     usage = SimpleNamespace(
@@ -1429,7 +1474,51 @@ def test_provider_exception_is_sanitized(caplog):
     assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
     assert "status=500" in caplog.text
     assert "private token" not in caplog.text
+    assert "detail=n/a" in caplog.text
     assert brain._history == []
+
+
+def test_provider_exception_detail_surfaces_bounded_api_error_message(caplog):
+    class ProviderFailure(RuntimeError):
+        status_code = 400
+
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self.message = message
+
+    long_message = (
+        "input_schema does not support oneOf, allOf, or anyOf at the top level"
+        + " padding" * 20
+    )
+    client = FakeClient(ProviderFailure(long_message))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
+    assert "status=400" in caplog.text
+    assert len(long_message) > 120
+    assert f"detail={long_message[:120]}" in caplog.text
+    assert long_message not in caplog.text
+
+
+def test_provider_exception_message_is_ignored_without_int_status_code(caplog):
+    """.message is only trusted when the exception is API-error-shaped.
+
+    Guards against a future, unrelated dependency raising something with a
+    coincidental .message attribute (but no int status_code) and having its
+    text land in the log unbounded/unreviewed.
+    """
+    class NotAnApiError(RuntimeError):
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self.message = message
+
+    client = FakeClient(NotAnApiError("must not leak into detail"))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == ["I couldn't reach my model just now. Still here."]
+    assert "status=unknown" in caplog.text
+    assert "detail=n/a" in caplog.text
+    assert "must not leak into detail" not in caplog.text
 
 
 def test_history_is_limited_to_configured_exchanges():

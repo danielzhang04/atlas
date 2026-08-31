@@ -15,7 +15,7 @@ from worker import app, runtime
 from worker.brain import Brain
 from worker.jobstore import JobStore
 from worker.mcp_client import McpServers
-from worker.tools import ToolRegistry
+from worker.tools import ToolRegistry, api_incompatible_tool_names
 from worker.work import WorkManager
 
 
@@ -90,6 +90,32 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
             "state": "not_configured", "detail": "disabled by configuration",
         }]
         assert factory_calls == []
+    finally:
+        built.store.close()
+
+
+def test_production_registry_has_no_api_incompatible_tool_schemas(monkeypatch, tmp_path):
+    """Regression test for the tools.11.custom.input_schema 400.
+
+    The Anthropic Messages API rejects a tool input_schema with a top-level
+    oneOf/allOf/anyOf. Build the registry the way worker.chat does (via
+    runtime.build) and assert none of the schemas it hands to the model use
+    that shape.
+    """
+    root = _root(tmp_path)
+    monkeypatch.setattr(runtime, "ATLAS", root)
+    built = runtime.build({
+        "fast_model": "claude-test",
+        "google_account": "owner@example.test",
+        "job_store_path": ":memory:",
+        "work_workspace_path": str(tmp_path / "jobs"),
+        "turn_timeout_s": 3,
+        "turn_ceiling_s": 9,
+        "max_tokens": 123,
+        "file_roots": [str(tmp_path)],
+    }, client=FakeClient(), launcher=FakeLauncher())
+    try:
+        assert api_incompatible_tool_names(built.registry.schemas()) == []
     finally:
         built.store.close()
 
