@@ -93,6 +93,7 @@ def build(
     launcher: ClaudeLauncher | None = None,
     session_factory=None,
     paired_url: Callable[[], str | None] | None = None,
+    tool_overrides: dict[str, Any] | None = None,
 ) -> Runtime:
     model = _required_text(cfg, "fast_model")
     store_path = _required_text(cfg, "job_store_path")
@@ -125,7 +126,7 @@ def build(
         folders=files.folders if files is not None else {},
     )
     builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
-            paired_url=paired_url, files=files)
+            paired_url=paired_url, files=files, **(tool_overrides or {}))
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}
     google_account = _required_text(cfg, "google_account")
 

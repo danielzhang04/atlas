@@ -142,13 +142,13 @@ def test_unresolved_configured_path_falls_back_without_localappdata(monkeypatch,
     assert traces.configured_path("$MISSING_ATLAS_HOME/trace.db") == expected
 
 
-def test_one_hour_cache_write_pricing_uses_double_standard_rate(tmp_path):
+def test_one_hour_cache_write_pricing_uses_double_base_input_rate(tmp_path):
     recorder = _recorder(tmp_path / "traces.db", cache_ttl="1h")
     _record_turn(recorder, tokens=(100, 20, 300, 40))
     summary = recorder.summary(days=1)
     recorder.close()
     assert summary["cost_usd"] == pytest.approx(
-        (100 + 20 * 5 + 300 * 0.1 + 40 * 1.25 * 2) / 1e6
+        (100 + 20 * 5 + 300 * 0.1 + 40 * 1.0 * 2) / 1e6
     )
 
 
@@ -188,3 +188,25 @@ def test_disabled_recorder_is_a_no_op(tmp_path: Path):
     _record_turn(recorder)
     assert recorder.summary(days=1)["turns"] == 0
     assert not (tmp_path / "traces.db").exists()
+
+
+def test_configured_fast_model_has_a_pricing_row():
+    # F8: traces.py prices a turn with self._pricing.get(model, {}) and
+    # _price() treats a missing rate as 0.0, so switching fast_model to a lane
+    # with no pricing row bills every turn at $0.00 in silence. Pin the two
+    # together: a lane switch must fail here instead.
+    import yaml
+
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "atlas.yaml").read_text(
+            encoding="utf-8",
+        ),
+    )
+    pricing = config["pricing"]
+    rates = pricing[config["fast_model"]]
+
+    assert set(rates) == {
+        "input_per_mtok", "output_per_mtok",
+        "cache_read_per_mtok", "cache_write_per_mtok",
+    }
+    assert all(isinstance(rate, (int, float)) and rate > 0 for rate in rates.values())

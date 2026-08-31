@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
 
-from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
+from .claims import FAILED_ATTEMPT_REPLY, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
 from .tools import (
     PendingAction,
@@ -27,10 +27,15 @@ logger = logging.getLogger("atlas.brain")
 
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
-CACHE_FLOOR_TOKENS = 4_096
+# Minimum cacheable prefix is model-dependent: 4096 tokens on Haiku-class
+# models, 1024 on Sonnet/Opus-class. Measured prefix on the sonnet-5 lane is
+# ~3.8k, so the haiku floor would false-alarm on every run.
+_CACHE_FLOOR_BY_MODEL = {"claude-haiku-4-5": 4_096}
+CACHE_FLOOR_TOKENS_DEFAULT = 1_024
 CACHE_FLOOR_MAX_CHECKS = 3
-TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
-PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
+CACHE_FLOOR_PROBE_MESSAGE = {"role": "user", "content": "hi"}
+TIMEOUT_REPLY = "I lost that one to a timeout. Still here. "
+PROVIDER_REPLY = "I couldn't reach my model just now. Still here. "
 
 _AFFIRM = frozenset({
     "confirm",
@@ -85,8 +90,13 @@ BASE_SYSTEM = """You are heard, not read: use short sentences, no markdown, and 
 Default answers are at most two short sentences. Give short social turns only a few words.
 Voice summaries are one or two sentences unless Daniel names a length.
 Never repeat Daniel's request back.
-Use tools whenever Daniel asks for something a tool does. Use open only to show an app or page.
+Use tools whenever Daniel asks for something a tool does. Every tool is instant except press_delete
+and mutating kb/MCP actions; for those, the host runs its own confirmation. For instant tools, never
+ask permission and never offer to do something you can just do -- act, then say what you did.
+A tool result with "already": true means nothing new happened -- say it is already open; never say
+you just opened it.
 Do not narrate steps for instant tools; call them directly. Do not say "Let me search" or "Now let me read".
+open with an alias opens the real desktop app when configured; a URL only opens a web page -- prefer the alias.
 Anything that needs reading or acting inside a web page, or Chrome, uses launch_work.
 Use MCP tools for reading mail, calendars, and files. Use launch_work for anything that needs research,
 multiple steps, writing files, browsing, or more than a few seconds.
@@ -170,6 +180,26 @@ def split_spoken(buffer: str) -> tuple[list[str], str]:
         chunks.append(chunk)
         remainder = remainder[end:]
     return chunks, remainder
+
+
+def _substitution_last(verdicts: list[str | None], rebuttal: str) -> list[str]:
+    """Order a held flush so the host's rebuttal is always the last word.
+
+    Item 3: sentences that passed evaluation AFTER an unbacked claim move ahead
+    of the rebuttal; further unbacked claims after the first are dropped by
+    ClaimGuard.evaluate (see its comment) rather than spoken again. The
+    word-boundary space is re-established at this new seam when the last
+    passing chunk does not already end in whitespace -- it may be the model's
+    true final sentence and so never had one to begin with.
+    """
+    ordered = [
+        verdict for verdict in verdicts
+        if verdict is not None and verdict is not UNBACKED_ACTION_REPLY
+    ]
+    if any(verdict is UNBACKED_ACTION_REPLY for verdict in verdicts):
+        boundary = "" if not ordered or ordered[-1][-1:].isspace() else " "
+        ordered.append(boundary + rebuttal)
+    return ordered
 
 
 def _field(block: Any, name: str) -> Any:
@@ -380,14 +410,20 @@ class Brain:
                 model=self.model,
                 system=[cached_system],
                 tools=tools,
-                messages=[],
+                # count_tokens 400s on an empty messages list on every model,
+                # so the Y1 floor check silently never ran. One minimal user
+                # message makes the request valid; it costs a couple of tokens
+                # against a 4096-token floor and is not part of the cached
+                # prefix being measured.
+                messages=[CACHE_FLOOR_PROBE_MESSAGE],
             )
             tokens = _field(result, "input_tokens")
             if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
                 raise ValueError("invalid token count")
             if generation != self._snapshot_generation:
                 return
-            self.cache_floor_ok = tokens >= CACHE_FLOOR_TOKENS
+            floor = _CACHE_FLOOR_BY_MODEL.get(self.model, CACHE_FLOOR_TOKENS_DEFAULT)
+            self.cache_floor_ok = tokens >= floor
             if not self.cache_floor_ok:
                 logger.warning("prompt cache floor unmet: %d tokens", tokens)
         except asyncio.CancelledError:
@@ -476,9 +512,7 @@ class Brain:
         spoken: list[str] = []
         guarded_chunks: list[str] = []
         tool_results: list[tuple[str, bool]] = []
-        guard = ClaimGuard(prompt, self.registry, tools)
-        if pending is not None:
-            guard.remember(pending.arguments)
+        guard = ClaimGuard(prompt, tools)
         tool_rounds = 0
         tainted = bool(context)
         host_line: str | None = None
@@ -550,7 +584,11 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
-                                        if guard.delayed(chunk):
+                                        # Item 7 log runs for every chunk: the
+                                        # hold short-circuit below used to mute
+                                        # it for the rest of the turn.
+                                        guard.observe(chunk)
+                                        if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
                                             spoken.append(chunk)
@@ -565,17 +603,27 @@ class Brain:
                             ok=final is not None,
                         )
                     if buffer:
-                        if guard.delayed(buffer):
+                        guard.observe(buffer)
+                        if guarded_chunks or guard.delayed(buffer):
                             guarded_chunks.append(buffer)
                         else:
                             spoken.append(buffer)
                             yield buffer
                     if not spoken and not guarded_chunks:
                         guarded_chunks.append(host_line)
-                    for chunk in guarded_chunks:
-                        verdict = guard.evaluate(chunk, tool_results)
-                        if verdict is not None:
-                            yield verdict
+                    verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
+                    # The narration flush substituted IN PLACE, so a rebuttal
+                    # landed mid-reply and the reassurance after it was spoken
+                    # last ("I did not actually do that - ... Want me to? It
+                    # failed though."). Same ordering as the main flush; and
+                    # when the host really did attempt the action and it
+                    # failed, the offer variant is wrong -- it was tried.
+                    attempted_and_failed = any(not ok for _name, ok in tool_results)
+                    for chunk in _substitution_last(
+                        verdicts,
+                        FAILED_ATTEMPT_REPLY if attempted_and_failed else UNBACKED_ACTION_REPLY,
+                    ):
+                        yield chunk
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
@@ -596,7 +644,11 @@ class Brain:
                                     buffer += delta
                                     chunks, buffer = split_spoken(buffer)
                                     for chunk in chunks:
-                                        if guard.delayed(chunk):
+                                        # Item 7 log runs for every chunk: the
+                                        # hold short-circuit below used to mute
+                                        # it for the rest of the turn.
+                                        guard.observe(chunk)
+                                        if guarded_chunks or guard.delayed(chunk):
                                             guarded_chunks.append(chunk)
                                         else:
                                             spoken.append(chunk)
@@ -636,7 +688,6 @@ class Brain:
                             tainted=tainted,
                             transcript=prompt,
                         )
-                        guard.remember(arguments)
                         tool_results.append(guard.evidence(
                             name, arguments, result.status == "ok",
                         ))
@@ -655,21 +706,36 @@ class Brain:
                         {"role": "user", "content": results},
                     ))
                     tool_rounds += 1
+                    # Seam between tool rounds: split_spoken only carries
+                    # whitespace the model actually streamed, so a round that
+                    # ended on its last sentence leaves no trailing space and
+                    # the next round's first chunk glues onto it
+                    # ("...for you.Music's playing."). Seed one boundary space
+                    # into the buffer; sanitize's _MULTISPACE collapses it if
+                    # the next round opens with its own space.
+                    if not buffer:
+                        emitted = (guarded_chunks or spoken or [""])[-1]
+                        if emitted and not emitted[-1].isspace():
+                            buffer = " "
 
-                if buffer:
-                    if guard.delayed(buffer):
+                if buffer.strip():
+                    guard.observe(buffer)
+                    if guarded_chunks or guard.delayed(buffer):
                         guarded_chunks.append(buffer)
                     else:
                         spoken.append(buffer)
                         yield buffer
-                final_chunks = [
-                    verdict for chunk in guarded_chunks
-                    if (verdict := guard.evaluate(chunk, tool_results)) is not None
-                ]
-                spoken.extend(final_chunks)
-                self._remember(prompt, "".join(spoken))
-                for chunk in final_chunks:
-                    yield chunk
+                verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
+                final_chunks = _substitution_last(verdicts, UNBACKED_ACTION_REPLY)
+                try:
+                    for chunk in final_chunks:
+                        spoken.append(chunk)
+                        yield chunk
+                finally:
+                    # Item 5: record only what was actually yielded, so a
+                    # generator closed mid-flush (barge-in) remembers just
+                    # the spoken prefix, not sentences Daniel never heard.
+                    self._remember(prompt, "".join(spoken))
         except TimeoutError:
             yield host_line or TIMEOUT_REPLY
         except Exception as exc:

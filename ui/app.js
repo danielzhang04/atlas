@@ -16,7 +16,7 @@
    * Hidden: 0 signal + 12 state + 12 jobs + 0 events = 24/min (88.2% below 204).
    * Settings adds 12 health requests/min only while visible.
    */
-  const SIGNAL_INTERVAL_MS = 100;
+  const SIGNAL_INTERVAL_MS = 150;
   const STATE_INTERVAL_MS = 1000;
   const JOBS_INTERVAL_MS = 2000;
   const HIDDEN_INTERVAL_MS = 5000;
@@ -26,7 +26,8 @@
     connection: document.querySelector("#connection"), topbar: document.querySelector(".topbar"),
     windowControls: document.querySelector("#window-controls"), windowMinimize: document.querySelector("#window-minimize"),
     windowMaximize: document.querySelector("#window-maximize"), windowClose: document.querySelector("#window-close"),
-    canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
+    canvas: document.querySelector("#engine-canvas"), engineCard: document.querySelector(".engine-card"),
+    stateLabel: document.querySelector("#state-label"),
     greeting: document.querySelector("#greeting"), toolStrip: document.querySelector("#tool-strip"),
     toolAnnouncer: document.querySelector("#tool-announcer"),
     textForm: document.querySelector("#text-turn-form"), textInput: document.querySelector("#text-turn-input"),
@@ -46,7 +47,7 @@
 
   let actionToken = "", actionExpiresAt = 0, pairingExpiryTimer = 0;
   let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
-  let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
+  let transcriptSignature = "", jobsSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
   let greetingTimer = 0, userName = "", activeToolIdentity = "";
   let pendingDismissTimer = 0, pendingDismissEnd = null;
   const pendingRequests = new Set();
@@ -220,6 +221,8 @@
     let toLayerPresence = 0;
     let animationFrame = 0;
     let running = false;
+    let wantsActive = false;
+    let lastFrameNow = 0;
     let coreDashPattern = [];
     let majorTickPath = new Path2D();
     let minorTickPath = new Path2D();
@@ -361,6 +364,10 @@
       backdrop.moveTo(spriteSize * .07, middle);
       backdrop.lineTo(spriteSize * .93, middle);
       backdrop.stroke();
+      // canvas.width/height above just cleared the bitmap; the rAF loop self-pauses
+      // while idle (ASLEEP/OFFLINE), so nothing will repaint it on its own — force
+      // one frame now without resuming the loop.
+      if (!running) draw(performance.now());
     }
 
     function expandBands() {
@@ -447,6 +454,9 @@
       realState = ENGINE_STATES.has(nextState) ? nextState : "OFFLINE";
       canvas.setAttribute("aria-label", `Atlas engine ${realState.toLowerCase()}`);
       if (!ENGINE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
+      // Waking from ASLEEP/OFFLINE must resume the loop immediately, not wait for
+      // the next start()/stop() call from view/visibility changes.
+      if (wantsActive && !running && !isIdleNow()) start();
     }
 
     function drawBackdrop() {
@@ -533,11 +543,20 @@
       context.restore();
     }
 
-    function drawWaveform(now) {
+    function drawWaveform(now, dt) {
       const baseRadius = .323 * scale;
       const inwardRange = .018 * scale;
       const outwardRange = .092 * scale;
       const breathing = .5 + .5 * Math.sin(now * .00115);
+      // Frame-rate-independent exponential decay: factor = 1 - (1-k)^(dt/16.67).
+      // At 60fps (dt=16.67, rate=1) this equals the old fixed k exactly; at lower
+      // frame rates it decays proportionally with no overshoot (a linear
+      // `k * rate` would overshoot ~19% at 30fps and hard-snap to target for any
+      // dt >= ~52ms, inside the 100ms clamp above) — the exponential form is
+      // naturally < 1 for any finite rate, so no Math.min cap is needed.
+      const rate = dt / 16.67;
+      const growFactor = 1 - Math.pow(1 - .32, rate);
+      const shrinkFactor = 1 - Math.pow(1 - .1, rate);
       const barPath = new Path2D();
       const tipPath = new Path2D();
       for (let index = 0; index < BAR_COUNT; index += 1) {
@@ -548,7 +567,7 @@
         if (visualState === "THINKING") target = .17 + .11 * (.5 + .5 * Math.sin(index * .31 + now * .002));
         if (visualState === "OFFLINE") target = 0;
         const current = barValues[index];
-        barValues[index] += (target - current) * (target > current ? .32 : .1);
+        barValues[index] += (target - current) * (target > current ? growFactor : shrinkFactor);
         const value = barValues[index];
         const innerRadius = baseRadius - inwardRange * value;
         const outerRadius = baseRadius + .008 * scale + outwardRange * value;
@@ -635,6 +654,8 @@
       setVisualState(previewState || realState);
       prepareFrameSignal(now, previewState);
       mixColors(now);
+      const dt = lastFrameNow ? Math.min(100, Math.max(0, now - lastFrameNow)) : 16.67;
+      lastFrameNow = now;
       context.fillStyle = "#070a10";
       context.fillRect(0, 0, width, height);
       drawBackdrop();
@@ -642,12 +663,28 @@
       drawSegmentRings(now);
       drawScanner(now);
       drawParticles(now);
-      drawWaveform(now);
+      drawWaveform(now, dt);
       drawCore(now);
+    }
+
+    // Idle (ASLEEP/OFFLINE) pauses the rAF loop entirely; a live preview override
+    // (headless review) keeps it running so any state can still be inspected.
+    function isIdleNow() {
+      return (realState === "ASLEEP" || realState === "OFFLINE")
+        && !ENGINE_STATES.has(window.__atlasEnginePreview);
+    }
+
+    function pauseLoop() {
+      running = false;
+      metrics.running = false;
+      canvas.dataset.animation = "paused";
+      if (animationFrame) cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
     }
 
     function frame(now) {
       if (!running) return;
+      if (isIdleNow()) { pauseLoop(); return; }
       const started = performance.now();
       draw(now);
       const elapsed = performance.now() - started;
@@ -663,7 +700,8 @@
     }
 
     function start() {
-      if (running || document.visibilityState !== "visible") return;
+      wantsActive = true;
+      if (running || isIdleNow() || document.visibilityState !== "visible") return;
       resize();
       running = true;
       metrics.running = true;
@@ -672,11 +710,8 @@
     }
 
     function stop() {
-      running = false;
-      metrics.running = false;
-      canvas.dataset.animation = "paused";
-      if (animationFrame) cancelAnimationFrame(animationFrame);
-      animationFrame = 0;
+      wantsActive = false;
+      pauseLoop();
     }
 
     if (typeof ResizeObserver === "function") {
@@ -834,6 +869,7 @@
       ? "TOOL"
       : VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
     if (refs.stateLabel.textContent !== state) refs.stateLabel.textContent = state;
+    refs.engineCard.classList.toggle("is-idle", state === "ASLEEP" || state === "OFFLINE");
     engine.setState(state);
   }
 
@@ -846,11 +882,13 @@
     if (identity === activeToolIdentity) return;
     activeToolIdentity = identity;
     if (!identity) {
-      refs.toolStrip.hidden = true;
+      refs.toolStrip.classList.remove("is-active");
+      refs.toolStrip.setAttribute("aria-hidden", "true");
       refs.toolStrip.textContent = "";
       return;
     }
-    refs.toolStrip.hidden = false;
+    refs.toolStrip.classList.add("is-active");
+    refs.toolStrip.removeAttribute("aria-hidden");
     refs.toolStrip.textContent = `TOOL - ${name}`;
     refs.toolAnnouncer.replaceChildren(document.createTextNode(`Tool started: ${name}.`));
   }
@@ -904,16 +942,21 @@
   function renderAudio(audio) {
     const input = audioDevice(audio, "input");
     const output = audioDevice(audio, "output");
-    refs.audioLine.textContent = `mic: ${input.name} · speaker: ${output.name}`;
-    refs.audioInput.textContent = input.name;
-    refs.audioOutput.textContent = output.name;
-    refs.audioInputMode.textContent = input.present && input.following ? "following system default" : "";
-    refs.audioOutputMode.textContent = output.present && output.following ? "following system default" : "";
+    const line = `mic: ${input.name} · speaker: ${output.name}`;
+    const inputMode = input.present && input.following ? "following system default" : "";
+    const outputMode = output.present && output.following ? "following system default" : "";
+    if (refs.audioLine.textContent !== line) refs.audioLine.textContent = line;
+    if (refs.audioInput.textContent !== input.name) refs.audioInput.textContent = input.name;
+    if (refs.audioOutput.textContent !== output.name) refs.audioOutput.textContent = output.name;
+    if (refs.audioInputMode.textContent !== inputMode) refs.audioInputMode.textContent = inputMode;
+    if (refs.audioOutputMode.textContent !== outputMode) refs.audioOutputMode.textContent = outputMode;
   }
 
   function renderVoice(payload) {
-    refs.voiceStatus.textContent = displayString(payload.voice);
-    refs.wakeStatus.textContent = displayString(payload.wake_model);
+    const voice = displayString(payload.voice);
+    const wake = displayString(payload.wake_model);
+    if (refs.voiceStatus.textContent !== voice) refs.voiceStatus.textContent = voice;
+    if (refs.wakeStatus.textContent !== wake) refs.wakeStatus.textContent = wake;
   }
 
   function refreshState() {
@@ -1202,6 +1245,19 @@
         jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
         const active = jobs.map((job) => jobView(job)).filter((view) => view.active);
         if (!document.hidden) await Promise.all(active.map((view) => refreshEvents(view.job)));
+        // The gate exists to skip a full rebuild every 2s while nothing
+        // changes. Jobs alone were not enough: rendered rows also depend on
+        // the clock ("just now" pinned forever once jobs stopped changing) and
+        // on pairing (stale "Pair to cancel" buttons survived pairing). The
+        // 30s bucket keeps the idle-rebuild rate at ~1 per 30s, not 1 per 2s.
+        const signature = JSON.stringify({
+          jobs,
+          events: active.map((view) => [view.job.id, eventStore(view.job.id).length]),
+          paired: Boolean(actionToken),
+          clockBucket: Math.floor(Date.now() / 30000),
+        });
+        if (signature === jobsSignature) return;
+        jobsSignature = signature;
         renderWorkers();
         renderHistory();
       } catch (_error) {

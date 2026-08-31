@@ -79,8 +79,8 @@ def test_state_signal_assets_and_security_headers():
     assert 'aria-controls="history-view"' in page[2]
     assert 'id="audio-line"' in page[2]
     assert 'id="greeting"' in page[2]
-    assert 'id="tool-strip" hidden' in page[2]
-    assert 'id="tool-strip" aria-hidden' not in page[2]
+    assert 'id="tool-strip" aria-hidden="true"' in page[2]
+    assert 'id="tool-strip" hidden' not in page[2]
     assert 'id="quick-actions"' not in page[2]
     assert 'id="text-turn-input"' in page[2]
     assert 'class="text-turn-form"' in page[2]
@@ -106,6 +106,19 @@ def test_state_signal_assets_and_security_headers():
     assert "function drawParticles(now)" in script[2]
     assert "Math.min(2" in script[2]
     assert "new Path2D()" in script[2]
+    # Waveform easing must be frame-rate-independent exponential decay, not a
+    # linear `k * rate` (which overshoots ~19% at 30fps and hard-snaps to target
+    # for dt >= ~52ms): factor = 1 - (1-k)^(dt/16.67), no Math.min cap needed
+    # since it is naturally < 1 for any finite rate.
+    assert "function drawWaveform(now, dt)" in script[2]
+    assert "const growFactor = 1 - Math.pow(1 - .32, rate);" in script[2]
+    assert "const shrinkFactor = 1 - Math.pow(1 - .1, rate);" in script[2]
+    assert "Math.min(1, .32" not in script[2]
+    assert "Math.min(1, .1" not in script[2]
+    # Jobs-signature gate must not freeze pairing-derived UI or relative
+    # timestamps: pairing state and a 30s clock bucket are part of the signature.
+    assert "paired: Boolean(actionToken)," in script[2]
+    assert "clockBucket: Math.floor(Date.now() / 30000)," in script[2]
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]
@@ -115,7 +128,7 @@ def test_state_signal_assets_and_security_headers():
     render_tool = script[2].split("function renderTool", 1)[1].split("function renderGreeting", 1)[0]
     identity_guard = "if (identity === activeToolIdentity) return;"
     assert "JSON.stringify([name, since])" in render_tool
-    assert render_tool.index(identity_guard) < render_tool.index("refs.toolStrip.hidden")
+    assert render_tool.index(identity_guard) < render_tool.index("refs.toolStrip.classList.remove")
     assert render_tool.index(identity_guard) < render_tool.index("refs.toolAnnouncer.replaceChildren")
     live_activity = script[2].split("function updateLiveActivity", 1)[1].split("function eventStore", 1)[0]
     assert "currentView === \"live\" && document.visibilityState === \"visible\"" in live_activity

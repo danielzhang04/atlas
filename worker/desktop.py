@@ -49,6 +49,9 @@ HTBOTTOMLEFT, HTBOTTOMRIGHT = 16, 17
 MONITOR_DEFAULTTONEAREST = 2
 SWP_FRAMECHANGED, SWP_NOACTIVATE = 0x0020, 0x0010
 SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER = 0x0002, 0x0001, 0x0004
+WEBVIEW_OCCLUSION_FEATURE = "CalculateNativeWinOcclusion"
+WEBVIEW_DISABLE_FEATURES = "--disable-features="
+WEBVIEW_BROWSER_ARGUMENTS = "--disable-features=ElasticOverscroll"
 _native_window_hooks = {}
 class _WindowRect(ctypes.Structure): _fields_ = [(name, ctypes.c_long) for name in ("left", "top", "right", "bottom")]
 class _NCCalcSizeParams(ctypes.Structure): _fields_ = [("rects", _WindowRect * 3), ("window_pos", ctypes.c_void_p)]
@@ -772,6 +775,97 @@ def _on_window_shown(proc, window, closing, restart) -> None:
                 logger.warning("could not set the Atlas Windows window icon: %s", detail)
                 logger.warning("could not configure the Atlas frameless Windows window: %s", detail)
     _watch_child(proc, window, closing, restart)
+def _merge_disable_features(arguments: str, feature: str) -> str | None:
+    """Fold `feature` into one `--disable-features=` flag, or None when splitting would corrupt it.
+
+    Chromium keeps only the last `--disable-features` argument, so every disabled feature has to
+    travel in one comma-joined flag. A quoted argument cannot be split on whitespace, so a value
+    carrying a double quote is refused rather than rewritten.
+    """
+    if '"' in arguments:
+        return None
+    values, others, position = [], [], None
+    for part in arguments.split():
+        if part.startswith(WEBVIEW_DISABLE_FEATURES):
+            if position is None:
+                position = len(others)
+            for value in part[len(WEBVIEW_DISABLE_FEATURES):].split(","):
+                if value and value not in values:
+                    values.append(value)
+        else:
+            others.append(part)
+    if feature not in values:
+        values.append(feature)
+    others.insert(len(others) if position is None else position,
+                  WEBVIEW_DISABLE_FEATURES + ",".join(values))
+    return " ".join(others)
+def _patch_webview_occlusion() -> None:
+    """Disable Windows native occlusion tracking for the WebView2 that renders the Atlas window.
+
+    Targets pywebview 6.2.1, whose `webview.platforms.edgechromium.EdgeChrome.__init__` hardcodes
+    `props.AdditionalBrowserArguments = '--disable-features=ElasticOverscroll'` and exposes no
+    settings hook for extra arguments. Windows native occlusion tracking can wrongly treat the
+    Atlas frameless custom-WndProc window as occluded and throttle its rendering, so
+    `CalculateNativeWinOcclusion` is merged into that value: two separate `--disable-features`
+    arguments do not combine in Chromium, the last one wins.
+
+    The last line of that constructor calls `EnsureCoreWebView2Async`, which reads the argument
+    string synchronously and copies it into the native environment options, so editing the
+    creation properties after the constructor returns is a silent no-op. This instead rewrites the
+    one string constant in the constructor's code object, which lands the merged value inside the
+    constructor before that call, keeps the original signature, and adds no wrapper frame: a
+    failure while building the browser still propagates exactly as it does today.
+
+    Every step is feature-detected - the module, the class, its own Python constructor, and exactly
+    one code constant equal to the known literal (CPython folds repeated equal literals into one
+    constant, so every use of it moves together). On any mismatch, such as a future pywebview, one
+    bounded INFO line is logged and the app behaves exactly as it does unpatched; nothing raises. A
+    constructor already carrying the feature is left alone, so repeat calls are silent no-ops.
+
+    Rule 11: importing this platform module costs 0.6-0.8s and about 41MB RSS (28 -> 69MB), and it
+    grows `os.environ['Path']` by 245 characters with the WebView2 interop directories. That cost
+    is moved, not added: `run` calls this immediately before `start`, which is where pywebview
+    imports the same module anyway, after the child environment has been copied, so neither the
+    already-running exit path nor any child process pays for it. Revert by deleting this function,
+    `_merge_disable_features`, and the single call in `run`.
+    """
+    from importlib import import_module
+    from types import FunctionType
+    def skip(reason: str) -> None:
+        logger.info("webview occlusion patch skipped: %s", reason)
+    try:
+        module = import_module("webview.platforms.edgechromium")
+    except Exception as error:
+        return skip(type(error).__name__)
+    browser = getattr(module, "EdgeChrome", None)
+    if not isinstance(browser, type):
+        return skip("class")
+    original = vars(browser).get("__init__")
+    code = getattr(original, "__code__", None)
+    if not isinstance(original, FunctionType) or code is None:
+        return skip("constructor")
+    constants = getattr(code, "co_consts", ())
+    if any(isinstance(value, str) and WEBVIEW_OCCLUSION_FEATURE in value for value in constants):
+        return
+    if sum(1 for value in constants
+           if isinstance(value, str) and value == WEBVIEW_BROWSER_ARGUMENTS) != 1:
+        return skip("literal")
+    merged = _merge_disable_features(WEBVIEW_BROWSER_ARGUMENTS, WEBVIEW_OCCLUSION_FEATURE)
+    if merged is None:
+        return skip("quoted")
+    try:
+        patched = FunctionType(
+            code.replace(co_consts=tuple(
+                merged if isinstance(value, str) and value == WEBVIEW_BROWSER_ARGUMENTS else value
+                for value in constants)),
+            original.__globals__, original.__name__, original.__defaults__, original.__closure__)
+        patched.__kwdefaults__ = original.__kwdefaults__
+        patched.__qualname__ = original.__qualname__
+        patched.__doc__ = original.__doc__
+        patched.__dict__.update(original.__dict__)
+        browser.__init__ = patched
+    except Exception as error:
+        skip(type(error).__name__)
 def run(
     *,
     spawn: Callable = subprocess.Popen,
@@ -782,6 +876,7 @@ def run(
     show_already_running: Callable = _show_already_running,
     assign_job: Callable = jobobject.assign_process,
     close_handle: Callable = _close_handle,
+    patch_webview: Callable = _patch_webview_occlusion,
     token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
     wait_url_timeout_s: float = 90,
 ) -> int:
@@ -945,6 +1040,7 @@ def run(
 
         window.events.closing += _confirm_close_current
         window.events.closed += _stop_once
+        patch_webview()
         start(_on_window_shown, (proc, window, closing, _restart_child))
         return 0
     finally:
