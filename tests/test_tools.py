@@ -271,7 +271,7 @@ def test_open_resolves_aliases_https_and_rejects_other_targets():
 
     result = _call(registry, "open", {"target": "Email"})
     assert result.status == "ok"
-    assert json.loads(result.content) == {"opened": "gmail"}
+    assert json.loads(result.content) == {"opened": "gmail", "via": "web"}
     assert opened == ["https://mail.google.com/"]
 
     result = _call(registry, "open", {"target": "https://example.com/x"})
@@ -282,6 +282,71 @@ def test_open_resolves_aliases_https_and_rejects_other_targets():
         result = _call(registry, "open", {"target": target})
         assert result.status == "error"
         assert result.content == "unknown app"
+
+
+def test_open_schema_lists_sorted_alias_names():
+    registry = ToolRegistry()
+    apps = {
+        "spotify": AppEntry(exe="spotify", words=("spotify", "music")),
+        "gmail": AppEntry(url="https://mail.google.com/", words=("gmail", "email")),
+        "chrome": AppEntry(exe="chrome", words=("chrome", "browser")),
+    }
+    builtin(registry, apps, _FakeWork())
+
+    open_schema = next(schema for schema in registry.schemas() if schema["name"] == "open")
+
+    assert "chrome, gmail, spotify" in open_schema["description"]
+
+
+def test_open_url_alias_dedupes_within_the_window_but_not_after_it():
+    opened = []
+    now = [0.0]
+    registry = ToolRegistry()
+    apps = {
+        "gmail": AppEntry(url="https://mail.google.com/", words=("gmail",)),
+    }
+    builtin(registry, apps, _FakeWork(), opener=opened.append, clock=lambda: now[0])
+
+    first = _call(registry, "open", {"target": "gmail"})
+    now[0] = 5.0
+    second = _call(registry, "open", {"target": "gmail"})
+    now[0] = 30.0
+    third = _call(registry, "open", {"target": "gmail"})
+
+    assert json.loads(first.content) == {"opened": "gmail", "via": "web"}
+    assert json.loads(second.content) == {"opened": "gmail", "via": "web", "already": True}
+    assert json.loads(third.content) == {"opened": "gmail", "via": "web"}
+    assert opened == ["https://mail.google.com/", "https://mail.google.com/"]
+
+
+def test_open_desktop_fallback_to_web_also_dedupes():
+    from worker.desktopapps import DesktopAppError
+
+    opened = []
+    now = [0.0]
+    apps = {
+        "spotify": AppEntry(
+            exe="spotify", url="https://open.spotify.com/", words=("spotify",),
+        ),
+    }
+    registry = ToolRegistry()
+
+    def unavailable(_app_id, _url):
+        raise DesktopAppError("unavailable")
+
+    builtin(
+        registry, apps, _FakeWork(),
+        opener=opened.append, profile_opener=unavailable, clock=lambda: now[0],
+    )
+
+    first = _call(registry, "open", {"target": "spotify"})
+    second = _call(registry, "open", {"target": "spotify"})
+
+    assert json.loads(first.content) == {"opened": "spotify", "via": "web"}
+    assert json.loads(second.content) == {
+        "opened": "spotify", "via": "web", "already": True,
+    }
+    assert opened == ["https://open.spotify.com/"]
 
 
 def test_open_exe_and_focus_use_signed_profiles():
@@ -301,7 +366,7 @@ def test_open_exe_and_focus_use_signed_profiles():
     )
 
     result = _call(registry, "open", {"target": "VS Code"})
-    assert json.loads(result.content) == {"opened": "vscode"}
+    assert json.loads(result.content) == {"opened": "vscode", "via": "desktop"}
     assert opened == [("vscode", None)]
     result = _call(registry, "focus", {"app": "editor"})
     assert json.loads(result.content) == {"focused": "vscode"}
@@ -666,7 +731,7 @@ def test_open_prefers_spotify_desktop_profile_and_falls_back_to_web():
         profile_opener=lambda app_id, url: profiles.append((app_id, url)),
     )
     result = _call(registry, "open", {"target": "spotify"})
-    assert json.loads(result.content) == {"opened": "spotify"}
+    assert json.loads(result.content) == {"opened": "spotify", "via": "desktop"}
     assert profiles == [("spotify", None)]
     assert opened == []
 
@@ -683,7 +748,7 @@ def test_open_prefers_spotify_desktop_profile_and_falls_back_to_web():
         profile_opener=unavailable,
     )
     result = _call(registry, "open", {"target": "spotify"})
-    assert json.loads(result.content) == {"opened": "spotify"}
+    assert json.loads(result.content) == {"opened": "spotify", "via": "web"}
     assert opened == ["https://open.spotify.com/"]
 
 
