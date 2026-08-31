@@ -18,6 +18,8 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from .statusdetail import status_detail_allowed
+
 __all__ = [
     "HEADER",
     "HOST",
@@ -52,7 +54,9 @@ JOB_ID = re.compile(
 JOB_FIELDS = (
     "id", "title", "status", "session_id", "created_at", "updated_at", "summary", "error",
 )
-MCP_FIELDS = ("name", "connected", "tools", "error")
+MCP_FIELDS = ("name", "connected", "tools", "error", "state", "detail")
+MCP_STATES = frozenset({"connecting", "connected", "not_configured", "error"})
+APP_STATES = frozenset({"configured", "not_configured", "error"})
 WAKE_MODEL_LIMIT = 128
 
 
@@ -247,18 +251,78 @@ def _safe_mcp(value: Any) -> list[dict[str, Any]]:
     for item in value[:32]:
         if not isinstance(item, dict):
             continue
-        name, connected, tools, error = (item.get(key) for key in MCP_FIELDS)
+        name, _connected, tools, error, state, detail = (
+            item.get(key) for key in MCP_FIELDS
+        )
         if not (
-            isinstance(name, str) and isinstance(connected, bool)
+            isinstance(name, str)
             and isinstance(tools, int) and not isinstance(tools, bool)
             and (error is None or isinstance(error, str))
+            and state in MCP_STATES
+            and status_detail_allowed(state, detail)
         ):
             continue
-        servers.append({
-            "name": name[:128], "connected": connected, "tools": max(0, tools),
-            "error": error[:128] if error is not None else None,
-        })
+        connected = state == "connected"
+        projected = {
+            "name": name[:128], "connected": connected,
+            "tools": max(0, tools) if connected else 0,
+            "error": error[:128] if state == "error" and error is not None else None,
+            "state": state, "detail": detail,
+        }
+        session = item.get("session")
+        if name == "kb" and session in {"held", "none", "expired"}:
+            projected["session"] = session
+        servers.append(projected)
     return servers
+
+
+def _safe_apps(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    apps = []
+    for item in value[:32]:
+        if not isinstance(item, dict):
+            continue
+        name, state, detail = (item.get(key) for key in ("name", "state", "detail"))
+        if not (
+            isinstance(name, str) and state in APP_STATES
+            and status_detail_allowed(state, detail)
+        ):
+            continue
+        apps.append({"name": name[:128], "state": state, "detail": detail})
+    return apps
+
+
+def _pending_projection(registry: Any) -> dict[str, str] | None:
+    if registry is None:
+        return None
+    pending = registry.pending
+    if pending is None:
+        return None
+    readback = _bounded_string(getattr(pending, "summary", None), 2_048)
+    if readback is None:
+        readback = "Confirmation required."
+    return {"readback": readback}
+
+
+def _safe_traces(value: Any) -> dict[str, bool | int | float]:
+    if not isinstance(value, dict):
+        value = {}
+
+    def _number(name: str, maximum: float) -> float:
+        item = value.get(name)
+        return min(max(0.0, float(item)), maximum) if _finite_number(item) else 0.0
+
+    turns = value.get("turns_today")
+    if isinstance(turns, bool) or not isinstance(turns, int):
+        turns = 0
+    return {
+        "enabled": value.get("enabled") is True,
+        "turns_today": min(max(0, turns), 1_000_000),
+        "avg_ms_today": _number("avg_ms_today", 86_400_000.0),
+        "cache_hit_ratio_today": _number("cache_hit_ratio_today", 1.0),
+        "cost_usd_today": _number("cost_usd_today", 1_000_000.0),
+    }
 
 
 class StateServer:
@@ -273,6 +337,10 @@ class StateServer:
         result_provider=None,
         cancel_provider=None,
         health_provider=None,
+        registry=None,
+        quick_actions=(),
+        quick_result_provider=None,
+        text_turn_provider=None,
         shutdown_token: str | None = None,
         shutdown_provider=None,
     ) -> None:
@@ -284,6 +352,10 @@ class StateServer:
         self._result_provider = result_provider
         self._cancel_provider = cancel_provider
         self._health_provider = health_provider
+        self._registry = registry
+        self._quick_actions = tuple(quick_actions)
+        self._quick_result_provider = quick_result_provider
+        self._text_turn_provider = text_turn_provider
         self._shutdown_token = shutdown_token
         self._shutdown_provider = shutdown_provider
         self._shutdown_task: asyncio.Task | None = None
@@ -293,6 +365,9 @@ class StateServer:
     async def _handle_state(self, _request: web.Request) -> web.Response:
         payload = self._publisher.snapshot()
         payload["wake_model"] = _bounded_string(payload.get("wake_model"), WAKE_MODEL_LIMIT)
+        payload["quick_actions"] = [
+            {"label": action.label} for action in self._quick_actions
+        ]
         payload["heartbeat"] = self._clock().isoformat()
         return web.json_response(payload, headers={"cache-control": "no-store"})
 
@@ -379,7 +454,15 @@ class StateServer:
             value = {}
         payload = {
             "claude": value.get("claude") is True,
+            "cache_floor_ok": (
+                value.get("cache_floor_ok")
+                if isinstance(value.get("cache_floor_ok"), bool)
+                else None
+            ),
+            "as_of": _bounded_string(value.get("as_of"), 64) or self._clock().isoformat(),
             "mcp": _safe_mcp(value.get("mcp", [])),
+            "apps": _safe_apps(value.get("apps", [])),
+            "traces": _safe_traces(value.get("traces")),
         }
         return web.json_response(payload, headers={"cache-control": "no-store"})
 
@@ -390,6 +473,14 @@ class StateServer:
             self._authorizer.authorize(request.headers.get(HEADER))
         except PermissionError as exc:
             raise web.HTTPUnauthorized(text=str(exc)) from None
+
+    def _authorize_action(self, request: web.Request) -> None:
+        if self._authorizer is None:
+            raise web.HTTPServiceUnavailable(text="Atlas UI pairing is unavailable")
+        try:
+            self._authorizer.authorize(request.headers.get(HEADER))
+        except PermissionError as exc:
+            raise web.HTTPForbidden(text=str(exc)) from None
 
     def _same_origin(self, request: web.Request) -> bool:
         host = request.host.rsplit(":", 1)[0].strip("[]").lower()
@@ -481,6 +572,51 @@ class StateServer:
             raise web.HTTPServiceUnavailable(text="job cancellation returned invalid state")
         return web.json_response({"job": job}, headers={"cache-control": "no-store"})
 
+    async def _handle_quick_action(self, request: web.Request) -> web.Response:
+        self._authorize_action(request)
+        payload = await self._read_json(request)
+        index = payload.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(self._quick_actions)
+        ):
+            raise web.HTTPBadRequest(text="invalid quick action index")
+        if self._registry is None:
+            raise web.HTTPServiceUnavailable(text="quick actions unavailable")
+        action = self._quick_actions[index]
+        result = await self._registry.call(action.tool, action.args)
+        if self._quick_result_provider is not None:
+            try:
+                await _provide(self._quick_result_provider, action.tool, result)
+            except Exception as exc:
+                logger.warning("quick action result provider failed: %s", type(exc).__name__)
+        response: dict[str, Any] = {
+            "ok": result.status != "error",
+            "pending": _pending_projection(self._registry),
+        }
+        if result.status != "needs_confirmation":
+            response["message"] = result.content
+        return web.json_response(response, headers={"cache-control": "no-store"})
+
+    async def _handle_text_turn(self, request: web.Request) -> web.Response:
+        self._authorize_action(request)
+        payload = await self._read_json(request)
+        text = _bounded_string(payload.get("text"), 2_048)
+        if text is None:
+            raise web.HTTPBadRequest(text="text must be a non-empty string")
+        if self._text_turn_provider is None:
+            raise web.HTTPServiceUnavailable(text="text turns unavailable")
+        try:
+            await _provide(self._text_turn_provider, text)
+        except Exception as exc:
+            logger.warning("text turn provider failed: %s", type(exc).__name__)
+            raise web.HTTPServiceUnavailable(text="text turn failed") from None
+        return web.json_response(
+            {"ok": True, "pending": _pending_projection(self._registry)},
+            headers={"cache-control": "no-store"},
+        )
+
     async def _handle_shutdown(self, request: web.Request) -> web.Response:
         supplied = request.headers.get(SHUTDOWN_HEADER)
         if (
@@ -503,6 +639,54 @@ class StateServer:
             headers={"cache-control": "no-store"},
         )
 
+    async def _handle_kb_session(self, request: web.Request) -> web.Response:
+        supplied = request.headers.get(SHUTDOWN_HEADER)
+        if (
+            not self._shutdown_token
+            or not supplied
+            or not hmac.compare_digest(supplied, self._shutdown_token)
+        ):
+            raise web.HTTPForbidden(text="valid launcher token required")
+        payload = await self._read_json(request)
+        token, expires_at = payload.get("token"), payload.get("expiresAt")
+        if not isinstance(token, str) or not token or not isinstance(
+            expires_at, (str, int, float),
+        ) or isinstance(expires_at, bool):
+            raise web.HTTPBadRequest(text="invalid kb session")
+        from .mcp_client import active_mcp_servers
+
+        mcp = active_mcp_servers()
+        if mcp is None:
+            raise web.HTTPServiceUnavailable(text="kb session channel unavailable")
+        try:
+            await mcp.set_session("kb", token, expires_at)
+        except ValueError:
+            raise web.HTTPBadRequest(text="invalid kb session") from None
+        except Exception as exc:
+            logger.warning("kb session forwarding failed: %s", type(exc).__name__)
+            raise web.HTTPServiceUnavailable(text="kb session forwarding failed") from None
+        return web.json_response(
+            {"ok": True},
+            headers={"cache-control": "no-store"},
+        )
+
+    async def _handle_kb_config(self, request: web.Request) -> web.Response:
+        supplied = request.headers.get(SHUTDOWN_HEADER)
+        if (
+            not self._shutdown_token
+            or not supplied
+            or not hmac.compare_digest(supplied, self._shutdown_token)
+        ):
+            raise web.HTTPForbidden(text="valid launcher token required")
+        from .mcp_client import active_mcp_servers
+
+        mcp = active_mcp_servers()
+        origin = mcp.session_origin("kb") if mcp is not None else None
+        return web.json_response(
+            {"enabled": origin is not None, "origin": origin},
+            headers={"cache-control": "no-store"},
+        )
+
     async def start(self, port: int) -> "StateServer":
         app = web.Application(middlewares=[_security_middleware(lambda: self.port)])
         app.router.add_get("/", self._handle_index)
@@ -517,6 +701,10 @@ class StateServer:
         app.router.add_get("/jobs/{job_id}/events", self._handle_job_events)
         app.router.add_get("/jobs/{job_id}/result", self._handle_job_result)
         app.router.add_post("/jobs/{job_id}/cancel", self._handle_cancel_job)
+        app.router.add_post("/actions/quick", self._handle_quick_action)
+        app.router.add_post("/turn", self._handle_text_turn)
+        app.router.add_get("/kb/config", self._handle_kb_config)
+        app.router.add_post("/kb/session", self._handle_kb_session)
         app.router.add_post("/shutdown", self._handle_shutdown)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -551,6 +739,10 @@ async def start(
     result_provider=None,
     cancel_provider=None,
     health_provider=None,
+    registry=None,
+    quick_actions=(),
+    quick_result_provider=None,
+    text_turn_provider=None,
     shutdown_token: str | None = None,
     shutdown_provider=None,
 ) -> StateServer:
@@ -563,6 +755,10 @@ async def start(
         result_provider=result_provider,
         cancel_provider=cancel_provider,
         health_provider=health_provider,
+        registry=registry,
+        quick_actions=quick_actions,
+        quick_result_provider=quick_result_provider,
+        text_turn_provider=text_turn_provider,
         shutdown_token=shutdown_token,
         shutdown_provider=shutdown_provider,
     )

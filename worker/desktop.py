@@ -17,6 +17,7 @@ from threading import Event, Lock, Thread
 import time
 from typing import Callable, TextIO
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import webview
@@ -202,6 +203,59 @@ def _status_html(title: str, message: str, *, heading: str | None = None) -> str
 </html>"""
 STOPPED_HTML = _status_html("Atlas stopped", "Close this window and open Atlas again to restart it.")
 RECONNECTING_HTML = _status_html("Atlas reconnecting audio", "Atlas is following your new system audio device.", heading="reconnecting audio\u2026")
+KB_UNLOCK_SCRIPT = r"""(() => {
+  const b64urlBytes = (value) => {
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+    return Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+  };
+  const bytesB64url = (value) => {
+    if (value === null || value === undefined) return null;
+    let binary = "";
+    new Uint8Array(value).forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  };
+  (async () => {
+    const optionsResponse = await fetch("/api/auth/assert/options", {method: "POST"});
+    if (!optionsResponse.ok) throw new Error("unlock failed");
+    const envelope = await optionsResponse.json();
+    const publicKey = envelope.options;
+    publicKey.challenge = b64urlBytes(publicKey.challenge);
+    if (Array.isArray(publicKey.allowCredentials)) {
+      publicKey.allowCredentials.forEach((item) => { item.id = b64urlBytes(item.id); });
+    }
+    const credential = await navigator.credentials.get({publicKey});
+    const response = credential.response;
+    const serialized = {
+      id: credential.id,
+      rawId: bytesB64url(credential.rawId),
+      type: credential.type,
+      response: {
+        authenticatorData: bytesB64url(response.authenticatorData),
+        clientDataJSON: bytesB64url(response.clientDataJSON),
+        signature: bytesB64url(response.signature),
+        userHandle: bytesB64url(response.userHandle),
+      },
+      clientExtensionResults: credential.getClientExtensionResults(),
+    };
+    const verifyResponse = await fetch("/api/auth/assert/verify", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({ceremonyId: envelope.ceremonyId, credential: serialized}),
+    });
+    if (!verifyResponse.ok) throw new Error("unlock failed");
+    const session = await verifyResponse.json();
+    if (
+      !session || typeof session.token !== "string" || !session.token ||
+      !(
+        typeof session.expiresAt === "string" ||
+        Number.isSafeInteger(session.expiresAt)
+      )
+    ) throw new Error("unlock failed");
+    await window.pywebview.api.kb_session(session.token, session.expiresAt);
+  })().catch(async () => {
+    try { await window.pywebview.api.kb_session_failed(); } catch (_error) {}
+  });
+})();"""
 def _configure_file_logging(local_app_data=None):
     root = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
     if not root:
@@ -232,9 +286,10 @@ def _log_worker_marker(line: str, count: int) -> bool:
 class WindowApi:
     """Expose native window controls to the frameless Atlas page."""
 
-    def __init__(self) -> None:
+    def __init__(self, unlock_kb: Callable[[], str] | None = None) -> None:
         self._window = None
         self._lock = Lock()
+        self._unlock_kb = unlock_kb
 
     def minimize(self) -> None:
         if self._window is not None:
@@ -259,6 +314,113 @@ class WindowApi:
     def request_close(self) -> None:
         if self._window is not None:
             self._window.destroy()
+
+    def unlock_kb(self) -> str:
+        if self._unlock_kb is None:
+            return "unlock cancelled"
+        try:
+            return self._unlock_kb()
+        except Exception:
+            return "unlock cancelled"
+
+
+class KbSessionApi:
+    """Receive one short-lived kb session from the dashboard-origin window."""
+
+    def __init__(
+        self,
+        accept: Callable[[str, object], None],
+        fail: Callable[[], None] = lambda: None,
+    ) -> None:
+        self._accept = accept
+        self._fail = fail
+
+    def kb_session(self, token: str, expires_at: object) -> None:
+        self._accept(token, expires_at)
+
+    def kb_session_failed(self) -> None:
+        self._fail()
+
+
+class KbUnlock:
+    def __init__(
+        self,
+        origin: str,
+        *,
+        window_factory: Callable,
+        session_sender: Callable[[str, object], None],
+        context_probe: Callable[[str], str],
+        timeout_s: float = 60.0,
+    ) -> None:
+        self._origin = origin.rstrip("/")
+        self._window_factory = window_factory
+        self._session_sender = session_sender
+        self._context_probe = context_probe
+        self._timeout_s = max(0.0, float(timeout_s))
+
+    def unlock(self) -> str:
+        try:
+            mode = self._context_probe(self._origin)
+        except Exception:
+            return "unlock cancelled"
+        if mode in {"legacy", "tailnet"}:
+            return "kb has no login today - already usable"
+        if mode != "win32-desktop":
+            return "unlock cancelled"
+        completed = Event()
+        terminal_failure = Event()
+        result: list[tuple[str, object]] = []
+
+        def accept(token: str, expires_at: object) -> None:
+            if (
+                not result
+                and isinstance(token, str)
+                and bool(token)
+                and isinstance(expires_at, (str, int))
+                and not isinstance(expires_at, bool)
+            ):
+                result.append((token, expires_at))
+            else:
+                terminal_failure.set()
+            completed.set()
+
+        def fail() -> None:
+            terminal_failure.set()
+            completed.set()
+
+        api = KbSessionApi(accept, fail)
+        window = None
+        try:
+            window = self._window_factory(
+                "Unlock kb",
+                f"{self._origin}/",
+                width=720,
+                height=640,
+                min_size=(560, 480),
+                js_api=api,
+                resizable=True,
+            )
+            if window is None:
+                return "unlock cancelled"
+            events = getattr(window, "events", None)
+            if events is not None and getattr(events, "closed", None) is not None:
+                window.events.closed += completed.set
+            window.evaluate_js(KB_UNLOCK_SCRIPT)
+            if not completed.wait(self._timeout_s) or not result:
+                return "unlock failed" if terminal_failure.is_set() else "unlock cancelled"
+            token, expires_at = result.pop()
+            try:
+                self._session_sender(token, expires_at)
+            except Exception:
+                return "unlock failed"
+            return f"kb unlocked until {expires_at}"
+        except Exception:
+            return "unlock cancelled"
+        finally:
+            result.clear()
+            if window is not None:
+                with suppress(Exception):
+                    window.destroy()
 def _kernel32_functions():
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -340,6 +502,16 @@ def _shutdown_url(ui_url: str) -> str:
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
         raise ValueError("invalid Atlas UI URL")
     return urlunsplit((parsed.scheme, parsed.netloc, "/shutdown", "", ""))
+def _kb_session_url(ui_url: str) -> str:
+    parsed = urlsplit(ui_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+        raise ValueError("invalid Atlas UI URL")
+    return urlunsplit((parsed.scheme, parsed.netloc, "/kb/session", "", ""))
+def _kb_config_url(ui_url: str) -> str:
+    parsed = urlsplit(ui_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+        raise ValueError("invalid Atlas UI URL")
+    return urlunsplit((parsed.scheme, parsed.netloc, "/kb/config", "", ""))
 def _loopback_request(
     url: str, *, method: str, headers: dict, body: bytes | None, timeout: float,
     max_bytes: int, opener: Callable,
@@ -399,6 +571,84 @@ def _request_shutdown(
         _shutdown_url(ui_url), method="POST",
         headers={"X-Atlas-Shutdown": shutdown_token}, body=b"",
         timeout=16.0, max_bytes=65_536, opener=opener)
+def _forward_kb_session(
+    ui_url: str,
+    shutdown_token: str,
+    token: str,
+    expires_at: object,
+    *,
+    opener: Callable = urlopen,
+) -> None:
+    parsed = urlsplit(ui_url)
+    body = json.dumps(
+        {"token": token, "expiresAt": expires_at},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(body) > 8_192:
+        raise ValueError("kb session payload is too large")
+    response = _loopback_request(
+        _kb_session_url(ui_url),
+        method="POST",
+        headers={
+            "X-Atlas-Shutdown": shutdown_token,
+            "Content-Type": "application/json",
+            "Origin": urlunsplit((parsed.scheme, parsed.netloc, "", "", "")),
+        },
+        body=body,
+        timeout=5.0,
+        max_bytes=1_024,
+        opener=opener,
+    )
+    payload = json.loads(response.decode("utf-8"))
+    if payload != {"ok": True}:
+        raise ValueError("kb session forwarding failed")
+def _request_kb_origin(
+    ui_url: str,
+    shutdown_token: str,
+    *,
+    opener: Callable = urlopen,
+) -> str | None:
+    body = _loopback_request(
+        _kb_config_url(ui_url),
+        method="GET",
+        headers={"X-Atlas-Shutdown": shutdown_token},
+        body=None,
+        timeout=3.0,
+        max_bytes=4_096,
+        opener=opener,
+    )
+    if len(body) > 4_096:
+        raise ValueError("kb config response is too large")
+    payload = json.loads(body.decode("utf-8"))
+    origin = payload.get("origin") if isinstance(payload, dict) and payload.get("enabled") is True else None
+    parsed = urlsplit(origin) if isinstance(origin, str) else None
+    if (
+        parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or (parsed.scheme == "http" and parsed.hostname != "127.0.0.1")
+    ):
+        return None
+    return origin.rstrip("/")
+def _probe_kb_auth_context(origin: str, *, opener: Callable = urlopen) -> str:
+    request = Request(f"{origin.rstrip('/')}/api/auth/context", headers={"Accept": "application/json"})
+    try:
+        with opener(request, timeout=3.0) as response:
+            body = response.read(4_097)
+    except HTTPError as exc:
+        if exc.code == 404:
+            return "legacy"
+        raise
+    if len(body) > 4_096:
+        raise ValueError("kb auth context is too large")
+    payload = json.loads(body.decode("utf-8"))
+    mode = payload.get("mode") if isinstance(payload, dict) else None
+    return mode if mode in {"win32-desktop", "tailnet"} else "unknown"
 def stop_child(
     proc, ui_url: str | None = None, shutdown_token: str | None = None, *,
     shutdown_request: Callable[[str, str], None] = _request_shutdown,
@@ -613,7 +863,37 @@ def run(
             return 1
         with child_lock:
             child["ui_url"] = ui_url
-        window_api = WindowApi()
+        def _send_kb_session(token: str, expires_at: object) -> None:
+            with child_lock:
+                current_url = child["ui_url"]
+            if not isinstance(current_url, str):
+                raise RuntimeError("Atlas worker is unavailable")
+            _forward_kb_session(
+                current_url,
+                shutdown_token,
+                token,
+                expires_at,
+            )
+
+        def _unlock_kb() -> str:
+            with child_lock:
+                current_url = child["ui_url"]
+            if not isinstance(current_url, str):
+                return "unlock cancelled"
+            try:
+                kb_origin = _request_kb_origin(current_url, shutdown_token)
+            except Exception:
+                return "unlock cancelled"
+            if kb_origin is None:
+                return "unlock cancelled"
+            return KbUnlock(
+                kb_origin,
+                window_factory=window_factory,
+                session_sender=_send_kb_session,
+                context_probe=_probe_kb_auth_context,
+            ).unlock()
+
+        window_api = WindowApi(_unlock_kb)
         window = window_factory(
             "Atlas",
             ui_url,

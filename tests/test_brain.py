@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from worker import brain as brain_mod
 from worker.brain import BASE_SYSTEM, Brain, split_spoken
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
@@ -83,9 +84,17 @@ class FakeRegistry:
 
 
 class FakeStream:
-    def __init__(self, deltas=(), *, content=(), stop_reason="end_turn", delay=0.0) -> None:
+    def __init__(
+        self,
+        deltas=(),
+        *,
+        content=(),
+        stop_reason="end_turn",
+        delay=0.0,
+        usage=None,
+    ) -> None:
         self.deltas = list(deltas)
-        self.final = SimpleNamespace(content=list(content), stop_reason=stop_reason)
+        self.final = SimpleNamespace(content=list(content), stop_reason=stop_reason, usage=usage)
         self.delay = delay
 
     async def __aenter__(self):
@@ -120,9 +129,11 @@ class ErrorStream:
 
 
 class FakeMessages:
-    def __init__(self, responses) -> None:
+    def __init__(self, responses, token_counts=(4_096,)) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
+        self.token_counts = list(token_counts)
+        self.count_calls: list[dict[str, Any]] = []
 
     def stream(self, **kwargs):
         self.calls.append(kwargs)
@@ -131,10 +142,17 @@ class FakeMessages:
         response = self.responses.pop(0)
         return ErrorStream(response) if isinstance(response, Exception) else response
 
+    async def count_tokens(self, **kwargs):
+        self.count_calls.append(kwargs)
+        result = self.token_counts.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return SimpleNamespace(input_tokens=result)
+
 
 class FakeClient:
-    def __init__(self, *responses) -> None:
-        self.messages = FakeMessages(responses)
+    def __init__(self, *responses, token_counts=(4_096,)) -> None:
+        self.messages = FakeMessages(responses, token_counts)
 
 
 class DelayedFinalStream(FakeStream):
@@ -199,9 +217,18 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     local_timezone = datetime.now().astimezone().tzinfo
     clock = lambda: datetime(2026, 8, 22, 9, 41, 29, tzinfo=local_timezone)
     now = clock().astimezone()
-    brain = Brain(client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock)
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="Dry and composed.", clock=clock,
+        cache_ttl="1h",
+    )
+    brain.mark_tools_settled()
 
-    chunks = asyncio.run(collect(brain, "Hello"))
+    async def scenario():
+        chunks = await collect(brain, "Hello")
+        await asyncio.sleep(0)
+        return chunks
+
+    chunks = asyncio.run(scenario())
 
     assert chunks == ["First sentence. ", "Second sentence! ", "Tail"]
     assert brain._history == [
@@ -209,21 +236,441 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
         {"role": "assistant", "content": "First sentence. Second sentence! Tail"},
     ]
     call = client.messages.calls[0]
-    assert call["system"] == [
-        {
-            "type": "text",
-            "text": BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed.",
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
-        },
-    ]
+    assert call["system"][0]["type"] == "text"
+    assert call["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert call["system"][0]["text"].startswith(
+        BASE_SYSTEM + "\n\nVoice and personality:\nDry and composed."
+    )
+    assert "lookup" in call["system"][0]["text"]
+    assert "mutate" in call["system"][0]["text"]
+    assert "Look something up." not in call["system"][0]["text"]
+    assert call["system"][1] == {
+        "type": "text",
+        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
+    }
     assert "cache_control" not in call["system"][1]
-    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert call["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "cache_control" not in call["tools"][0]
     assert call["tool_choice"] == {"type": "auto"}
+    assert client.messages.count_calls == [{
+        "model": "fast",
+        "system": [call["system"][0]],
+        "tools": call["tools"],
+        "messages": [],
+    }]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected", "warning"),
+    [
+        (4_095, False, "prompt cache floor unmet: 4095 tokens"),
+        (4_096, True, None),
+    ],
+)
+def test_first_turn_checks_cache_floor_once_without_blocking(tokens, expected, warning, caplog):
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        token_counts=(tokens,),
+    )
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain.mark_tools_settled()
+
+    async def scenario():
+        first = await collect(brain, "First turn")
+        second = await collect(brain, "Second turn")
+        await asyncio.sleep(0)
+        return first, second
+
+    assert asyncio.run(scenario()) == (["First."], ["Second."])
+    assert brain.cache_floor_ok is expected
+    assert len(client.messages.count_calls) == 1
+    if warning is None:
+        assert "prompt cache floor unmet" not in caplog.text
+    else:
+        assert caplog.text.count(warning) == 1
+
+
+def test_cache_floor_failure_is_logged_once_and_remains_unknown(caplog):
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        token_counts=(RuntimeError("must-not-escape"),),
+    )
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    brain.mark_tools_settled()
+
+    async def scenario():
+        await collect(brain, "First turn")
+        await collect(brain, "Second turn")
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert brain.cache_floor_ok is None
+    assert len(client.messages.count_calls) == 1
+    assert caplog.text.count("prompt cache floor check failed: RuntimeError") == 1
+    assert "must-not-escape" not in caplog.text
+
+
+def test_cache_floor_waits_for_first_turn_and_settle_then_rearms_per_snapshot():
+    registry = FakeRegistry()
+    client = FakeClient(
+        FakeStream(["Before settle."], content=[text_block("Before settle.")]),
+        token_counts=(4_096, 4_095, 4_096),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        await collect(brain, "Early turn")
+        await asyncio.sleep(0)
+        assert client.messages.count_calls == []
+
+        brain.mark_tools_settled()
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 1
+
+        original = registry.schemas()
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "second_generation",
+                "description": "Second generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        assert brain.refresh_tools() is False
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 2
+
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "third_generation",
+                "description": "Third generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        await asyncio.sleep(0)
+        assert len(client.messages.count_calls) == 3
+
+        registry.schemas = lambda: [
+            *original,
+            {
+                "name": "fourth_generation",
+                "description": "Fourth generation.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+        assert brain.refresh_tools() is True
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(client.messages.count_calls) == 3
+    assert brain.cache_floor_ok is None
+
+
+def test_cache_floor_count_never_blocks_the_first_stream_chunk():
+    release = asyncio.Event()
+    started = asyncio.Event()
+    client = FakeClient(FakeStream(
+        ["Immediate response."],
+        content=[text_block("Immediate response.")],
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+    original_count_tokens = client.messages.count_tokens
+
+    async def gated_count_tokens(**kwargs):
+        started.set()
+        await release.wait()
+        return await original_count_tokens(**kwargs)
+
+    client.messages.count_tokens = gated_count_tokens
+    brain.mark_tools_settled()
+
+    async def scenario():
+        response = brain.respond("Hello")
+        first = await asyncio.wait_for(anext(response), timeout=0.1)
+        assert first == "Immediate response."
+        assert release.is_set() is False
+        await asyncio.sleep(0)
+        assert started.is_set() is True
+        assert release.is_set() is False
+        release.set()
+        await asyncio.sleep(0)
+        await response.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_snapshot_rebuilds_only_when_registered_tool_name_set_changes(caplog):
+    caplog.set_level("INFO", logger="atlas.brain")
+    registry = FakeRegistry()
+    client = FakeClient(FakeStream(["Done."], content=[text_block("Done.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+    original_tools = brain._request_tools()
+
+    assert brain.refresh_tools() is False
+    registry.schemas = lambda: [
+        {**schema, "description": "Reconnected description."}
+        for schema in original_tools
+    ]
+    assert brain.refresh_tools() is False
+    assert brain._request_tools() == original_tools
+
+    registry.schemas = lambda: [
+        *original_tools,
+        {
+            "name": "new_tool",
+            "description": "New capability.",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ]
+    assert brain.refresh_tools() is True
+    assert [tool["name"] for tool in brain._request_tools()] == ["lookup", "mutate", "new_tool"]
+    assert caplog.text.count("brain prompt snapshot rebuilt") == 1
+
+
+def test_usage_records_cache_read_and_creation_tokens(caplog):
+    caplog.set_level("INFO", logger="atlas.brain")
+    usage = SimpleNamespace(
+        input_tokens=5_100,
+        output_tokens=23,
+        cache_read_input_tokens=4_000,
+        cache_creation_input_tokens=1_100,
+    )
+    client = FakeClient(FakeStream(["Okay."], content=[text_block("Okay.")], usage=usage))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Hello")) == ["Okay."]
+    assert brain.last_usage == {
+        "input_tokens": 5_100,
+        "output_tokens": 23,
+        "cache_read_input_tokens": 4_000,
+        "cache_creation_input_tokens": 1_100,
+    }
+    assert "cache_read_input_tokens=4000" in caplog.text
+    assert "cache_creation_input_tokens=1100" in caplog.text
+
+
+@pytest.mark.parametrize("claim", ["I opened Spotify.", "I've opened Spotify."])
+def test_unbacked_action_claim_is_suppressed_by_the_host(caplog, claim):
+    client = FakeClient(FakeStream(
+        [claim],
+        content=[text_block(claim)],
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert "".join(asyncio.run(collect(brain, "Open Spotify"))) == (
+        "I did not actually do that - I have no tool result. Want me to?"
+    )
+    assert caplog.text.count("unbacked action claim suppressed") == 1
+
+
+def test_action_claim_after_ok_tool_result_passes_through():
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Open Spotify")) == ["Spotify is open."]
+
+
+def test_known_registry_target_state_claim_requires_a_relevant_call():
+    registry = ToolRegistry()
+    builtin(
+        registry,
+        {"spotify": AppEntry(url="https://spotify.test/", words=("spotify", "music"))},
+        BrainWork(),
+        opener=lambda _target: None,
+    )
+    reply = "Spotify is open."
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Is Spotify open?")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+def test_unrelated_ok_read_does_not_license_failed_open_claim():
+    registry = FakeRegistry(
+        ToolResult("ok", "read result"),
+        ToolResult("error", "could not open"),
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="read_file")], stop_reason="tool_use"),
+        FakeStream(
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Read the note, then open Spotify")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+def test_cancel_pending_does_not_license_open_claim():
+    registry = FakeRegistry(ToolResult("ok", "cancelled"))
+    registry._pending = PendingAction(
+        confirm_id="confirm-123",
+        name="open",
+        arguments={"target": "spotify"},
+        summary="open Spotify",
+        expires=float("inf"),
+    )
+    client = FakeClient(
+        FakeStream(["Spotify is open."], content=[text_block("Spotify is open.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "no")) == [
+        "I did not actually do that - I have no tool result. Want me to?"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        (
+            "No problem, I opened Spotify.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+        ("I did not open Spotify.", "I did not open Spotify."),
+        (
+            "I couldn't open X, but I opened Y.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+        ("I couldn't open Spotify.", "I couldn't open Spotify."),
+        (
+            "The task is done.",
+            "I did not actually do that - I have no tool result. Want me to?",
+        ),
+    ],
+)
+def test_action_claim_negation_is_clause_local(reply, expected):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert "".join(asyncio.run(collect(brain, "Help me"))) == expected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Spotify was created in 2006.",
+        "The store is open today.",
+        "This project is open source.",
+        "The question is open-ended.",
+    ],
+)
+def test_factual_action_words_are_not_treated_as_attributed_claims(reply):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Tell me a fact")) == [reply]
+
+
+@pytest.mark.parametrize("reply", ["Spotify has many playlists.", "Would you like a playlist?"])
+def test_non_action_answers_and_questions_are_not_changed(reply):
+    client = FakeClient(FakeStream([reply], content=[text_block(reply)]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Tell me about Spotify")) == [reply]
+
+
+def test_registry_capabilities_are_named_in_the_system_prompt():
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "open_folder",
+        lambda _arguments: return_value({"opened": "C:/Users/danie/kb"}),
+    ))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        FakeStream(["The folder is open."], content=[text_block("The folder is open.")]),
+    )
+    brain = Brain(
+        client,
+        registry,
+        model="fast",
+        persona="",
+        mcp_status=[{
+            "name": "google", "state": "not_configured",
+            "detail": "private detail must not enter the prompt",
+        }],
+    )
+
+    assert asyncio.run(collect(brain, "open my kb folder")) == ["The folder is open."]
+    system_text = client.messages.calls[0]["system"][0]["text"]
+    assert "open_folder" in system_text
+    assert "google: not_configured" in system_text
+    assert "private detail" not in system_text
+    assert "Before saying you cannot do something, check this list" in system_text
+
+
+def test_capability_prefix_changes_only_when_explicitly_refreshed():
+    registry = ToolRegistry()
+    client = FakeClient(
+        FakeStream(["First."], content=[text_block("First.")]),
+        FakeStream(["Second."], content=[text_block("Second.")]),
+        FakeStream(["Third."], content=[text_block("Third.")]),
+    )
+    brain = Brain(
+        client, registry, model="fast", persona="",
+        mcp_status=[{"name": "google", "state": "connecting"}],
+    )
+
+    asyncio.run(collect(brain, "one"))
+    registry.register(registry_tool("google__search", lambda _arguments: return_value({})))
+    asyncio.run(collect(brain, "two"))
+    brain.refresh_capabilities([{"name": "google", "state": "connected"}])
+    asyncio.run(collect(brain, "three"))
+
+    prefixes = [call["system"][0]["text"] for call in client.messages.calls]
+    assert prefixes[0] == prefixes[1]
+    assert prefixes[2] != prefixes[1]
+    assert "google__search" in prefixes[2]
+    assert "google: connected" in prefixes[2]
+
+
+def test_capability_text_is_stable_across_snapshot_permutations():
+    schemas = [{"name": "zeta"}, {"name": "alpha"}, {"name": "middle"}]
+    states = [
+        {"name": "zeta", "state": "error"},
+        {"name": "alpha", "state": "connected"},
+        {"name": "middle", "state": "not_configured"},
+    ]
+
+    expected = brain_mod._capability_system_text(schemas, states)
+
+    assert brain_mod._capability_system_text(list(reversed(schemas)), states[1:] + states[:1]) == expected
+
+
+def test_refusal_of_registered_capability_is_suppressed(caplog):
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "open_folder",
+        lambda _arguments: return_value({"opened": "C:/Users/danie/kb"}),
+    ))
+    refusal = "I don't have access to your local desktop folders."
+    client = FakeClient(FakeStream([refusal], content=[text_block(refusal)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "open my kb folder")) == [
+        "I can do that with open_folder - shall I?",
+    ]
+    assert "available capability refusal suppressed (tool=open_folder)" in caplog.text
 
 
 def test_ambient_context_reaches_provider_taints_tools_and_is_not_remembered():
@@ -332,7 +779,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
         {"role": "user", "content": "yes go ahead and create the draft"},
         {
             "role": "assistant",
-            "content": "Done — google__draft_gmail_message executed.",
+            "content": "Done -- google__draft_gmail_message executed.",
         },
     ]
     request = client.messages.calls[0]
@@ -361,7 +808,7 @@ def test_closed_affirmative_with_action_words_executes_pending(monkeypatch):
             }],
         },
     ]
-    assert "Done — google__draft_gmail_message executed." in request["system"][-1]["text"]
+    assert "Done -- google__draft_gmail_message executed." in request["system"][-1]["text"]
 
 
 def test_confirm_error_is_persisted_and_narrated_as_a_real_tool_error():
@@ -546,11 +993,11 @@ def test_confirm_narration_failure_returns_and_remembers_deterministic_host_line
 
     result = asyncio.run(collect(brain, "confirm"))
 
-    assert result == ["Done — mutate executed."]
+    assert result == ["Done -- mutate executed."]
     assert mutation_calls == [{"message": "hello"}]
     assert brain._history == [
         {"role": "user", "content": "confirm"},
-        {"role": "assistant", "content": "Done — mutate executed."},
+        {"role": "assistant", "content": "Done -- mutate executed."},
     ]
 
 
@@ -711,12 +1158,12 @@ def test_brain_passes_the_exact_transcript_to_each_registry_call():
     registry = FakeRegistry(ToolResult("ok", "done"))
     client = FakeClient(
         FakeStream(content=[tool_block()], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
     transcript = "  Keep my spacing  "
 
-    assert asyncio.run(collect(brain, transcript)) == ["Done."]
+    assert asyncio.run(collect(brain, transcript)) == ["Finished."]
     assert registry.transcripts == [transcript]
 
 
@@ -726,11 +1173,11 @@ def test_content_bearing_tools_taint_every_later_call_in_the_turn(content_tool):
     client = FakeClient(
         FakeStream(content=[tool_block(name=content_tool)], stop_reason="tool_use"),
         FakeStream(content=[tool_block(name="lookup")], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Check, then act")) == ["Done."]
+    assert asyncio.run(collect(brain, "Check, then act")) == ["Finished."]
     assert registry.taints == [False, True]
 
 
@@ -743,11 +1190,11 @@ def test_metadata_tools_do_not_taint_later_calls_in_the_turn(first_tool, later_t
     client = FakeClient(
         FakeStream(content=[tool_block(name=first_tool)], stop_reason="tool_use"),
         FakeStream(content=[tool_block(name=later_tool)], stop_reason="tool_use"),
-        FakeStream(["Done."], content=[text_block("Done.")]),
+        FakeStream(["Finished."], content=[text_block("Finished.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
 
-    assert asyncio.run(collect(brain, "Check, then open it")) == ["Done."]
+    assert asyncio.run(collect(brain, "Check, then open it")) == ["Finished."]
     assert registry.calls == [(first_tool, {}), (later_tool, {})]
     assert registry.taints == [False, False]
 
@@ -835,7 +1282,11 @@ def test_streamed_text_is_yielded_before_tool_runs():
     registry = FakeRegistry(ToolResult("ok", "result"))
     registry.when_called = lambda: seen.append("called")
     client = FakeClient(
-        FakeStream(["Let me check. "], content=[tool_block()], stop_reason="tool_use"),
+        FakeStream(
+            ["Let me check. "],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
         FakeStream(["Done."], content=[text_block("Done.")]),
     )
     brain = Brain(client, registry, model="fast", persona="")
@@ -850,6 +1301,33 @@ def test_streamed_text_is_yielded_before_tool_runs():
     first, rest = asyncio.run(scenario())
     assert first == "Let me check. "
     assert rest == ["Done."]
+    assert seen == ["called"]
+
+
+def test_claim_sentence_waits_while_safe_sentence_streams_first():
+    seen: list[str] = []
+    registry = FakeRegistry(ToolResult("error", "could not open"))
+    registry.when_called = lambda: seen.append("called")
+    client = FakeClient(
+        FakeStream(
+            ["Let me check. ", "I opened Spotify."],
+            content=[tool_block(name="open", arguments={"target": "spotify"})],
+            stop_reason="tool_use",
+        ),
+        FakeStream(),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        iterator = brain.respond("Open Spotify")
+        first = await anext(iterator)
+        assert seen == []
+        rest = [chunk async for chunk in iterator]
+        return first, rest
+
+    first, rest = asyncio.run(scenario())
+    assert first == "Let me check. "
+    assert rest == ["I did not actually do that - I have no tool result. Want me to?"]
     assert seen == ["called"]
 
 
@@ -992,7 +1470,7 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
     assert (
-        "If read_file reports truncated, do not analyse the preview — "
+        "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM

@@ -1,8 +1,28 @@
-(() => {
+(root => {
   "use strict";
+
+  function hitTestQuickAction(x, y, geometry, actionCount = Number.POSITIVE_INFINITY) {
+    if (!geometry || !Array.isArray(geometry.segments)) return -1;
+    const dx = x - geometry.centerX;
+    const dy = y - geometry.centerY;
+    const radius = Math.hypot(dx, dy);
+    if (radius < geometry.innerRadius || radius > geometry.outerRadius) return -1;
+    let angle = Math.atan2(dy, dx);
+    if (angle < 0) angle += Math.PI * 2;
+    for (const segment of geometry.segments) {
+      if (segment.index >= actionCount) continue;
+      const comparable = angle < segment.start ? angle + Math.PI * 2 : angle;
+      if (comparable >= segment.start && comparable <= segment.end) return segment.index;
+    }
+    return -1;
+  }
+
+  if (root.__ATLAS_TEST__ === true) root.__atlasHitTest = hitTestQuickAction;
+  if (typeof document === "undefined") return;
 
   const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
   const VOICE_STATES = new Set(["ASLEEP", "LISTENING", "THINKING", "SPEAKING"]);
+  const ENGINE_STATES = new Set([...VOICE_STATES, "TOOL"]);
   const TRANSCRIPT_ROLES = new Set(["user", "atlas", "tool", "ambient", "system"]);
   const ACTIVE_JOB_STATES = new Set(["queued", "launching", "running"]);
   const ACTION_HEADER = "x-atlas-action-token";
@@ -24,6 +44,11 @@
     windowControls: document.querySelector("#window-controls"), windowMinimize: document.querySelector("#window-minimize"),
     windowMaximize: document.querySelector("#window-maximize"), windowClose: document.querySelector("#window-close"),
     canvas: document.querySelector("#engine-canvas"), stateLabel: document.querySelector("#state-label"),
+    greeting: document.querySelector("#greeting"), toolStrip: document.querySelector("#tool-strip"),
+    toolAnnouncer: document.querySelector("#tool-announcer"),
+    engineStage: document.querySelector(".engine-stage"), quickActions: document.querySelector("#quick-actions"),
+    textForm: document.querySelector("#text-turn-form"), textInput: document.querySelector("#text-turn-input"),
+    pendingCard: document.querySelector("#pending-confirmation"), pendingText: document.querySelector("#pending-confirmation-text"),
     audioLine: document.querySelector("#audio-line"), transcript: document.querySelector("#transcript"),
     workerSummary: document.querySelector("#worker-summary"), workerTabs: document.querySelector("#worker-tabs"),
     workerOutput: document.querySelector("#worker-output"), history: document.querySelector("#history-list"),
@@ -33,12 +58,15 @@
     audioInput: document.querySelector("#audio-input"), audioInputMode: document.querySelector("#audio-input-mode"),
     audioOutput: document.querySelector("#audio-output"), audioOutputMode: document.querySelector("#audio-output-mode"),
     claudeStatus: document.querySelector("#claude-status"), mcpList: document.querySelector("#mcp-list"),
+    appsList: document.querySelector("#apps-list"),
     pairingStatus: document.querySelector("#pairing-status"), repairButton: document.querySelector("#repair-button"),
   };
 
   let actionToken = "", actionExpiresAt = 0, pairingExpiryTimer = 0;
   let currentView = "live", jobs = [], selectedJobId = "", selectedResultId = "";
   let transcriptSignature = "", signalTimer = 0, stateTimer = 0, jobsTimer = 0, settingsTimer = 0;
+  let greetingTimer = 0, userName = "", activeToolIdentity = "";
+  let quickActionSignature = "", quickActions = [], pendingDismissTimer = 0, pendingDismissEnd = null;
   const pendingRequests = new Set();
   const eventsByJob = new Map();
   const resultsByJob = new Map();
@@ -49,8 +77,8 @@
   }
   function callNativeWindow(method) {
     const api = nativeWindowApi();
-    if (api === null || typeof api[method] !== "function") return;
-    Promise.resolve(api[method]()).catch(() => {});
+    if (api === null || typeof api[method] !== "function") return Promise.resolve(undefined);
+    return Promise.resolve(api[method]()).catch(() => undefined);
   }
   document.querySelectorAll(".no-drag").forEach((element) => {
     element.addEventListener("mousedown", (event) => event.stopPropagation());
@@ -75,6 +103,32 @@
     if (text !== undefined) element.textContent = text;
     return element;
   }
+
+  const kbUnlockButton = node("button", "button", "Unlock kb");
+  kbUnlockButton.id = "kb-unlock-button";
+  kbUnlockButton.type = "button";
+  const kbUnlockStatus = node("p", "status-note", "");
+  refs.mcpList.parentElement.append(kbUnlockButton, kbUnlockStatus);
+  let kbVoiceSignature = "";
+  async function requestKbUnlock() {
+    kbUnlockButton.disabled = true;
+    kbUnlockStatus.textContent = "Unlocking kb";
+    const result = await callNativeWindow("unlock_kb");
+    kbUnlockStatus.textContent = typeof result === "string" && result ? result : "unlock cancelled";
+    kbUnlockButton.disabled = false;
+    refreshSettings();
+  }
+  function maybeRequestVoiceKbUnlock(lines) {
+    const latest = [...lines].reverse().find((line) => isRecord(line) && line.role === "user" && typeof line.text === "string");
+    if (!latest) return;
+    const phrase = latest.text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!["atlas unlock kb", "unlock the dashboard"].includes(phrase)) return;
+    const signature = `${stringValue(latest.t)}:${latest.text}`;
+    if (signature === kbVoiceSignature) return;
+    kbVoiceSignature = signature;
+    requestKbUnlock();
+  }
+  kbUnlockButton.addEventListener("click", requestKbUnlock);
 
   function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
   async function requestJson(path, {
@@ -116,6 +170,13 @@
     const INPUT_BANDS = 24;
     const PARTICLE_COUNT = 42;
     const TAU = Math.PI * 2;
+    const OUTER_SEGMENT_COUNT = 14;
+    const OUTER_SEGMENT_RADIUS = .417;
+    const outerSegments = Array.from({length: OUTER_SEGMENT_COUNT}, (_value, index) => {
+      const start = index / OUTER_SEGMENT_COUNT * TAU;
+      const length = TAU / OUTER_SEGMENT_COUNT * (.48 + (index % 3) * .08);
+      return {index, start, end: start + length, middle: start + length / 2};
+    });
     const palettes = {
       ASLEEP: {
         primary: [105, 119, 137], secondary: [139, 151, 166], core: [114, 130, 148],
@@ -128,6 +189,10 @@
       THINKING: {
         primary: [255, 165, 55], secondary: [255, 222, 111], core: [255, 184, 71],
         motion: [.92, 1, .68, .64, 1, 0],
+      },
+      TOOL: {
+        primary: [255, 196, 38], secondary: [255, 244, 184], core: [255, 211, 92],
+        motion: [.78, .94, .74, .82, .72, 0],
       },
       SPEAKING: {
         primary: [255, 113, 72], secondary: [255, 236, 184], core: [255, 244, 220],
@@ -185,6 +250,10 @@
     let minorTickPath = new Path2D();
     let innerSegmentPath = new Path2D();
     let outerSegmentPath = new Path2D();
+    let outerSegmentPaths = [];
+    let quickActionHover = -1;
+    let quickActionFlash = -1;
+    let quickActionFlashUntil = 0;
 
     for (let index = 0; index < BAR_COUNT; index += 1) {
       const angle = -Math.PI / 2 + index * TAU / BAR_COUNT;
@@ -279,18 +348,22 @@
 
       innerSegmentPath = new Path2D();
       outerSegmentPath = new Path2D();
-      const segmentSets = [
-        {path: innerSegmentPath, radius: .295, count: 18, fill: .62},
-        {path: outerSegmentPath, radius: .417, count: 14, fill: .48},
-      ];
-      segmentSets.forEach(({path, radius, count, fill}) => {
-        for (let index = 0; index < count; index += 1) {
-          const start = index / count * TAU;
-          const length = TAU / count * (fill + (index % 3) * .08);
-          path.moveTo(Math.cos(start) * radius * scale, Math.sin(start) * radius * scale);
-          path.arc(0, 0, radius * scale, start, start + length);
-        }
+      outerSegmentPaths = outerSegments.map((segment) => {
+        const path = new Path2D();
+        path.moveTo(
+          Math.cos(segment.start) * OUTER_SEGMENT_RADIUS * scale,
+          Math.sin(segment.start) * OUTER_SEGMENT_RADIUS * scale,
+        );
+        path.arc(0, 0, OUTER_SEGMENT_RADIUS * scale, segment.start, segment.end);
+        outerSegmentPath.addPath(path);
+        return path;
       });
+      for (let index = 0; index < 18; index += 1) {
+        const start = index / 18 * TAU;
+        const length = TAU / 18 * (.62 + (index % 3) * .08);
+        innerSegmentPath.moveTo(Math.cos(start) * .295 * scale, Math.sin(start) * .295 * scale);
+        innerSegmentPath.arc(0, 0, .295 * scale, start, start + length);
+      }
 
       const spriteSize = Math.max(256, Math.ceil(scale * 1.08));
       backdropSprite.width = spriteSize;
@@ -412,9 +485,9 @@
     }
 
     function setState(nextState) {
-      realState = VOICE_STATES.has(nextState) ? nextState : "OFFLINE";
+      realState = ENGINE_STATES.has(nextState) ? nextState : "OFFLINE";
       canvas.setAttribute("aria-label", `Atlas engine ${realState.toLowerCase()}`);
-      if (!VOICE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
+      if (!ENGINE_STATES.has(window.__atlasEnginePreview)) setVisualState(realState);
     }
 
     function drawBackdrop() {
@@ -445,10 +518,15 @@
       context.lineCap = "round";
       context.save();
       context.translate(centerX, centerY);
-      context.rotate(now * speed);
       context.lineWidth = Math.max(.75, scale * .0032);
       context.strokeStyle = colorString(primaryColor, (.22 + motion[1] * .3) * visibility);
       context.stroke(outerSegmentPath);
+      const activeIndex = now < quickActionFlashUntil ? quickActionFlash : quickActionHover;
+      if (activeIndex >= 0 && outerSegmentPaths[activeIndex]) {
+        context.lineWidth = Math.max(1.5, scale * .006);
+        context.strokeStyle = colorString(secondaryColor, .82 * visibility);
+        context.stroke(outerSegmentPaths[activeIndex]);
+      }
       context.restore();
 
       context.save();
@@ -605,7 +683,7 @@
 
     function draw(now) {
       // boss-authorized preview override for headless review; visuals only
-      const previewState = VOICE_STATES.has(window.__atlasEnginePreview)
+      const previewState = ENGINE_STATES.has(window.__atlasEnginePreview)
         ? window.__atlasEnginePreview
         : null;
       setVisualState(previewState || realState);
@@ -655,6 +733,26 @@
       animationFrame = 0;
     }
 
+    function quickActionGeometry() {
+      return {
+        centerX,
+        centerY,
+        innerRadius: .385 * scale,
+        outerRadius: .45 * scale,
+        labelRadius: .417 * scale,
+        segments: outerSegments.map((segment) => ({...segment})),
+      };
+    }
+
+    function setQuickActionHover(index) {
+      quickActionHover = Number.isInteger(index) ? index : -1;
+    }
+
+    function flashQuickAction(index) {
+      quickActionFlash = Number.isInteger(index) ? index : -1;
+      quickActionFlashUntil = performance.now() + 420;
+    }
+
     if (typeof ResizeObserver === "function") {
       const observer = new ResizeObserver(resize);
       observer.observe(canvas);
@@ -667,10 +765,170 @@
     canvas.dataset.frameMaxMs = "0.000";
     canvas.dataset.animation = "paused";
     window.__atlasEngineMetrics = metrics;
-    return {setSignal, setState, start, stop};
+    return {
+      setSignal, setState, start, stop, quickActionGeometry, setQuickActionHover, flashQuickAction,
+    };
   }
 
   const engine = createEngine(refs.canvas);
+  root.__atlasEngineGeometry = {snapshot: () => engine.quickActionGeometry()};
+
+  function positionQuickActions() {
+    const geometry = engine.quickActionGeometry();
+    refs.quickActions.querySelectorAll(".quick-action").forEach((button) => {
+      const segment = geometry.segments[Number(button.dataset.index)];
+      if (!segment) return;
+      button.style.left = `${geometry.centerX + Math.cos(segment.middle) * geometry.labelRadius}px`;
+      button.style.top = `${geometry.centerY + Math.sin(segment.middle) * geometry.labelRadius}px`;
+    });
+  }
+
+  function showPendingConfirmation(readback) {
+    if (pendingDismissTimer) window.clearTimeout(pendingDismissTimer);
+    pendingDismissTimer = 0;
+    if (pendingDismissEnd) refs.pendingCard.removeEventListener("animationend", pendingDismissEnd);
+    pendingDismissEnd = null;
+    refs.pendingText.textContent = readback;
+    refs.pendingCard.hidden = false;
+    refs.pendingCard.classList.remove("is-holo-dismissing");
+  }
+
+  function hidePendingConfirmation() {
+    if (refs.pendingCard.hidden || pendingDismissTimer) return;
+    const finish = () => {
+      if (pendingDismissTimer) window.clearTimeout(pendingDismissTimer);
+      pendingDismissTimer = 0;
+      if (pendingDismissEnd) refs.pendingCard.removeEventListener("animationend", pendingDismissEnd);
+      pendingDismissEnd = null;
+      refs.pendingCard.hidden = true;
+      refs.pendingCard.classList.remove("is-holo-dismissing");
+    };
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true) {
+      finish();
+      return;
+    }
+    refs.pendingCard.classList.add("is-holo-dismissing");
+    pendingDismissEnd = (event) => {
+      if (event.target === refs.pendingCard) finish();
+    };
+    refs.pendingCard.addEventListener("animationend", pendingDismissEnd);
+    pendingDismissTimer = window.setTimeout(finish, 400);
+  }
+
+  function renderPendingConfirmation(pending) {
+    if (isRecord(pending) && typeof pending.readback === "string") {
+      showPendingConfirmation(pending.readback);
+    } else {
+      hidePendingConfirmation();
+    }
+  }
+
+  async function activateQuickAction(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= quickActions.length) return;
+    if (!actionToken) {
+      showPendingConfirmation("Pair Atlas before running quick actions.");
+      return;
+    }
+    const button = refs.quickActions.querySelector(`[data-index="${index}"]`);
+    if (button) button.disabled = true;
+    try {
+      const payload = await authenticatedJson("/actions/quick", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({index}),
+      });
+      if (!payload) return;
+      engine.flashQuickAction(index);
+      if (button) {
+        button.classList.remove("is-flashing");
+        void button.offsetWidth;
+        button.classList.add("is-flashing");
+      }
+      renderPendingConfirmation(payload.pending);
+    } catch (_error) {
+      showPendingConfirmation("Quick action unavailable.");
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function renderQuickActions(actions) {
+    const safeActions = Array.isArray(actions)
+      ? actions.filter((action) => isRecord(action) && typeof action.label === "string").slice(0, 14)
+      : [];
+    const signature = JSON.stringify(safeActions);
+    if (signature === quickActionSignature) return;
+    quickActionSignature = signature;
+    quickActions = safeActions;
+    refs.quickActions.replaceChildren();
+    safeActions.forEach((action, index) => {
+      const button = node("button", "quick-action", action.label);
+      button.type = "button";
+      button.dataset.index = String(index);
+      button.setAttribute("aria-label", `Quick action: ${action.label}`);
+      button.addEventListener("mouseenter", () => engine.setQuickActionHover(index));
+      button.addEventListener("mouseleave", () => engine.setQuickActionHover(-1));
+      button.addEventListener("focus", () => engine.setQuickActionHover(index));
+      button.addEventListener("blur", () => engine.setQuickActionHover(-1));
+      button.addEventListener("click", () => activateQuickAction(index));
+      refs.quickActions.append(button);
+    });
+    positionQuickActions();
+  }
+
+  function canvasQuickActionIndex(event) {
+    const bounds = refs.canvas.getBoundingClientRect();
+    return hitTestQuickAction(
+      event.clientX - bounds.left,
+      event.clientY - bounds.top,
+      engine.quickActionGeometry(),
+      quickActions.length,
+    );
+  }
+
+  refs.canvas.addEventListener("pointermove", (event) => {
+    engine.setQuickActionHover(canvasQuickActionIndex(event));
+  });
+  refs.canvas.addEventListener("pointerleave", () => engine.setQuickActionHover(-1));
+  refs.canvas.addEventListener("click", (event) => activateQuickAction(canvasQuickActionIndex(event)));
+  if (typeof ResizeObserver === "function") {
+    const quickActionObserver = new ResizeObserver(positionQuickActions);
+    quickActionObserver.observe(refs.engineStage);
+  } else {
+    window.addEventListener("resize", positionQuickActions);
+  }
+
+  refs.textForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = refs.textInput.value.trim();
+    if (!text) return;
+    if (!actionToken) {
+      showPendingConfirmation("Pair Atlas before sending a message.");
+      return;
+    }
+    refs.textInput.disabled = true;
+    try {
+      const payload = await authenticatedJson("/turn", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({text}),
+      });
+      if (payload?.ok === true) {
+        refs.textInput.value = "";
+        renderPendingConfirmation(payload.pending);
+      }
+    } catch (_error) {
+      showPendingConfirmation("Message could not be sent.");
+    } finally {
+      refs.textInput.disabled = false;
+      refs.textInput.focus();
+    }
+  });
+  refs.textInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    refs.textInput.value = "";
+  });
 
   function activateTab(button, active, handler = null, syncHash = false) {
     button.classList.toggle("is-active", active);
@@ -733,9 +991,38 @@
     refs.connection.querySelector(".connection-label").textContent = online ? "connected" : "offline";
   }
 
-  function setEngineState(rawState) {
-    const state = VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
-    refs.stateLabel.textContent = state; engine.setState(state);
+  function setEngineState(rawState, tool = null) {
+    const state = rawState === "THINKING" && isRecord(tool) && typeof tool.name === "string" && tool.name.trim()
+      ? "TOOL"
+      : VOICE_STATES.has(rawState) ? rawState : "OFFLINE";
+    if (refs.stateLabel.textContent !== state) refs.stateLabel.textContent = state;
+    engine.setState(state);
+  }
+
+  function renderTool(rawState, tool) {
+    const name = rawState === "THINKING" && isRecord(tool) && typeof tool.name === "string"
+      ? tool.name.trim()
+      : "";
+    const since = name && typeof tool.since === "string" ? tool.since.trim() : "";
+    const identity = name && since ? JSON.stringify([name, since]) : "";
+    if (identity === activeToolIdentity) return;
+    activeToolIdentity = identity;
+    if (!identity) {
+      refs.toolStrip.hidden = true;
+      refs.toolStrip.textContent = "";
+      return;
+    }
+    refs.toolStrip.hidden = false;
+    refs.toolStrip.textContent = `TOOL - ${name}`;
+    refs.toolAnnouncer.replaceChildren(document.createTextNode(`Tool started: ${name}.`));
+  }
+
+  function renderGreeting(user = null, now = new Date()) {
+    if (isRecord(user)) userName = typeof user.name === "string" ? user.name.trim() : "";
+    const hour = now.getHours();
+    const period = hour < 12 ? "MORNING" : hour < 18 ? "AFTERNOON" : "EVENING";
+    const greeting = `GOOD ${period}${userName ? `, ${userName.toLocaleUpperCase()}` : ""}`;
+    if (refs.greeting.textContent !== greeting) refs.greeting.textContent = greeting;
   }
 
   function renderTranscript(lines) {
@@ -743,6 +1030,7 @@
     const signature = JSON.stringify(safeLines);
     if (signature === transcriptSignature) return;
     transcriptSignature = signature;
+    maybeRequestVoiceKbUnlock(safeLines);
     refs.transcript.replaceChildren();
     if (safeLines.length === 0) {
       refs.transcript.append(node("p", "empty", "No transcript yet."));
@@ -795,13 +1083,17 @@
       try {
         const payload = await publicJson("/state", {cache: "no-store"});
         setConnection(true);
-        setEngineState(payload.state);
+        setEngineState(payload.state, payload.tool);
+        renderTool(payload.state, payload.tool);
+        renderGreeting(payload.user);
         renderTranscript(payload.transcript);
+        renderQuickActions(payload.quick_actions);
         renderVoice(payload);
         renderAudio(payload.audio);
       } catch (_error) {
         setConnection(false);
         setEngineState("OFFLINE");
+        renderTool("OFFLINE", null);
         renderAudio(null);
       }
     });
@@ -823,6 +1115,10 @@
     const active = currentView === "live" && document.visibilityState === "visible";
     if (active) {
       engine.start();
+      if (!greetingTimer) {
+        renderGreeting();
+        greetingTimer = window.setInterval(renderGreeting, 60_000);
+      }
       if (!signalTimer) {
         refreshSignal();
         signalTimer = window.setInterval(refreshSignal, SIGNAL_INTERVAL_MS);
@@ -830,6 +1126,8 @@
       return;
     }
     engine.stop();
+    if (greetingTimer) window.clearInterval(greetingTimer);
+    greetingTimer = 0;
     if (signalTimer) window.clearInterval(signalTimer);
     signalTimer = 0;
   }
@@ -1083,11 +1381,39 @@
     servers.forEach((server) => {
       if (!isRecord(server)) return;
       const row = node("div", "mcp-row");
-      row.append(node("strong", "", stringValue(server.name)));
+      const state = ["connecting", "connected", "not_configured", "error"].includes(server.state)
+        ? server.state : (server.connected ? "connected" : "error");
+      const name = node("strong", "status-name");
+      name.append(node("span", `status-dot is-${state}`));
+      name.append(document.createTextNode(stringValue(server.name)));
+      row.append(name);
       const tools = Number.isInteger(server.tools) ? server.tools : 0;
-      const detail = server.connected ? `${tools} ${tools === 1 ? "tool" : "tools"}` : stringValue(server.error || "disconnected");
-      row.append(node("span", server.connected ? "is-connected" : "is-failed", detail));
+      let detail = stringValue(server.detail || state);
+      if (server.connected) detail = `${detail}, ${tools} ${tools === 1 ? "tool" : "tools"}`;
+      if (server.name === "kb" && ["held", "none", "expired"].includes(server.session)) {
+        detail = `${detail}, session ${server.session}`;
+      }
+      row.append(node("span", `status-detail is-${state}`, detail));
       refs.mcpList.append(row);
+    });
+  }
+  function renderApps(apps) {
+    refs.appsList.replaceChildren();
+    if (!Array.isArray(apps) || apps.length === 0) {
+      refs.appsList.append(node("p", "empty", "No desktop profiles configured."));
+      return;
+    }
+    apps.forEach((app) => {
+      if (!isRecord(app)) return;
+      const state = ["configured", "not_configured", "error"].includes(app.state)
+        ? app.state : "error";
+      const row = node("div", "mcp-row");
+      const name = node("strong", "status-name");
+      name.append(node("span", `status-dot is-${state}`));
+      name.append(document.createTextNode(stringValue(app.name)));
+      row.append(name);
+      row.append(node("span", `status-detail is-${state}`, stringValue(app.detail || state)));
+      refs.appsList.append(row);
     });
   }
   function refreshSettings() {
@@ -1096,6 +1422,7 @@
         const health = await publicJson("/health", {cache: "no-store", ignoreHttpError: true});
         if (health) {
           renderMcp(health.mcp);
+          renderApps(health.apps);
           refs.claudeStatus.textContent = health.claude ? "Available" : "Unavailable";
           refs.claudeStatus.classList.toggle("is-unavailable", !health.claude);
         }
@@ -1175,4 +1502,4 @@
   refreshState();
   refreshJobs();
   updatePolling();
-})();
+})(globalThis);

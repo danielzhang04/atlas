@@ -100,6 +100,8 @@ def build(
     max_tokens = cfg.get("max_tokens", 400)
     timeout_s = cfg.get("turn_timeout_s", 12.0)
     ceiling_s = cfg.get("turn_ceiling_s", 30.0)
+    pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
+    cache_ttl = pricing.get("cache_ttl", "5m")
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
         raise ValueError("invalid Atlas configuration: max_tokens")
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
@@ -137,6 +139,8 @@ def build(
 
     register_count_mail(registry, search)
 
+    brain_holder: list[Brain] = []
+
     def on_server(name: str, _current_registry: ToolRegistry) -> None:
         if name != "google":
             return
@@ -150,9 +154,14 @@ def build(
 
         current_search[0] = connected_search
 
+    def on_state(_name: str, _state: str, snapshot: list[dict]) -> None:
+        if brain_holder:
+            brain_holder[0].refresh_capabilities(snapshot)
+
     mcp = McpServers(
         load_mcp_config(ATLAS / "config" / "mcp.yaml"),
         on_server=on_server,
+        on_state=on_state,
         account_values={"user_google_email": google_account},
         **mcp_kwargs,
     )
@@ -167,5 +176,8 @@ def build(
         max_tokens=max_tokens,
         turn_timeout_s=float(timeout_s),
         turn_ceiling_s=float(ceiling_s),
+        mcp_status=mcp.status(),
+        cache_ttl=cache_ttl,
     )
+    brain_holder.append(brain)
     return Runtime(registry, mcp, work, brain, store)

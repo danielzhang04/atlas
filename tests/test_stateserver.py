@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import sys
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -11,6 +14,7 @@ import aiohttp
 
 from worker import stateserver
 from worker.state import StatePublisher
+from worker.tools import Tool, ToolRegistry
 
 
 def _dt(second: int) -> datetime:
@@ -30,6 +34,7 @@ def test_state_signal_assets_and_security_headers():
             clock=lambda: _dt(0),
             voice="mars",
             wake_model="hey_atlas",
+            user_name="Daniel",
         )
         publisher.start_session()
         publisher.set_state("LISTENING")
@@ -57,6 +62,8 @@ def test_state_signal_assets_and_security_headers():
     assert payload["heartbeat"] == _dt(1).isoformat()
     assert payload["state"] == "LISTENING"
     assert payload["wake_model"] == "hey_atlas"
+    assert payload["user"] == {"name": "Daniel"}
+    assert payload["tool"] is None
     assert payload["audio"] == {
         "input": {"name": "Headset microphone", "following": True},
         "output": {"name": "Headphones", "following": True},
@@ -71,6 +78,12 @@ def test_state_signal_assets_and_security_headers():
     assert 'data-view="live"' in page[2]
     assert 'aria-controls="history-view"' in page[2]
     assert 'id="audio-line"' in page[2]
+    assert 'id="greeting"' in page[2]
+    assert 'id="tool-strip" hidden' in page[2]
+    assert 'id="tool-strip" aria-hidden' not in page[2]
+    assert 'id="quick-actions"' in page[2]
+    assert 'id="text-turn-input"' in page[2]
+    assert "autofocus" not in page[2]
     assert 'class="core"' not in page[2]
     assert styles[0] == 200 and "--header: 40px" in styles[2]
     assert ".view[hidden]" in styles[2]
@@ -79,6 +92,12 @@ def test_state_signal_assets_and_security_headers():
     assert ".engine::before" not in styles[2]
     assert ".orbit" not in styles[2]
     assert "background-size:" not in styles[2]
+    assert all(
+        f"@keyframes {name}" in styles[2]
+        for name in (
+            "holoApproach", "holoIdle", "holoDismiss", "holoTrace", "holoScanSweep",
+        )
+    )
     assert script[0] == 200 and "const BAR_COUNT = 96" in script[2]
     assert "const INPUT_BANDS = 24" in script[2]
     assert "const UNIQUE_BANDS = 48" in script[2]
@@ -89,6 +108,26 @@ def test_state_signal_assets_and_security_headers():
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]
+    assert "TOOL:" in script[2]
+    assert "renderGreeting" in script[2]
+    assert "renderTool" in script[2]
+    render_tool = script[2].split("function renderTool", 1)[1].split("function renderGreeting", 1)[0]
+    identity_guard = "if (identity === activeToolIdentity) return;"
+    assert "JSON.stringify([name, since])" in render_tool
+    assert render_tool.index(identity_guard) < render_tool.index("refs.toolStrip.hidden")
+    assert render_tool.index(identity_guard) < render_tool.index("refs.toolAnnouncer.replaceChildren")
+    live_activity = script[2].split("function updateLiveActivity", 1)[1].split("function eventStore", 1)[0]
+    assert "currentView === \"live\" && document.visibilityState === \"visible\"" in live_activity
+    assert "window.setInterval(renderGreeting, 60_000)" in live_activity
+    assert "window.clearInterval(greetingTimer)" in live_activity
+    assert script[2].count("window.setInterval(renderGreeting, 60_000)") == 1
+    assert "root.__atlasEngineGeometry" in script[2]
+    assert 'authenticatedJson("/actions/quick"' in script[2]
+    assert 'authenticatedJson("/turn"' in script[2]
+    assert "renderPendingConfirmation(payload.pending)" in script[2]
+    assert 'classList.add("is-holo-dismissing")' in script[2]
+    assert 'addEventListener("animationend"' in script[2]
+    assert "window.setTimeout(finish, 400)" in script[2]
     assert 'publicJson("/signal"' in script[2]
     assert 'currentView !== "live"' in script[2]
     assert 'document.visibilityState !== "visible"' in script[2]
@@ -148,6 +187,12 @@ def test_ui_bearer_survives_reload_only_in_session_and_clears_when_invalid():
     assert 'publicJson("/health"' in script[2]
     assert '"/mcp"' not in script[2]
     assert "renderMcp(health.mcp);" in script[2]
+    assert "renderApps(health.apps);" in script[2]
+    assert 'kbUnlockButton.id = "kb-unlock-button";' in script[2]
+    assert 'callNativeWindow("unlock_kb")' in script[2]
+    assert '"atlas unlock kb"' in script[2]
+    assert '"unlock the dashboard"' in script[2]
+    assert "session ${server.session}" in script[2]
 
 
 def test_jobs_events_and_health_are_fixed_public_projections():
@@ -169,7 +214,19 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     )]
     mcp = [{
         "name": "google", "connected": True, "tools": 11, "error": None,
+        "state": "connected", "detail": "ready",
         "env": "must-not-escape",
+    }, {
+        "name": "kb", "connected": True, "tools": 22, "error": None,
+        "state": "connected", "detail": "ready",
+        "session": "held", "token": "must-not-escape",
+    }]
+    apps = [{
+        "name": "vscode", "state": "configured", "detail": "signed executable found",
+        "path": "must-not-escape",
+    }, {
+        "name": "spotify", "state": "not_configured",
+        "detail": "signed executable not found: Spotify.exe",
     }]
 
     async def scenario():
@@ -182,7 +239,19 @@ def test_jobs_events_and_health_are_fixed_public_projections():
             job_event_provider=lambda requested, after: (
                 after_seen.append((requested, after)) or events
             ),
-            health_provider=lambda: {"claude": True, "mcp": mcp},
+            health_provider=lambda: {
+                "claude": True, "mcp": mcp, "apps": apps,
+                "as_of": "2026-08-27T12:00:00+00:00",
+                "cache_floor_ok": False,
+                "traces": {
+                    "enabled": True,
+                    "turns_today": 7,
+                    "avg_ms_today": 125.5,
+                    "cache_hit_ratio_today": 0.75,
+                    "cost_usd_today": 0.0123,
+                    "secret": "must-not-escape",
+                },
+            },
         )
         event_headers = {stateserver.HEADER: bearer}
         try:
@@ -219,19 +288,182 @@ def test_jobs_events_and_health_are_fixed_public_projections():
     assert "must-not-escape" not in health_response[2]
     assert json.loads(health_response[2]) == {
         "claude": True,
-        "mcp": [{"name": "google", "connected": True, "tools": 11, "error": None}],
+        "cache_floor_ok": False,
+        "as_of": "2026-08-27T12:00:00+00:00",
+        "mcp": [
+            {
+                "name": "google", "connected": True, "tools": 11, "error": None,
+                "state": "connected", "detail": "ready",
+            },
+            {
+                "name": "kb", "connected": True, "tools": 22, "error": None,
+                "state": "connected", "detail": "ready",
+                "session": "held",
+            },
+        ],
+        "apps": [
+            {"name": "vscode", "state": "configured", "detail": "signed executable found"},
+            {
+                "name": "spotify", "state": "not_configured",
+                "detail": "signed executable not found: Spotify.exe",
+            },
+        ],
+        "traces": {
+            "enabled": True,
+            "turns_today": 7,
+            "avg_ms_today": 125.5,
+            "cache_hit_ratio_today": 0.75,
+            "cost_usd_today": 0.0123,
+        },
     }
     assert missing_mcp[0] == 404
     assert invalid[0] == 400
     assert oversized[0] == 400
 
 
+def test_health_projects_unknown_cache_floor_as_null():
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            clock=lambda: _dt(1),
+            health_provider=lambda: {"cache_floor_ok": "must-not-escape"},
+        )
+        try:
+            return await _request(server, path="/health")
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert json.loads(response[2]) == {
+        "claude": False,
+        "cache_floor_ok": None,
+        "as_of": "2026-08-22T12:00:01+00:00",
+        "mcp": [],
+        "apps": [],
+        "traces": {
+            "enabled": False,
+            "turns_today": 0,
+            "avg_ms_today": 0.0,
+            "cache_hit_ratio_today": 0.0,
+            "cost_usd_today": 0.0,
+        },
+    }
+    assert "must-not-escape" not in response[2]
+
+
+def test_health_normalizes_state_derived_connection_shapes():
+    mcp = [
+        {
+            "name": "connected", "state": "connected", "detail": "ready",
+            "connected": False, "tools": 3, "error": "RuntimeError",
+        },
+        {
+            "name": "failed", "state": "error", "detail": "spawn failed",
+            "connected": True, "tools": 9, "error": "OSError",
+        },
+        {
+            "name": "pending", "state": "connecting", "detail": "connection pending",
+            "connected": True, "tools": 7, "error": "RuntimeError",
+        },
+    ]
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            clock=lambda: _dt(1),
+            health_provider=lambda: {"mcp": mcp},
+        )
+        try:
+            return await _request(server, path="/health")
+        finally:
+            await server.stop()
+
+    response = asyncio.run(scenario())
+
+    assert json.loads(response[2]) == {
+        "claude": False,
+        "cache_floor_ok": None,
+        "as_of": "2026-08-22T12:00:01+00:00",
+        "mcp": [
+            {
+                "name": "connected", "state": "connected", "detail": "ready",
+                "connected": True, "tools": 3, "error": None,
+            },
+            {
+                "name": "failed", "state": "error", "detail": "spawn failed",
+                "connected": False, "tools": 0, "error": "OSError",
+            },
+            {
+                "name": "pending", "state": "connecting",
+                "detail": "connection pending", "connected": False,
+                "tools": 0, "error": None,
+            },
+        ],
+        "apps": [],
+        "traces": {
+            "enabled": False,
+            "turns_today": 0,
+            "avg_ms_today": 0.0,
+            "cache_hit_ratio_today": 0.0,
+            "cost_usd_today": 0.0,
+        },
+    }
+
+
+def test_health_returns_cached_trace_snapshot_while_database_is_exclusively_locked(tmp_path):
+    from worker.traces import TraceRecorder
+
+    path = tmp_path / "traces.db"
+    recorder = TraceRecorder(path)
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.route(turn, ms=1, ok=True)
+    recorder.end_turn(
+        turn, addressed=True, wake_kind="wake", outcome="responded", total_ms=7,
+    )
+    assert recorder.summary(days=1)["turns"] == 1
+
+    def health():
+        cached = recorder.health
+        return {"traces": {
+            "enabled": cached["enabled"], "turns_today": cached["turns"],
+            "avg_ms_today": cached["avg_ms"],
+            "cache_hit_ratio_today": cached["cache_hit_ratio"],
+            "cost_usd_today": cached["cost_usd"],
+        }}
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)), 0, health_provider=health,
+        )
+        lock = sqlite3.connect(path, timeout=0)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            started = time.perf_counter()
+            response = await _request(server, path="/health")
+            return response, time.perf_counter() - started
+        finally:
+            lock.rollback()
+            lock.close()
+            await server.stop()
+
+    response, elapsed = asyncio.run(scenario())
+    recorder.close()
+    assert elapsed < 0.1
+    assert json.loads(response[2])["traces"]["turns_today"] == 1
+
+
 def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypatch):
     from worker import app
 
+    sys.modules.pop("worker.traces", None)
     calls = []
     publishers = []
     placeholder_audio = []
+    health_providers = []
+    desktop_resolutions = []
     build_active = False
 
     real_publisher = app.state.StatePublisher
@@ -266,7 +498,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
             self.brain = SimpleNamespace(on_tool=None)
             self.work = FakeWork()
             self.mcp = FakeMcp()
-            self.registry = object()
+            self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
         def warm_model_client(self):
@@ -297,6 +529,7 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
 
     async def start_server(*_args, **_kwargs):
         publishers.append(_args[0])
+        health_providers.append(_kwargs["health_provider"])
         snapshot = publishers[0].snapshot()
         assert snapshot["ready"] is False
         assert snapshot["audio"] == placeholder_audio[0]
@@ -362,9 +595,14 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
     monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
     monkeypatch.setattr(app.stateserver, "start", start_server)
+    monkeypatch.setattr(
+        app.desktopapps,
+        "status",
+        lambda **_kwargs: desktop_resolutions.append("resolved") or [],
+    )
     monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: calls.append("ui-emitted"))
     real_create_task = asyncio.create_task
-    scheduled = iter(("mcp-scheduled", "work-scheduled"))
+    scheduled = iter(("desktop-status-scheduled", "mcp-scheduled", "work-scheduled"))
 
     def record_create_task(coro):
         calls.append(next(scheduled))
@@ -373,12 +611,16 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
     monkeypatch.setattr(app.asyncio, "create_task", record_create_task)
 
     asyncio.run(app.entrypoint(FakeContext()))
+    health = [health_providers[0]() for _ in range(20)]
 
     assert publishers[0].snapshot()["ready"] is True
+    assert desktop_resolutions == ["resolved"]
+    assert all(item["apps"] == [] and item["as_of"] for item in health)
     assert calls == [
         "build-returned",
         "publisher-created",
         "server-started",
+        "desktop-status-scheduled",
         "ui-emitted",
         "warm",
         "wake-resolved",
@@ -390,6 +632,152 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         "livekit-connected",
         "session-started",
     ]
+    assert "worker.traces" not in sys.modules
+
+
+def test_entrypoint_wires_blocking_tool_into_real_state_server(monkeypatch):
+    from worker import app
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    registry = ToolRegistry(execution_clock=lambda: _dt(4))
+    servers = []
+
+    async def block(_arguments):
+        started.set()
+        await release.wait()
+        return "done"
+
+    registry.register(Tool(
+        "search_messages",
+        "Search messages.",
+        {"type": "object", "properties": {}},
+        block,
+    ))
+
+    class FakeWork:
+        launcher = SimpleNamespace(available=True)
+
+        def on_terminal(self, _callback):
+            return None
+
+        def active(self):
+            return []
+
+        async def cancel(self, _job_id):
+            return True
+
+        async def cancel_active(self, *, timeout_s):
+            return None
+
+        async def run(self, _stop):
+            return None
+
+    class FakeMcp:
+        async def connect(self, _registry):
+            return None
+
+        async def close(self):
+            return None
+
+        def status(self):
+            return []
+
+    services = SimpleNamespace(
+        brain=SimpleNamespace(on_tool=None),
+        work=FakeWork(),
+        mcp=FakeMcp(),
+        registry=registry,
+        store=SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None),
+        warm_model_client=lambda: None,
+    )
+
+    class FakeSession:
+        input = SimpleNamespace(set_audio_enabled=lambda _enabled: None)
+
+        async def start(self, **_kwargs):
+            return None
+
+        def interrupt(self):
+            return None
+
+    class FakeContext:
+        room = object()
+
+        async def connect(self):
+            return None
+
+        def add_shutdown_callback(self, _callback):
+            return None
+
+        def shutdown(self, _reason):
+            return None
+
+    real_start = app.stateserver.start
+
+    async def capture_start(*args, **kwargs):
+        server = await real_start(*args, **kwargs)
+        servers.append(server)
+        return server
+
+    cfg = {
+        "active_voice": "mars",
+        "engagement_timeout_s": 30,
+        "state_port": 0,
+        "wake_input_device": None,
+        "wake_model": "hey_atlas",
+    }
+    monkeypatch.setattr(app, "TEXT_MODE", True)
+    monkeypatch.setattr(app, "_cfg", lambda: cfg)
+    monkeypatch.setattr(app.runtime, "build", lambda *_args, **_kwargs: services)
+    monkeypatch.setattr(app.jobobject, "assign_current_process", lambda: None)
+    monkeypatch.setattr(app.envload, "load_private_environment", lambda: None)
+    monkeypatch.setattr(app.router, "Addressing", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app.router, "vocabulary", lambda _cfg: [])
+    monkeypatch.setattr(app.wakeword, "InputDeviceSwitch", lambda _device: object())
+    monkeypatch.setattr(app.devicewatch, "audio_status", lambda _cfg: {})
+    monkeypatch.setattr(
+        app.devicewatch,
+        "AudioRestartCoalescer",
+        lambda *_args, **_kwargs: SimpleNamespace(request=lambda _reason: None),
+    )
+    monkeypatch.setattr(app.devicewatch, "audio_failure_callback", lambda *_args: None)
+    monkeypatch.setattr(
+        app.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(start=lambda: None),
+    )
+    monkeypatch.setattr(app, "AgentSession", lambda **_kwargs: FakeSession())
+    monkeypatch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
+    monkeypatch.setattr(app, "_build_tts", lambda _cfg: object())
+    monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
+    monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
+    monkeypatch.setattr(app.stateserver, "start", capture_start)
+    monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: None)
+
+    async def scenario():
+        await app.entrypoint(FakeContext())
+        call = asyncio.create_task(registry.call("search_messages", {}))
+        try:
+            await started.wait()
+            active = json.loads((await _request(servers[0]))[2])["tool"]
+            release.set()
+            result = await call
+            cleared = json.loads((await _request(servers[0]))[2])["tool"]
+            return active, cleared, result
+        finally:
+            release.set()
+            await asyncio.gather(call, return_exceptions=True)
+            await servers[0].stop()
+
+    active, cleared, result = asyncio.run(scenario())
+
+    assert active == {
+        "name": "search_messages",
+        "since": _dt(4).isoformat(),
+    }
+    assert cleared is None
+    assert result.status == "ok"
 
 
 def test_wake_before_session_exists_publishes_listening_without_speaking():
@@ -459,7 +847,7 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
                 self.brain = SimpleNamespace(on_tool=None)
                 self.work = FakeWork()
                 self.mcp = FakeMcp()
-                self.registry = object()
+                self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
                 self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
             def warm_model_client(self):
@@ -591,7 +979,7 @@ def test_entrypoint_early_shutdown_is_registered_and_idempotent(monkeypatch):
             self.brain = SimpleNamespace(on_tool=None)
             self.work = FakeWork()
             self.mcp = FakeMcp()
-            self.registry = object()
+            self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
 
     class FakeServer:
@@ -900,6 +1288,75 @@ def test_shutdown_requires_exact_launcher_token_before_invoking_provider():
     assert json.loads(accepted[2]) == {"ok": True}
     assert json.loads(repeated[2]) == {"ok": True}
     assert shutdown_calls == ["requested"]
+
+
+def test_kb_session_channel_requires_launcher_token_and_forwards_only_in_memory(monkeypatch):
+    received = []
+
+    class FakeMcp:
+        async def set_session(self, server, token, expires_at):
+            received.append((server, token, expires_at))
+
+        def session_origin(self, server):
+            assert server == "kb"
+            return "http://127.0.0.1:5317"
+
+    from worker import mcp_client
+
+    monkeypatch.setattr(mcp_client, "active_mcp_servers", lambda: FakeMcp())
+
+    async def scenario():
+        server = await stateserver.start(
+            StatePublisher(clock=lambda: _dt(0)),
+            0,
+            shutdown_token="launcher-token",
+        )
+        body = json.dumps({
+            "token": "private-operator-bearer",
+            "expiresAt": "2099-01-01T00:00:00Z",
+        })
+        origin = f"http://127.0.0.1:{server.port}"
+        try:
+            denied = await _request(
+                server,
+                "POST",
+                "/kb/session",
+                body=body,
+                headers={"Content-Type": "application/json", "Origin": origin},
+            )
+            accepted = await _request(
+                server,
+                "POST",
+                "/kb/session",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin,
+                    stateserver.SHUTDOWN_HEADER: "launcher-token",
+                },
+            )
+            config = await _request(
+                server,
+                path="/kb/config",
+                headers={stateserver.SHUTDOWN_HEADER: "launcher-token"},
+            )
+            return denied, accepted, config
+        finally:
+            await server.stop()
+
+    denied, accepted, config = asyncio.run(scenario())
+    assert denied[0] == 403
+    assert json.loads(accepted[2]) == {"ok": True}
+    assert received == [(
+        "kb",
+        "private-operator-bearer",
+        "2099-01-01T00:00:00Z",
+    )]
+    assert "private-operator-bearer" not in accepted[2]
+    assert json.loads(config[2]) == {
+        "enabled": True,
+        "origin": "http://127.0.0.1:5317",
+    }
 
 
 def test_authorized_shutdown_continues_after_the_request_task_is_cancelled():

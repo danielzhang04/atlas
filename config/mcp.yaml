@@ -1,4 +1,19 @@
 servers:
+  kb:
+    command: [node, "{kb_bridge.path}/dist/server.js"]
+    enabled_from: kb_bridge.enabled
+    session_channel: true
+    env_from:
+      ATLAS_KB_BRIDGE_ENABLED: kb_bridge.enabled
+      ATLAS_KB_MUTATIONS_ENABLED: kb_bridge.mutations
+      ATLAS_KB_ORIGIN: kb_bridge.origin
+    instant: [kb_capabilities, kb_agents_list, kb_agent_get,
+              kb_workflows_list, kb_workflow_get, kb_runs_list, kb_run_get,
+              kb_run_events, kb_run_watch, kb_inbox_list, kb_schedules_list,
+              kb_deployment_inspect, kb_asset_pull_inspect, kb_repo_tree,
+              kb_repo_file, kb_repo_history, kb_repo_search,
+              kb_analytics_snapshot, kb_trace_list, kb_trace_get,
+              kb_terminal_list]
   google:
     from_claude_config: google-workspace
     account_param: user_google_email

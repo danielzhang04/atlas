@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime
 from typing import Any, Protocol
 
+from .claims import ACTION_CLAIM_VERBS, UNBACKED_ACTION_REPLY, ClaimGuard
 from .router import normalize
 from .tools import PendingAction, ToolRegistry, ToolResult
 
@@ -19,6 +21,8 @@ logger = logging.getLogger("atlas.brain")
 
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
+CACHE_FLOOR_TOKENS = 4_096
+CACHE_FLOOR_MAX_CHECKS = 3
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here."
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here."
 
@@ -84,7 +88,7 @@ As a recipient, "myself" means Daniel's own address.
 After launch_work returns ok, say it is launching and will show in Workers; never pretend it is done.
 Use find_file and read_file for quick questions about a file. Use launch_work for
 analysis that needs code or produces artifacts.
-If read_file reports truncated, do not analyse the preview — call launch_work with the exact path.
+If read_file reports truncated, do not analyse the preview -- call launch_work with the exact path.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
 in:inbox for all; never count from a search page.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
@@ -166,6 +170,26 @@ def _field(block: Any, name: str) -> Any:
     return block.get(name) if isinstance(block, Mapping) else getattr(block, name, None)
 
 
+def _record_generation(
+    model: str,
+    started: float,
+    usage: Mapping[str, int] | None,
+    *,
+    ok: bool,
+) -> None:
+    def _tokens(name: str) -> int:
+        value = _field(usage, name)
+        return max(0, int(value)) if isinstance(value, (int, float)) else 0
+
+    from worker import traces as traces_mod
+    traces_mod.record_current_generate(
+        model, ms=round((time.perf_counter() - started) * 1000), ok=ok,
+        tokens_in=_tokens("input_tokens"), tokens_out=_tokens("output_tokens"),
+        cache_read_tokens=_tokens("cache_read_input_tokens"),
+        cache_write_tokens=_tokens("cache_creation_input_tokens"),
+    )
+
+
 def _block_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, Mapping):
         return dict(block)
@@ -199,8 +223,10 @@ class Brain:
         turn_timeout_s: float = 12.0,
         turn_ceiling_s: float = 30.0,
         history_exchanges: int = 8,
+        cache_ttl: str = "5m",
         on_tool: Callable[[str, ToolResult], None] | None = None,
         clock: Callable[[], datetime] = datetime.now,
+        mcp_status: list[dict[str, Any]] | None = None,
     ) -> None:
         if (
             isinstance(turn_timeout_s, bool)
@@ -222,18 +248,167 @@ class Brain:
         self.turn_ceiling_s = float(turn_ceiling_s)
         self.history_exchanges = history_exchanges
         self.on_tool = on_tool
+        if cache_ttl not in {"5m", "1h"}:
+            raise ValueError("cache_ttl must be 5m or 1h")
+        self._cache_control = {"type": "ephemeral"}
+        if cache_ttl == "1h":
+            self._cache_control["ttl"] = "1h"
         self._clock = clock
         rules = BASE_SYSTEM
         if persona.strip():
             rules += "\n\nVoice and personality:\n" + persona.strip()
         self._system_text = rules
         self._history: list[dict[str, str]] = []
+        self.cache_floor_ok: bool | None = None
+        self.last_usage: dict[str, int] | None = None
+        self._first_turn_seen = False
+        self._tools_settled = False
+        self._capabilities_settling = False
+        self._snapshot_generation = 0
+        self._cache_floor_generations: set[int] = set()
+        self._cache_floor_checks_started = 0
+        self._cache_floor_tasks: set[asyncio.Task[None]] = set()
+        self._tool_names: tuple[str, ...] = ()
+        self._tools: list[dict[str, Any]] = []
+        self._mcp_status = self._copy_mcp_status(mcp_status or [])
+        self._capability_text = ""
+        self._cached_system: dict[str, Any] = {}
+        self._replace_tool_snapshot(self.registry.schemas())
+
+    @staticmethod
+    def _schema_names(schemas: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(sorted({
+            name
+            for schema in schemas
+            if isinstance((name := schema.get("name")), str)
+        }))
+
+    @staticmethod
+    def _copy_mcp_status(mcp_status: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [dict(item) for item in mcp_status if isinstance(item, Mapping)]
+
+    def _replace_tool_snapshot(self, schemas: list[dict[str, Any]]) -> None:
+        tools = [dict(schema) for schema in schemas]
+        if tools:
+            tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        self._tool_names = self._schema_names(schemas)
+        self._tools = tools
+        self._capability_text = _capability_system_text(tools, self._mcp_status)
+        self._cached_system = {
+            "type": "text",
+            "text": self._system_text + "\n\n" + self._capability_text,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+
+    def _refresh_snapshot(self) -> bool:
+        schemas = self.registry.schemas()
+        capability_text = _capability_system_text(schemas, self._mcp_status)
+        if capability_text == self._capability_text:
+            return False
+        self._replace_tool_snapshot(schemas)
+        self._snapshot_generation += 1
+        self.cache_floor_ok = None
+        logger.info("brain prompt snapshot rebuilt (tools=%d)", len(self._tool_names))
+        self._arm_cache_floor_check()
+        return True
+
+    def refresh_tools(self) -> bool:
+        """Rebuild only when the registered tool-name or recorded state set changes."""
+        return self._refresh_snapshot()
+
+    def begin_capability_settle(self) -> None:
+        """Coalesce initial MCP state transitions into the post-connect snapshot."""
+        self._capabilities_settling = True
+
+    def refresh_capabilities(self, mcp_status: list[dict[str, Any]]) -> bool:
+        """Record a host-observed transition and rebuild one coherent snapshot."""
+        self._mcp_status = self._copy_mcp_status(mcp_status)
+        if self._capabilities_settling:
+            return False
+        return self._refresh_snapshot()
+
+    def mark_tools_settled(self) -> None:
+        """Allow cache-floor checks after initial MCP discovery has settled."""
+        self._capabilities_settling = False
+        if self._tools_settled:
+            return
+        self._tools_settled = True
+        self._arm_cache_floor_check()
 
     def _request_tools(self) -> list[dict[str, Any]]:
-        tools = [dict(schema) for schema in self.registry.schemas()]
-        if tools:
-            tools[-1]["cache_control"] = {"type": "ephemeral"}
-        return tools
+        return [dict(tool) for tool in self._tools]
+
+    async def _check_cache_floor(
+        self,
+        generation: int,
+        tools: list[dict[str, Any]],
+        cached_system: dict[str, Any],
+    ) -> None:
+        try:
+            result = await self.client.messages.count_tokens(
+                model=self.model,
+                system=[cached_system],
+                tools=tools,
+                messages=[],
+            )
+            tokens = _field(result, "input_tokens")
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                raise ValueError("invalid token count")
+            if generation != self._snapshot_generation:
+                return
+            self.cache_floor_ok = tokens >= CACHE_FLOOR_TOKENS
+            if not self.cache_floor_ok:
+                logger.warning("prompt cache floor unmet: %d tokens", tokens)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if generation == self._snapshot_generation:
+                logger.warning("prompt cache floor check failed: %s", type(exc).__name__)
+
+    def _arm_cache_floor_check(self) -> bool:
+        generation = self._snapshot_generation
+        if (
+            not self._first_turn_seen
+            or not self._tools_settled
+            or generation in self._cache_floor_generations
+            or self._cache_floor_checks_started >= CACHE_FLOOR_MAX_CHECKS
+        ):
+            return False
+        self._cache_floor_generations.add(generation)
+        self._cache_floor_checks_started += 1
+        task = asyncio.create_task(self._check_cache_floor(
+            generation,
+            self._request_tools(),
+            dict(self._cached_system),
+        ))
+        self._cache_floor_tasks.add(task)
+        task.add_done_callback(self._cache_floor_tasks.discard)
+        return True
+
+    def _record_usage(self, message: Any) -> dict[str, int] | None:
+        usage = _field(message, "usage")
+        if usage is None:
+            return None
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+        recorded = {}
+        for name in fields:
+            value = _field(usage, name)
+            recorded[name] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        self.last_usage = recorded
+        logger.info(
+            "conversation model usage input_tokens=%d output_tokens=%d "
+            "cache_read_input_tokens=%d cache_creation_input_tokens=%d",
+            recorded["input_tokens"],
+            recorded["output_tokens"],
+            recorded["cache_read_input_tokens"],
+            recorded["cache_creation_input_tokens"],
+        )
+        return recorded
 
     def _remember(self, transcript: str, spoken: str) -> None:
         self._history.extend((
@@ -249,6 +424,9 @@ class Brain:
     async def respond(self, transcript: str, *, context: str | None = None) -> AsyncIterator[str]:
         if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > MAX_TRANSCRIPT:
             raise ValueError("transcript must contain 1 to 4096 characters")
+        if not self._first_turn_seen:
+            self._first_turn_seen = True
+            self._arm_cache_floor_check()
         prompt = transcript
         pending = self.registry.pending
         confirmation_intent = _confirmation_intent(prompt, pending) if pending is not None else None
@@ -257,17 +435,19 @@ class Brain:
         if context:
             turn_content = f"{context}\n\nCurrent addressed utterance:\n{prompt}"
         messages.append({"role": "user", "content": turn_content})
-        system = [{
-            "type": "text",
-            "text": self._system_text,
-            "cache_control": {"type": "ephemeral"},
-        }, {
+        tools = self._request_tools()
+        cached_system = dict(self._cached_system)
+        system = [cached_system, {
             "type": "text",
             "text": self._now_system_text(),
         }]
-        tools = self._request_tools()
-        spoken: list[str] = []
         buffer = ""
+        spoken: list[str] = []
+        guarded_chunks: list[str] = []
+        tool_results: list[tuple[str, bool]] = []
+        guard = ClaimGuard(prompt, self.registry, tools)
+        if pending is not None:
+            guard.remember(pending.arguments)
         tool_rounds = 0
         tainted = bool(context)
         host_line: str | None = None
@@ -277,13 +457,17 @@ class Brain:
                     if confirmation_intent == "confirm":
                         name = "confirm"
                         result = await self.registry.confirm(pending.confirm_id)
+                        tool_results.append(guard.evidence(
+                            pending.name, pending.arguments, result.status == "ok",
+                        ))
                         if result.status == "ok":
-                            host_line = f"Done — {pending.name} executed."
+                            host_line = f"Done -- {pending.name} executed."
                         else:
                             host_line = f"That didn't go through: {result.content[:160]}."
                     else:
                         name = "cancel_pending"
                         result = self.registry.cancel_pending()
+                        tool_results.append((name, result.status == "ok"))
                         host_line = "Cancelled."
                     self._remember(prompt, host_line)
                     if self.on_tool is not None:
@@ -318,46 +502,83 @@ class Brain:
                                 }],
                             },
                         ]
-                    async with asyncio.timeout(self.turn_timeout_s):
-                        async with self.client.messages.stream(
-                            model=self.model,
-                            max_tokens=self.max_tokens,
-                            system=narration_system,
-                            messages=narration_messages,
-                            tools=tools,
-                            tool_choice={"type": "none"},
-                        ) as stream:
-                            async for delta in stream.text_stream:
-                                buffer += delta
-                                chunks, buffer = split_spoken(buffer)
-                                for chunk in chunks:
-                                    spoken.append(chunk)
-                                    yield chunk
-                            await stream.get_final_message()
+                    generation_started = time.perf_counter()
+                    final = None
+                    generation_usage = None
+                    try:
+                        async with asyncio.timeout(self.turn_timeout_s):
+                            async with self.client.messages.stream(
+                                model=self.model,
+                                max_tokens=self.max_tokens,
+                                system=narration_system,
+                                messages=narration_messages,
+                                tools=tools,
+                                tool_choice={"type": "none"},
+                            ) as stream:
+                                async for delta in stream.text_stream:
+                                    buffer += delta
+                                    chunks, buffer = split_spoken(buffer)
+                                    for chunk in chunks:
+                                        if guard.delayed(chunk):
+                                            guarded_chunks.append(chunk)
+                                        else:
+                                            spoken.append(chunk)
+                                            yield chunk
+                                final = await stream.get_final_message()
+                                generation_usage = self._record_usage(final)
+                    finally:
+                        _record_generation(
+                            self.model,
+                            generation_started,
+                            generation_usage,
+                            ok=final is not None,
+                        )
                     if buffer:
-                        spoken.append(buffer)
-                        yield buffer
-                    if not spoken:
-                        yield host_line
+                        if guard.delayed(buffer):
+                            guarded_chunks.append(buffer)
+                        else:
+                            spoken.append(buffer)
+                            yield buffer
+                    if not spoken and not guarded_chunks:
+                        guarded_chunks.append(host_line)
+                    for chunk in guarded_chunks:
+                        verdict = guard.evaluate(chunk, tool_results)
+                        if verdict is not None:
+                            yield verdict
                     return
                 while True:
                     tool_choice = {"type": "none"} if tool_rounds >= MAX_TOOL_ROUNDS else {"type": "auto"}
-                    async with asyncio.timeout(self.turn_timeout_s):
-                        async with self.client.messages.stream(
-                            model=self.model,
-                            max_tokens=self.max_tokens,
-                            system=system,
-                            messages=messages,
-                            tools=tools,
-                            tool_choice=tool_choice,
-                        ) as stream:
-                            async for delta in stream.text_stream:
-                                buffer += delta
-                                chunks, buffer = split_spoken(buffer)
-                                for chunk in chunks:
-                                    spoken.append(chunk)
-                                    yield chunk
-                            final = await stream.get_final_message()
+                    generation_started = time.perf_counter()
+                    final = None
+                    generation_usage = None
+                    try:
+                        async with asyncio.timeout(self.turn_timeout_s):
+                            async with self.client.messages.stream(
+                                model=self.model,
+                                max_tokens=self.max_tokens,
+                                system=system,
+                                messages=messages,
+                                tools=tools,
+                                tool_choice=tool_choice,
+                            ) as stream:
+                                async for delta in stream.text_stream:
+                                    buffer += delta
+                                    chunks, buffer = split_spoken(buffer)
+                                    for chunk in chunks:
+                                        if guard.delayed(chunk):
+                                            guarded_chunks.append(chunk)
+                                        else:
+                                            spoken.append(chunk)
+                                            yield chunk
+                                final = await stream.get_final_message()
+                                generation_usage = self._record_usage(final)
+                    finally:
+                        _record_generation(
+                            self.model,
+                            generation_started,
+                            generation_usage,
+                            ok=final is not None,
+                        )
 
                     if getattr(final, "stop_reason", None) != "tool_use":
                         break
@@ -384,6 +605,10 @@ class Brain:
                             tainted=tainted,
                             transcript=prompt,
                         )
+                        guard.remember(arguments)
+                        tool_results.append(guard.evidence(
+                            name, arguments, result.status == "ok",
+                        ))
                         results.append({
                             "type": "tool_result",
                             "tool_use_id": call_id,
@@ -401,9 +626,19 @@ class Brain:
                     tool_rounds += 1
 
                 if buffer:
-                    spoken.append(buffer)
-                    yield buffer
+                    if guard.delayed(buffer):
+                        guarded_chunks.append(buffer)
+                    else:
+                        spoken.append(buffer)
+                        yield buffer
+                final_chunks = [
+                    verdict for chunk in guarded_chunks
+                    if (verdict := guard.evaluate(chunk, tool_results)) is not None
+                ]
+                spoken.extend(final_chunks)
                 self._remember(prompt, "".join(spoken))
+                for chunk in final_chunks:
+                    yield chunk
         except TimeoutError:
             yield host_line or TIMEOUT_REPLY
         except Exception as exc:
@@ -417,6 +652,40 @@ class Brain:
     def _now_system_text(self) -> str:
         now = self._clock().astimezone()
         return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
+
+
+def _capability_system_text(
+    schemas: list[dict[str, Any]],
+    mcp_status: list[dict[str, Any]],
+) -> str:
+    lines = ["Available registered capabilities by name:"]
+    names = sorted(
+        schema.get("name")
+        for schema in schemas
+        if isinstance(schema.get("name"), str)
+    )
+    for name in names:
+        lines.append(name)
+    if len(lines) == 1:
+        lines.append("none")
+    lines.append("MCP server states:")
+    state_count = 0
+    states = sorted(
+        (item.get("name"), item.get("state"))
+        for item in mcp_status
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and item.get("state") in {"connecting", "connected", "not_configured", "error"}
+    )
+    for name, state in states:
+        lines.append(f"{name}: {state}")
+        state_count += 1
+    if state_count == 0:
+        lines.append("none")
+    lines.append(
+        "Before saying you cannot do something, check this list; if a tool covers it, call it."
+    )
+    return "\n".join(lines)
 
 
 def _content_bearing_tool(name: str) -> bool:

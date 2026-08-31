@@ -9,7 +9,7 @@ from pathlib import Path
 from queue import Queue
 import subprocess
 import sys
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +155,218 @@ def test_pywebview_injection_walk_terminates():
     api._window = RecursiveAttributeGraph()
 
     assert _pywebview_api_walk(api) < 200
+
+
+def test_kb_session_api_exposes_only_methods_and_reflection_walk_terminates():
+    api = desktop.KbSessionApi(lambda _token, _expires_at: None)
+
+    assert all(
+        callable(getattr(api, name))
+        for name in dir(api)
+        if not name.startswith("_")
+    )
+    assert _pywebview_api_walk(api) < 200
+
+
+def test_kb_unlock_window_forwards_session_and_closes_without_logging(desktop_log):
+    sent = []
+    windows = []
+    bearer = "private-operator-bearer"
+
+    class AuthWindow:
+        def __init__(self, api):
+            self.api = api
+            self.scripts = []
+            self.destroy_calls = 0
+
+        def evaluate_js(self, script):
+            self.scripts.append(script)
+            self.api.kb_session(bearer, "2099-01-01T00:00:00Z")
+
+        def destroy(self):
+            self.destroy_calls += 1
+
+    def window_factory(title, url, **kwargs):
+        assert title == "Unlock kb"
+        assert url == "http://127.0.0.1:5317/"
+        window = AuthWindow(kwargs["js_api"])
+        windows.append(window)
+        return window
+
+    unlock = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=window_factory,
+        session_sender=lambda token, expires_at: sent.append((token, expires_at)),
+        context_probe=lambda _origin: "win32-desktop",
+    )
+
+    result = unlock.unlock()
+
+    assert result == "kb unlocked until 2099-01-01T00:00:00Z"
+    assert sent == [(bearer, "2099-01-01T00:00:00Z")]
+    assert windows[0].destroy_calls == 1
+    script = windows[0].scripts[0]
+    assert "/api/auth/assert/options" in script
+    assert "navigator.credentials.get" in script
+    assert "/api/auth/assert/verify" in script
+    assert "typeof session.token" in script
+    assert "Number.isSafeInteger(session.expiresAt)" in script
+    assert "kb_session" in script
+    assert bearer not in script
+    assert bearer not in desktop_log.getvalue()
+
+
+def test_kb_unlock_timeout_and_legacy_daemon_are_content_free():
+    windows = []
+    sent = []
+
+    class AuthWindow:
+        def __init__(self):
+            self.destroy_calls = 0
+
+        def evaluate_js(self, _script):
+            return None
+
+        def destroy(self):
+            self.destroy_calls += 1
+
+    def window_factory(*_args, **_kwargs):
+        window = AuthWindow()
+        windows.append(window)
+        return window
+
+    timeout = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=window_factory,
+        session_sender=lambda *args: sent.append(args),
+        context_probe=lambda _origin: "win32-desktop",
+        timeout_s=0,
+    )
+    assert timeout.unlock() == "unlock cancelled"
+    assert windows[0].destroy_calls == 1
+    assert sent == []
+
+    legacy = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy daemon must not open an auth window")
+        ),
+        session_sender=lambda *_args: None,
+        context_probe=lambda _origin: "legacy",
+    )
+    assert legacy.unlock() == "kb has no login today - already usable"
+
+
+def test_kb_unlock_invalid_verify_shape_and_forwarding_failure_are_terminal():
+    class InvalidWindow:
+        def __init__(self, api):
+            self.api = api
+            self.events = SimpleNamespace(closed=FakeEvent())
+
+        def evaluate_js(self, _script):
+            self.api.kb_session("private", 1.5)
+
+        def destroy(self):
+            return None
+
+    invalid = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=lambda *_args, **kwargs: InvalidWindow(kwargs["js_api"]),
+        session_sender=lambda *_args: None,
+        context_probe=lambda _origin: "win32-desktop",
+        timeout_s=0.05,
+    )
+    assert invalid.unlock() == "unlock failed"
+
+    class ValidWindow(InvalidWindow):
+        def evaluate_js(self, _script):
+            self.api.kb_session("private", "2099-01-01T00:00:00Z")
+
+    rejected = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=lambda *_args, **kwargs: ValidWindow(kwargs["js_api"]),
+        session_sender=lambda *_args: (_ for _ in ()).throw(ValueError("rejected")),
+        context_probe=lambda _origin: "win32-desktop",
+    )
+    assert rejected.unlock() == "unlock failed"
+
+
+def test_kb_unlock_manual_close_cancels_without_waiting_for_timeout():
+    created = Event()
+    windows = []
+    outcome = []
+
+    class ClosingWindow:
+        def __init__(self):
+            self.events = SimpleNamespace(closed=FakeEvent())
+
+        def evaluate_js(self, _script):
+            created.set()
+
+        def destroy(self):
+            return None
+
+    def factory(*_args, **_kwargs):
+        window = ClosingWindow()
+        windows.append(window)
+        return window
+
+    unlock = desktop.KbUnlock(
+        "http://127.0.0.1:5317",
+        window_factory=factory,
+        session_sender=lambda *_args: None,
+        context_probe=lambda _origin: "win32-desktop",
+        timeout_s=0.5,
+    )
+    thread = Thread(target=lambda: outcome.append(unlock.unlock()))
+    thread.start()
+    assert created.wait(0.2)
+    windows[0].events.closed.fire()
+    thread.join(0.1)
+    cancelled_immediately = not thread.is_alive()
+    thread.join(1.0)
+
+    assert cancelled_immediately is True
+    assert outcome == ["unlock cancelled"]
+
+
+def test_kb_unlock_utterances_route_as_a_reflex():
+    from worker import router
+
+    assert router.route("atlas, unlock kb", {}) == ("reflex", "unlock_kb")
+    assert router.route("unlock the dashboard", {}) == ("reflex", "unlock_kb")
+
+
+def test_kb_origin_comes_from_the_private_worker_channel():
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, limit):
+            requests.append(("read", limit))
+            return b'{"enabled":true,"origin":"http://127.0.0.1:5317"}'
+
+    def opener(request, *, timeout):
+        requests.append((request.full_url, dict(request.header_items()), timeout))
+        return Response()
+
+    origin = desktop._request_kb_origin(
+        "http://127.0.0.1:4360/#pair=one-use",
+        "launcher-token",
+        opener=opener,
+    )
+
+    assert origin == "http://127.0.0.1:5317"
+    url, headers, timeout = requests[0]
+    assert url == "http://127.0.0.1:4360/kb/config"
+    assert headers["X-atlas-shutdown"] == "launcher-token"
+    assert timeout == 3.0
+    assert requests[1] == ("read", 4_097)
 
 
 def test_set_app_user_model_id_calls_shell_once_and_swallows_failure(desktop_log):

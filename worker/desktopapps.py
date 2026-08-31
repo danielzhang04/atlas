@@ -1,25 +1,34 @@
 """Open or focus signed, allowlisted desktop application profiles."""
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import ctypes
+from datetime import datetime, timezone
+import importlib
 import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable
+import threading
+from typing import Any
 from urllib.parse import urlsplit
+
+from .statusdetail import render_status_detail
 
 __all__ = [
     "AppProfile",
     "DEFAULT_PROFILES",
     "DesktopAppError",
     "DesktopApps",
+    "StatusSnapshot",
     "close_profile",
     "focus_profile",
     "known_folder_path",
     "native_launcher",
     "open_profile",
+    "status",
 ]
 
 
@@ -69,6 +78,12 @@ _KNOWN_FOLDER_IDS = {
         0x4FCF,
         (0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
     ),
+    "roaming_app_data": (
+        0x3EB685DB,
+        0x65F9,
+        0x4CF6,
+        (0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D),
+    ),
     "program_files": (
         0x905E63B6,
         0xC1BF,
@@ -84,6 +99,7 @@ _KNOWN_FOLDER_IDS = {
 }
 _LEGACY_FOLDER_IDS = {
     "local_app_data": 0x001C,
+    "roaming_app_data": 0x001A,
     "program_files": 0x0026,
     "program_files_x86": 0x002A,
 }
@@ -96,6 +112,35 @@ _EXPECTED_PUBLISHERS = {
     "Spotify.exe": "Spotify AB",
     "explorer.exe": "Microsoft Windows",
 }
+
+# A Store app installs a zero-byte app-execution alias into WindowsApps; the real signed
+# image lives behind an APPEXECLINK reparse point. Reading that link only redirects which
+# file the mandatory Authenticode publisher check runs against.
+#
+# The alias file itself is writable by the signed-in user, so its target is untrusted
+# input. A remote target would let an SMB server answer the signature check with a signed
+# image and the later launch with a payload, so a target is accepted only when it is a
+# local drive-letter path contained in one of these admin-only roots. Containment is
+# re-checked after resolution, before the Authenticode gate runs.
+_ALIAS_TARGET_ROOTS = (
+    ("program_files", "WindowsApps"),
+    ("windows", "SystemApps"),
+    ("windows", "System32"),
+)
+_LOCAL_DRIVE = re.compile(r"[A-Za-z]:")
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
+_FSCTL_GET_REPARSE_POINT = 0x000900A8
+_OPEN_EXISTING = 3
+_FILE_SHARE_READ_WRITE_DELETE = 0x00000007
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_MAXIMUM_REPARSE_DATA_BUFFER_SIZE = 16 * 1024
+_REPARSE_HEADER_SIZE = 8
+_APPEXECLINK_VERSION_SIZE = 4
+# packageId, entryPoint, executable target, applicationType
+_APPEXECLINK_TARGET_INDEX = 2
 
 
 class _Guid(ctypes.Structure):
@@ -137,6 +182,91 @@ class DesktopApps:
             return self._profiles[app_id]
         except KeyError as exc:
             raise DesktopAppError("app is not allowlisted") from exc
+
+
+def status(
+    *,
+    profiles: dict[str, AppProfile] | None = None,
+    resolver: Callable[[str], str] | None = None,
+) -> list[dict[str, str]]:
+    """Report signed executable availability without exposing resolved paths."""
+    configured = profiles or DEFAULT_PROFILES
+    resolve = resolver or _resolve_executable
+    result = []
+    for name, profile in configured.items():
+        try:
+            resolve(profile.executable)
+        except DesktopAppError:
+            result.append({
+                "name": name,
+                "state": "not_configured",
+                "detail": render_status_detail(
+                    "not_configured", "signed_missing", executable=profile.executable,
+                ),
+            })
+        except Exception:
+            result.append({
+                "name": name,
+                "state": "error",
+                "detail": render_status_detail("error", "profile_failed"),
+            })
+        else:
+            result.append({
+                "name": name,
+                "state": "configured",
+                "detail": render_status_detail("configured", "signed_found"),
+            })
+    return result
+
+
+class StatusSnapshot:
+    """Lazily cache signed desktop status and refresh it only off the poll path."""
+
+    def __init__(
+        self,
+        *,
+        profiles: dict[str, AppProfile] | None = None,
+        resolver: Callable[[str], str] | None = None,
+        clock: Callable[[], datetime | str] = lambda: datetime.now(timezone.utc),
+        refresh_interval_s: float = 600.0,
+    ) -> None:
+        self._profiles = profiles
+        self._resolver = resolver
+        self._clock = clock
+        self._refresh_interval_s = refresh_interval_s
+        self._lock = threading.Lock()
+        self._apps: list[dict[str, str]] | None = None
+        self._as_of: str | None = None
+
+    def refresh(self) -> dict[str, Any]:
+        apps = status(profiles=self._profiles, resolver=self._resolver)
+        now = self._clock()
+        as_of = now.isoformat() if isinstance(now, datetime) else str(now)
+        with self._lock:
+            self._apps = apps
+            self._as_of = as_of[:64]
+            return self._copy_locked()
+
+    def get(self) -> dict[str, Any]:
+        with self._lock:
+            if self._apps is not None:
+                return self._copy_locked()
+            apps = status(profiles=self._profiles, resolver=self._resolver)
+            now = self._clock()
+            self._apps = apps
+            self._as_of = (now.isoformat() if isinstance(now, datetime) else str(now))[:64]
+            return self._copy_locked()
+
+    async def run(self) -> None:
+        while True:
+            await asyncio.sleep(self._refresh_interval_s)
+            await asyncio.to_thread(self.refresh)
+
+    def _copy_locked(self) -> dict[str, Any]:
+        return {
+            "apps": [dict(item) for item in self._apps or ()],
+            "as_of": self._as_of,
+        }
 
 
 def _direct_https(value: str) -> bool:
@@ -198,7 +328,23 @@ def _taskkill_executable() -> str:
 
 def native_launcher(executable: str, url: str | None) -> dict[str, object]:
     """Launch one already-allowlisted executable without a shell or inherited stdin."""
+    if executable not in _EXPECTED_PUBLISHERS:
+        raise DesktopAppError("desktop application is not an approved profile")
     resolved = _resolve_executable(executable)
+    existing = None
+    if url is None:
+        try:
+            existing = _visible_profile_window(resolved)
+        except _desktopcontrol().DesktopControlError:
+            existing = None
+    if existing is not None:
+        _focus_profile_window(existing)
+        return {
+            "application": executable,
+            "pid": existing["pid"],
+            "focused": True,
+            "existing": True,
+        }
     command = [resolved] + ([url] if url is not None else [])
     child_env = {
         key: os.environ[key]
@@ -230,6 +376,18 @@ def native_launcher(executable: str, url: str | None) -> dict[str, object]:
     }
 
 
+def _desktopcontrol():
+    return importlib.import_module("worker.desktopcontrol")
+
+
+def _visible_profile_window(executable_path: str) -> dict | None:
+    return _desktopcontrol().find_window_by_process_path(executable_path)
+
+
+def _focus_profile_window(window: dict) -> object:
+    return _desktopcontrol().focus_resolved_window(window)
+
+
 def _resolve_executable(executable: str) -> str:
     if os.name != "nt" or executable not in _EXPECTED_PUBLISHERS:
         raise DesktopAppError(
@@ -242,7 +400,10 @@ def _resolve_executable(executable: str) -> str:
         ],
         "wt.exe": [("local_app_data", "Microsoft/WindowsApps/wt.exe")],
         "notepad.exe": [("windows", "System32/notepad.exe")],
-        "Spotify.exe": [("local_app_data", "Microsoft/WindowsApps/Spotify.exe")],
+        "Spotify.exe": [
+            ("local_app_data", "Microsoft/WindowsApps/Spotify.exe"),
+            ("roaming_app_data", "Spotify/Spotify.exe"),
+        ],
         "explorer.exe": [("windows", "System32/explorer.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
@@ -260,15 +421,152 @@ def _resolve_executable(executable: str) -> str:
             )
         except DesktopAppError:
             continue
-        item = root / relative
-        if not item.is_file():
+        resolved = _candidate_image(root / relative)
+        if resolved is None:
             continue
-        resolved = item.resolve()
         if _verify_authenticode_publisher(resolved, expected_publisher):
             return str(resolved)
     raise DesktopAppError(
         "configured desktop application is unavailable at an approved location"
     )
+
+
+def _candidate_image(item: Path) -> Path | None:
+    """Resolve one candidate to a real file, following an app-execution alias."""
+    candidate = item
+    reparse = _read_reparse_data(item)
+    if reparse is not None and _reparse_tag(reparse) == _IO_REPARSE_TAG_APPEXECLINK:
+        target = _parse_app_execution_link(reparse)
+        if target is None:
+            return None
+        candidate = _contained_alias_target(target)
+        if candidate is None:
+            return None
+    try:
+        if not candidate.is_file():
+            return None
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
+def _alias_target_roots() -> tuple[Path, ...]:
+    """Resolve the admin-only roots an app-execution alias is allowed to point into."""
+    roots = []
+    for root_name, relative in _ALIAS_TARGET_ROOTS:
+        try:
+            base = (
+                _windows_directory()
+                if root_name == "windows"
+                else _known_folder_path(root_name)
+            )
+            roots.append((base / relative).resolve())
+        except (DesktopAppError, OSError):
+            continue
+    return tuple(roots)
+
+
+def _is_local_drive_path(path: Path) -> bool:
+    """Reject UNC shares and the \\\\?\\ and \\\\.\\ device namespaces."""
+    return path.is_absolute() and bool(_LOCAL_DRIVE.fullmatch(path.drive))
+
+
+def _contained_alias_target(target: str) -> Path | None:
+    """Accept an alias target only as a local file inside an admin-only root."""
+    roots = _alias_target_roots()
+    if not roots:
+        return None
+    candidate = Path(target)
+    if not _is_local_drive_path(candidate):
+        return None
+    if not any(candidate.is_relative_to(root) for root in roots):
+        return None
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if not _is_local_drive_path(resolved):
+        return None
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None
+    return resolved
+
+
+def _reparse_tag(buffer: bytes) -> int | None:
+    """Read the reparse tag of a raw REPARSE_DATA_BUFFER."""
+    if len(buffer) < _REPARSE_HEADER_SIZE:
+        return None
+    return int.from_bytes(buffer[0:4], "little")
+
+
+def _parse_app_execution_link(buffer: bytes) -> str | None:
+    """Return the executable target of an APPEXECLINK buffer, or None if unusable."""
+    if _reparse_tag(buffer) != _IO_REPARSE_TAG_APPEXECLINK:
+        return None
+    data_length = int.from_bytes(buffer[4:6], "little")
+    data = buffer[_REPARSE_HEADER_SIZE:_REPARSE_HEADER_SIZE + data_length]
+    if len(data) != data_length or data_length <= _APPEXECLINK_VERSION_SIZE:
+        return None
+    try:
+        fields = data[_APPEXECLINK_VERSION_SIZE:].decode("utf-16-le").split("\x00")
+    except UnicodeDecodeError:
+        return None
+    if len(fields) <= _APPEXECLINK_TARGET_INDEX:
+        return None
+    target = fields[_APPEXECLINK_TARGET_INDEX].strip()
+    if not target or not Path(target).is_absolute():
+        return None
+    return target
+
+
+def _read_reparse_data(path: Path) -> bytes | None:
+    """Read a file's raw reparse buffer through Win32 without following the link."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        attributes = kernel32.GetFileAttributesW(ctypes.c_wchar_p(str(path)))
+        if attributes & _INVALID_FILE_ATTRIBUTES == _INVALID_FILE_ATTRIBUTES:
+            return None
+        if not attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            ctypes.c_wchar_p(str(path)),
+            0,
+            _FILE_SHARE_READ_WRITE_DELETE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not handle or handle == _invalid_handle_value():
+        return None
+    try:
+        buffer = ctypes.create_string_buffer(_MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        returned = ctypes.c_ulong(0)
+        if not kernel32.DeviceIoControl(
+            ctypes.c_void_p(handle),
+            _FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            buffer,
+            _MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            ctypes.byref(returned),
+            None,
+        ):
+            return None
+        return buffer.raw[:returned.value]
+    except (OSError, ValueError):
+        return None
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _invalid_handle_value() -> int:
+    return (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
 
 
 def known_folder_path(name: str) -> Path:

@@ -5,7 +5,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 import logging
 import math
-from typing import Callable
+from typing import Callable, Mapping
 import uuid
 
 __all__ = [
@@ -40,6 +40,9 @@ _PRIOR_SPEECH_PHRASES = (
 )
 BAND_COUNT = 24
 WAKE_MODEL_LIMIT = 128
+TOOL_NAME_LIMIT = 64
+TOOL_SINCE_LIMIT = 64
+USER_NAME_LIMIT = 80
 
 STATE_FROM_AGENT = {
     "thinking": THINKING,
@@ -62,10 +65,12 @@ class StatePublisher:
         ring_size: int = DEFAULT_RING,
         voice: str | None = None,
         wake_model: str | None = None,
+        user_name: str | None = None,
     ) -> None:
         self._clock = clock
         self.voice = voice
         self.wake_model = _bounded_wake_model(wake_model)
+        self.user_name = _bounded_text(user_name, USER_NAME_LIMIT) or ""
         self._state = ASLEEP
         self.ready = False
         self._since = clock()
@@ -77,6 +82,7 @@ class StatePublisher:
         }
         self._audio_energy = 0.0
         self._audio_bands = [0.0] * BAND_COUNT
+        self._tool: dict[str, str] | None = None
         self._subs: list[Callable] = []
 
     @property
@@ -110,6 +116,24 @@ class StatePublisher:
 
     def set_wake_model(self, value: str | None) -> None:
         self.wake_model = _bounded_wake_model(value)
+
+    def set_tool(self, tool: Mapping[str, object] | None) -> None:
+        if tool is None:
+            self.clear_tool()
+            return
+        name = _bounded_text(tool.get("name"), TOOL_NAME_LIMIT)
+        since = _bounded_text(tool.get("since"), TOOL_SINCE_LIMIT)
+        if name is None or since is None:
+            self.clear_tool()
+            return
+        self._tool = {"name": name, "since": since}
+        self._emit(("tool", dict(self._tool)))
+
+    def clear_tool(self) -> None:
+        if self._tool is None:
+            return
+        self._tool = None
+        self._emit(("tool", None))
 
     def set_audio(self, status: dict) -> None:
         for direction in ("input", "output"):
@@ -160,8 +184,10 @@ class StatePublisher:
         self.set_audio_energy(energy)
         self.set_audio_bands(bands)
 
-    def add_line(self, role: str, text: str) -> None:
+    def add_line(self, role: str, text: str, *, source: str | None = None) -> None:
         line = {"t": self._clock().isoformat(), "role": role, "text": text}
+        if source is not None:
+            line["source"] = source
         self._ring.append(line)
         self._emit(("line", line))
 
@@ -213,6 +239,8 @@ class StatePublisher:
             "session_id": self._session_id,
             "voice": self.voice,
             "wake_model": self.wake_model,
+            "user": {"name": self.user_name},
+            "tool": dict(self._tool) if self._tool is not None else None,
             "transcript": list(self._ring),
             "audio": {
                 "input": dict(self._audio["input"]),
@@ -230,6 +258,10 @@ class StatePublisher:
 
 
 def _bounded_wake_model(value: str | None) -> str | None:
+    return _bounded_text(value, WAKE_MODEL_LIMIT)
+
+
+def _bounded_text(value: object, limit: int) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
-    return value.strip()[:WAKE_MODEL_LIMIT]
+    return value.strip()[:limit]

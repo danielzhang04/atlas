@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Any, Awaitable, Callable
 
 import yaml
@@ -16,6 +17,7 @@ from livekit.agents import Agent, AgentSession, JobContext, StopResponse, Worker
 from livekit.plugins import deepgram, silero
 
 from worker import brain as brain_mod
+from worker import desktopapps
 from worker import devicewatch
 from worker import engagement as engagement_mod
 from worker import envload, jobobject, router, runtime, sanitize, state, stateserver
@@ -194,22 +196,35 @@ async def _submit_voice_turn(
     publisher: state.StatePublisher,
     engagement: engagement_mod.Engagement,
     context: str | None = None,
+    source: str | None = None,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
-    publisher.add_line("user", text)
+    publisher.add_line("user", text, source=source)
     publisher.set_state(state.THINKING)
     spoken: list[str] = []
+    respond_started: float | None = None
 
     async def _tee():
+        nonlocal respond_started
         response = brain.respond(text, context=context) if context is not None else brain.respond(text)
         async for chunk in response:
+            if respond_started is None:
+                respond_started = time.perf_counter()
             spoken.append(chunk)
             yield chunk
 
+    responded = False
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
+        responded = True
     finally:
+        from worker import traces as traces_mod
+        traces_mod.record_current_respond(
+            ms=(round((time.perf_counter() - respond_started) * 1000)
+                if respond_started is not None else 0),
+            ok=responded,
+        )
         if engagement.state == engagement_mod.ENGAGED:
             publisher.set_state(state.LISTENING)
     response = "".join(spoken)
@@ -239,6 +254,7 @@ async def _handle_reflex(
     dismiss,
     cancel_turn=None,
     on_spoken=None,
+    source: str | None = None,
 ) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
@@ -246,7 +262,7 @@ async def _handle_reflex(
     if lane != "reflex":
         return False
     repeated = _last_atlas_line(publisher) if intent == "repeat" else None
-    publisher.add_line("user", text)
+    publisher.add_line("user", text, source=source)
     if intent == "dismiss":
         dismiss()
     elif intent == "cancel":
@@ -260,7 +276,7 @@ async def _handle_reflex(
     return True
 
 
-async def _handle_audio_turn(
+async def _handle_audio_turn_inner(
     text: str,
     *,
     intents: dict,
@@ -271,11 +287,37 @@ async def _handle_audio_turn(
     addressing: router.Addressing,
     sleep,
     turn_ownership: TurnOwnership | None = None,
+    source: str = "speech",
+    _trace=None,
+    _trace_meta: dict | None = None,
 ) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
 
+    if source not in {"speech", "typed"}:
+        raise ValueError("turn source must be speech or typed")
+    line_source = "typed" if source == "typed" else None
     ownership = turn_ownership or TurnOwnership()
+    route_started = time.perf_counter()
+    route_recorded = False
+
+    def _record_route() -> None:
+        nonlocal route_recorded
+        if _trace is not None and not route_recorded:
+            _trace[0].route(
+                _trace[1],
+                ms=round((time.perf_counter() - route_started) * 1000),
+                ok=True,
+            )
+            route_recorded = True
+
+    def _mark(*, addressed: bool, wake_kind: str, outcome: str) -> None:
+        if _trace_meta is not None:
+            _trace_meta.update(
+                addressed=addressed, wake_kind=wake_kind, outcome=outcome,
+            )
+        _record_route()
+
     lane, intent = router.route(text, intents)
 
     def _dismiss() -> None:
@@ -285,17 +327,22 @@ async def _handle_audio_turn(
         sleep()
 
     if lane == "reflex" and intent == "dismiss":
+        _mark(addressed=False, wake_kind="reflex", outcome="dismissed")
         await _handle_reflex(
             text,
             intents=intents,
             session=session,
             publisher=publisher,
             dismiss=_dismiss,
+            source=line_source,
         )
         return ""
     if lane == "reflex" and intent == "cancel":
-        cancel_allowed = ownership.in_flight or _address_window_open(addressing)
+        cancel_allowed = (
+            source == "typed" or ownership.in_flight or _address_window_open(addressing)
+        )
         if cancel_allowed:
+            _mark(addressed=False, wake_kind="reflex", outcome="cancelled")
             await _handle_reflex(
                 text,
                 intents=intents,
@@ -303,20 +350,30 @@ async def _handle_audio_turn(
                 publisher=publisher,
                 dismiss=_dismiss,
                 cancel_turn=ownership.cancel,
+                source=line_source,
             )
             return ""
     previous = engagement.state
     if engagement.tick() != engagement_mod.ENGAGED:
+        _mark(addressed=False, wake_kind="ambient", outcome="asleep")
         if previous == engagement_mod.ENGAGED:
             sleep(announce=False)
         return ""
     normalized = router.normalize(text)
     if lane == "reflex" and intent == "cancel":
+        _mark(addressed=False, wake_kind="ambient", outcome="ignored")
         publisher.add_line("ambient", text)
         return ""
-    if not addressing.is_addressed(normalized):
+    reply_window = _address_window_open(addressing)
+    if source != "typed" and not addressing.is_addressed(normalized):
+        _mark(addressed=False, wake_kind="ambient", outcome="ignored")
         publisher.add_line("ambient", text)
         return ""
+    _mark(
+        addressed=True,
+        wake_kind="reply" if reply_window else "wake",
+        outcome="error",
+    )
     engagement.interacted()
     if lane == "reflex" and intent == "repeat":
         def _repeated() -> None:
@@ -333,6 +390,7 @@ async def _handle_audio_turn(
             dismiss=_dismiss,
             cancel_turn=ownership.cancel,
             on_spoken=_repeated,
+            source=line_source,
         ))
         return ""
     async def _respond() -> str:
@@ -344,6 +402,7 @@ async def _handle_audio_turn(
             publisher=publisher,
             engagement=engagement,
             context=context,
+            source=line_source,
         )
         if response and engagement.state == engagement_mod.ENGAGED:
             engagement.interacted()
@@ -351,6 +410,108 @@ async def _handle_audio_turn(
         return response
 
     return await ownership.run(_respond)
+
+
+async def _handle_audio_turn(
+    text: str,
+    *,
+    intents: dict,
+    brain: brain_mod.Brain,
+    session,
+    publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
+    addressing: router.Addressing,
+    sleep,
+    turn_ownership: TurnOwnership | None = None,
+    source: str = "speech",
+    trace_recorder=None,
+) -> str:
+    if trace_recorder is None or not isinstance(text, str) or not text.strip():
+        return await _handle_audio_turn_inner(
+            text,
+            intents=intents,
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=sleep,
+            turn_ownership=turn_ownership,
+            source=source,
+        )
+
+    from worker import traces as traces_mod
+    started = time.perf_counter()
+    metadata = {"addressed": False, "wake_kind": "ambient", "outcome": "error"}
+    turn = trace_recorder.begin_turn(wake_kind="ambient")
+    token = traces_mod.activate(trace_recorder, turn)
+    try:
+        response = await _handle_audio_turn_inner(
+            text,
+            intents=intents,
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=sleep,
+            turn_ownership=turn_ownership,
+            source=source,
+            _trace=(trace_recorder, turn),
+            _trace_meta=metadata,
+        )
+        if metadata["addressed"] and metadata["outcome"] == "error":
+            metadata["outcome"] = "responded"
+        return response
+    except asyncio.CancelledError:
+        metadata["outcome"] = "cancelled"
+        raise
+    except Exception:
+        if metadata["addressed"]:
+            metadata["outcome"] = "speech_failed"
+        raise
+    finally:
+        traces_mod.reset(token)
+        trace_recorder.end_turn(
+            turn,
+            **metadata,
+            total_ms=round((time.perf_counter() - started) * 1000),
+        )
+
+
+async def _handle_typed_turn(
+    text: str,
+    *,
+    ready: bool,
+    intents: dict,
+    brain: brain_mod.Brain,
+    session,
+    publisher: state.StatePublisher,
+    engagement: engagement_mod.Engagement,
+    addressing: router.Addressing,
+    engage,
+    sleep,
+    turn_ownership: TurnOwnership | None = None,
+    trace_recorder=None,
+) -> str:
+    """Route deliberate UI text through the same guarded turn path as speech."""
+    if not ready:
+        raise RuntimeError("voice session is not ready")
+    if engagement.tick() != engagement_mod.ENGAGED:
+        engage()
+    return await _handle_audio_turn(
+        text,
+        intents=intents,
+        brain=brain,
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=sleep,
+        turn_ownership=turn_ownership,
+        source="typed",
+        trace_recorder=trace_recorder,
+    )
 
 
 async def _sleep_watch(
@@ -398,7 +559,7 @@ def _record_tool(
 def _terminal_line(job) -> str:
     if job.state is JobState.SUCCEEDED:
         summary = " ".join((job.summary or "").split())
-        return (f"Done — {summary}" if summary else "Done.")[:320]
+        return (f"Done -- {summary}" if summary else "Done.")[:320]
     if job.state is JobState.CANCELLED:
         return "Cancelled."
     return "That task hit a problem; it's in History."
@@ -462,11 +623,31 @@ def _engage_wake(
         session.say(WAKE_LINE, add_to_chat_ctx=False)
 
 
+async def _connect_mcp_and_settle(mcp, registry, brain: brain_mod.Brain) -> None:
+    """Coalesce initial MCP arrivals into one prompt snapshot rebuild."""
+    settled = False
+    begin_settle = getattr(brain, "begin_capability_settle", None)
+    if begin_settle is not None:
+        begin_settle()
+
+    def _on_server(_name: str, _registry) -> None:
+        if settled:
+            brain.refresh_tools()
+
+    await mcp.connect(registry, on_server=_on_server)
+    settled = True
+    brain.refresh_tools()
+    brain.mark_tools_settled()
+
+
 async def entrypoint(ctx: JobContext) -> None:
     jobobject.assign_current_process()
     wakeword.shutting_down.clear()
     envload.load_private_environment()
     cfg = _cfg()
+    trace_cfg = cfg.get("traces") if isinstance(cfg.get("traces"), dict) else {}
+    pricing_cfg = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
+    trace_recorder = None
     authorizer = stateserver.PairingAuthorizer()
     server: stateserver.StateServer | None = None
 
@@ -476,12 +657,37 @@ async def entrypoint(ctx: JobContext) -> None:
         return stateserver.pairing_url(authorizer, server.port)
 
     services = runtime.build(cfg, paired_url=_paired_url)
-    publisher = state.StatePublisher(voice=cfg.get("active_voice"))
+
+    def _traces():
+        nonlocal trace_recorder
+        if trace_recorder is None:
+            from worker import traces as traces_mod
+            trace_recorder = traces_mod.TraceRecorder(
+                trace_cfg.get("path"),
+                enabled=trace_cfg.get("enabled") is not False,
+                pricing={key: value for key, value in pricing_cfg.items()
+                         if isinstance(value, dict)},
+                cache_ttl=pricing_cfg.get("cache_ttl", "5m"),
+                tool_names=services.registry.names(),
+                model_names=(cfg.get("fast_model"),),
+                retention_days=trace_cfg.get("retention_days", 30),
+            )
+        return trace_recorder
+
+    user = cfg.get("user")
+    user_name = user.get("name") if isinstance(user, dict) else None
+    publisher = state.StatePublisher(voice=cfg.get("active_voice"), user_name=user_name)
+    services.registry.set_execution_observer(publisher.set_tool)
+    quick_actions = tools_mod.load_quick_actions(
+        ATLAS / "config" / "quick_actions.yaml", services.registry,
+    )
+    intents = _load_intents()
     loop = asyncio.get_running_loop()
     session: Any | None = None
     session_started = False
     mcp_task: asyncio.Task | None = None
     work_task: asyncio.Task | None = None
+    desktop_status_task: asyncio.Task | None = None
     engagement: engagement_mod.Engagement | None = None
     turn_ownership: TurnOwnership | None = None
     wake_switch: Any | None = None
@@ -493,6 +699,45 @@ async def entrypoint(ctx: JobContext) -> None:
     shutdown_jobs_requested = False
     shutdown_started = False
     shutdown_done = asyncio.Event()
+
+    def _sleep(announce: bool = True) -> bool:
+        if session is None:
+            return False
+        return _sleep_session(session, publisher, announce=announce)
+
+    async def _submit_text_turn(text: str) -> None:
+        if (
+            session is None
+            or engagement is None
+            or turn_ownership is None
+            or not session_started
+            or not publisher.ready
+        ):
+            raise RuntimeError("voice session is not ready")
+        await _handle_typed_turn(
+            text,
+            ready=True,
+            intents=intents,
+            brain=services.brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            engage=_engage,
+            sleep=_sleep,
+            turn_ownership=turn_ownership,
+            trace_recorder=_traces(),
+        )
+
+    async def _handle_quick_result(name: str, result: tools_mod.ToolResult) -> None:
+        _record_tool(publisher, name, result)
+        if result.status != "needs_confirmation":
+            return
+        pending = services.registry.pending
+        readback = f"{pending.summary}." if pending is not None else result.content
+        publisher.add_line("atlas", readback)
+        if session is not None:
+            session.say(readback, add_to_chat_ctx=False)
 
     async def _request_shutdown() -> None:
         nonlocal shutdown_jobs_requested
@@ -523,6 +768,9 @@ async def entrypoint(ctx: JobContext) -> None:
             if sleep_task is not None:
                 sleep_task.cancel()
                 await asyncio.gather(sleep_task, return_exceptions=True)
+            if desktop_status_task is not None:
+                desktop_status_task.cancel()
+                await asyncio.gather(desktop_status_task, return_exceptions=True)
             if _should_cancel_active_jobs(shutdown_jobs_requested):
                 await services.work.cancel_active(timeout_s=15.0)
             stop_work.set()
@@ -536,7 +784,35 @@ async def entrypoint(ctx: JobContext) -> None:
             if server is not None:
                 await _flush_store_and_stop_state_server(services.store, server)
         finally:
+            if trace_recorder is not None:
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
+                except TimeoutError:
+                    logger.warning("turn tracing close exceeded shutdown deadline")
             shutdown_done.set()
+
+    desktop_status = desktopapps.StatusSnapshot()
+
+    def _health() -> dict[str, Any]:
+        snapshot = desktop_status.get()
+        summary = (trace_recorder.health if trace_recorder is not None else {
+            "enabled": trace_cfg.get("enabled") is not False,
+            "turns": 0, "avg_ms": 0.0, "cache_hit_ratio": 0.0, "cost_usd": 0.0,
+        })
+        return {
+            "claude": services.work.launcher.available,
+            "mcp": services.mcp.status(),
+            "apps": snapshot["apps"],
+            "as_of": snapshot["as_of"],
+            "cache_floor_ok": getattr(services.brain, "cache_floor_ok", None),
+            "traces": {
+                "enabled": summary["enabled"],
+                "turns_today": summary["turns"],
+                "avg_ms_today": summary["avg_ms"],
+                "cache_hit_ratio_today": summary["cache_hit_ratio"],
+                "cost_usd_today": summary["cost_usd"],
+            },
+        }
 
     server = await stateserver.start(
         publisher,
@@ -546,10 +822,17 @@ async def entrypoint(ctx: JobContext) -> None:
         job_event_provider=services.store.events,
         result_provider=services.store.result,
         cancel_provider=services.work.cancel,
-        health_provider=lambda: {"claude": services.work.launcher.available, "mcp": services.mcp.status()},
+        health_provider=_health,
+        registry=services.registry,
+        quick_actions=quick_actions,
+        quick_result_provider=_handle_quick_result,
+        text_turn_provider=_submit_text_turn,
         shutdown_token=os.environ.get("ATLAS_SHUTDOWN_TOKEN"),
         shutdown_provider=_request_shutdown,
     )
+    desktop_status_task = asyncio.create_task(desktop_status.run())
+    _BG_TASKS.add(desktop_status_task)
+    desktop_status_task.add_done_callback(_BG_TASKS.discard)
     try:
         ctx.add_shutdown_callback(_shutdown)
         _emit_ui_url(authorizer, server.port)
@@ -618,7 +901,9 @@ async def entrypoint(ctx: JobContext) -> None:
             lambda job: loop.call_soon_threadsafe(_deliver_terminal, job)
         )
 
-        mcp_task = asyncio.create_task(services.mcp.connect(services.registry))
+        mcp_task = asyncio.create_task(
+            _connect_mcp_and_settle(services.mcp, services.registry, services.brain)
+        )
         work_task = asyncio.create_task(services.work.run(stop_work))
         _BG_TASKS.update((mcp_task, work_task))
         mcp_task.add_done_callback(_BG_TASKS.discard)
@@ -648,16 +933,7 @@ async def entrypoint(ctx: JobContext) -> None:
             _announce_terminal(terminal_job, publisher, session, engagement, addressing)
         pending_terminal.clear()
 
-        async def _submit(text: str) -> None:
-            await turn_ownership.run(lambda: _submit_voice_turn(
-                text,
-                brain=services.brain,
-                session=session,
-                publisher=publisher,
-                engagement=engagement,
-            ))
-
-        agent.turn_handler = _submit
+        agent.turn_handler = _submit_text_turn
 
         if TEXT_MODE:
             return
@@ -670,14 +946,9 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         session.input.set_audio_enabled(False)
 
-        def _sleep(announce: bool = True) -> bool:
-            return _sleep_session(session, publisher, announce=announce)
-
         @session.on("agent_state_changed")
         def _on_agent_state(event) -> None:
             _apply_agent_state(engagement, publisher, event.new_state)
-
-        intents = _load_intents()
 
         async def _audio_turn(text: str) -> None:
             await _handle_audio_turn(
@@ -690,6 +961,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 addressing=addressing,
                 sleep=_sleep,
                 turn_ownership=turn_ownership,
+                trace_recorder=_traces(),
             )
 
         agent.turn_handler = _audio_turn

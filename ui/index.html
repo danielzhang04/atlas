@@ -46,9 +46,21 @@
             <h1 class="panel-label" id="engine-heading">Atlas Engine</h1>
             <div class="engine-stage">
               <canvas id="engine-canvas" role="img" aria-label="Atlas engine offline"></canvas>
+              <div class="quick-actions" id="quick-actions" aria-label="Quick actions"></div>
+              <article class="pending-confirmation" id="pending-confirmation" role="status" aria-live="polite" hidden>
+                <span>Confirmation required</span>
+                <p id="pending-confirmation-text"></p>
+              </article>
+              <form class="text-turn-form" id="text-turn-form">
+                <label class="visually-hidden" for="text-turn-input">Message Atlas</label>
+                <input id="text-turn-input" name="text" type="text" maxlength="2048" autocomplete="off" placeholder="type a message...">
+              </form>
             </div>
-            <div class="engine-status" aria-live="polite">
-              <strong id="state-label">OFFLINE</strong>
+            <div class="engine-status">
+              <span class="engine-greeting" id="greeting" role="status" aria-live="polite">GOOD MORNING</span>
+              <strong id="state-label" role="status" aria-live="polite">OFFLINE</strong>
+              <span class="tool-strip" id="tool-strip" hidden></span>
+              <span class="sr-only" id="tool-announcer" role="status" aria-live="polite" aria-atomic="true"></span>
               <span id="audio-line">mic: — · speaker: —</span>
             </div>
           </section>
@@ -138,11 +150,16 @@
             </article>
 
             <article class="setting-card setting-wide">
+              <h2>Desktop apps</h2>
+              <div class="mcp-list" id="apps-list"><p class="empty">Checking profiles.</p></div>
+            </article>
+
+            <article class="setting-card setting-wide">
               <h2>Configuration files</h2>
               <ul class="config-list" id="config-list">
                 <li>config/atlas.yaml</li><li>config/apps.yaml</li>
                 <li>config/mcp.yaml</li><li>config/intents.yaml</li>
-                <li>config/persona.md</li>
+                <li>config/persona.md</li><li>config/quick_actions.yaml</li>
               </ul>
             </article>
           </div>

@@ -19,6 +19,7 @@ _LEAD_FILLER = {
     "uh", "um", "so", "alright", "all", "right",
 }
 _TAIL_FILLER = {"please", "now", "atlas", "okay", "ok"}
+_KB_UNLOCK_PHRASES = {"unlock kb", "unlock the dashboard"}
 
 
 def normalize(value: str) -> str:
@@ -111,6 +112,8 @@ def route(utterance: str, intents: dict) -> tuple[str, str | None]:
     for variant in filler_variants(_legacy_normalize(utterance)):
         if variant not in variants:
             variants.append(variant)
+    if any(value in _KB_UNLOCK_PHRASES for value in variants):
+        return "reflex", "unlock_kb"
     for name, raw in (intents or {}).items():
         spec = raw if isinstance(raw, dict) else {}
         phrases = set()

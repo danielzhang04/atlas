@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import importlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -23,12 +26,14 @@ __all__ = [
     "McpToolError",
     "PendingAction",
     "Policy",
+    "QuickAction",
     "Tool",
     "ToolRegistry",
     "ToolResult",
     "WorkLike",
     "builtin",
     "load_apps",
+    "load_quick_actions",
     "register_count_mail",
 ]
 
@@ -42,12 +47,28 @@ _READBACK_VALUE_LIMIT = 160
 _HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
-_TRUNCATED = "…[truncated]"
+_TRUNCATED = "...[truncated]"
+_DESKTOP_DELETE_CHORDS = ("delete", "ctrl+d", "ctrl+x", "shift+delete")
+_DESKTOP_ALLOWED_CHORDS = frozenset({
+    "alt+tab", "backspace", "ctrl+a", "ctrl+c", "ctrl+f", "ctrl+l", "ctrl+p",
+    "ctrl+s", "ctrl+t", "ctrl+v", "ctrl+w", "ctrl+y", "ctrl+z", "down", "end",
+    "enter", "escape", "home", "left", "pagedown", "pageup", "right", "space",
+    "tab", "up",
+})
+_DESKTOP_MEDIA_KEYS = (
+    "play_pause", "next", "previous", "volume_up", "volume_down", "mute",
+)
+_WINDOW_PROPERTIES = {
+    "title": {"type": "string"},
+    "pid": {"type": "integer", "minimum": 1},
+}
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
 _NEXT_PAGE_TOKEN = re.compile(
     r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+logger = logging.getLogger("atlas.tools")
 
 
 class McpToolError(RuntimeError):
@@ -64,6 +85,14 @@ class Tool:
     input_schema: dict
     run: Callable[[dict], Awaitable[Any]]
     policy: Policy = "instant"
+    prepare: Callable[[dict], dict | _PreparedAction] | None = None
+    execute_prepared: Callable[[dict, Any], Awaitable[Any]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAction:
+    arguments: dict[str, Any]
+    host_state: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +109,7 @@ class PendingAction:
     arguments: dict[str, Any]
     summary: str
     expires: float
+    host_state: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +117,13 @@ class AppEntry:
     words: tuple[str, ...]
     url: str | None = None
     exe: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QuickAction:
+    label: str
+    tool: str
+    args: dict[str, Any]
 
 
 class _JobLike(Protocol):
@@ -108,14 +145,18 @@ class WorkLike(Protocol):
 
 class ToolRegistry:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
+                 execution_clock: Callable[[], datetime] | None = None,
                  timeout_s: float = 8.0) -> None:
         if timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
         self._clock = clock
+        self._execution_clock = execution_clock or (lambda: datetime.now(timezone.utc))
         self._timeout_s = timeout_s
         self._tools: dict[str, Tool] = {}
         self._pending: PendingAction | None = None
         self._open_aliases: frozenset[str] = frozenset()
+        self._executions: dict[object, dict[str, str]] = {}
+        self._execution_observer: Callable[[dict[str, str] | None], None] | None = None
 
     @property
     def pending(self) -> PendingAction | None:
@@ -135,6 +176,26 @@ class ToolRegistry:
         if not isinstance(tool.input_schema, dict) or tool.input_schema.get("type") != "object":
             raise ValueError("tool input schema must describe an object")
         self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> bool:
+        tool = self._tools.pop(name, None)
+        if tool is None:
+            return False
+        if self._pending is not None and self._pending.name == name:
+            self._pending = None
+        return True
+
+    def set_execution_observer(
+        self,
+        observer: Callable[[dict[str, str] | None], None] | None,
+    ) -> None:
+        self._execution_observer = observer
+
+    def _publish_execution(self) -> None:
+        if self._execution_observer is None:
+            return
+        newest = next(reversed(self._executions.values()), None)
+        self._execution_observer(dict(newest) if newest is not None else None)
 
     def names(self) -> list[str]:
         return list(self._tools)
@@ -172,6 +233,16 @@ class ToolRegistry:
             copied = deepcopy(dict(arguments))
             if tainted and self._refused_after_external_content(name, copied):
                 return ToolResult("error", _TAINT_REFUSAL)
+            if tool.prepare is not None:
+                prepared = tool.prepare(copied)
+                if isinstance(prepared, _PreparedAction):
+                    copied = prepared.arguments
+                    host_state = prepared.host_state
+                else:
+                    copied = prepared
+                    host_state = None
+            else:
+                host_state = None
             if tainted and name == "launch_work":
                 if not isinstance(transcript, str) or not transcript.strip():
                     return ToolResult("error", "missing turn transcript")
@@ -186,6 +257,7 @@ class ToolRegistry:
                     arguments=copied,
                     summary=_readback_summary(name, copied),
                     expires=self._clock() + 120.0,
+                    host_state=host_state,
                 )
                 self._pending = pending
                 return ToolResult(
@@ -196,7 +268,7 @@ class ToolRegistry:
                     ),
                     pending.confirm_id,
                 )
-            return await self._execute(tool, copied)
+            return await self._execute(tool, copied, host_state=host_state)
         except Exception as exc:
             return ToolResult("error", type(exc).__name__)
 
@@ -214,6 +286,13 @@ class ToolRegistry:
             "open_file",
             "open_folder",
             "cancel_work",
+            "focus_window",
+            "window_action",
+            "media_key",
+            "click",
+            "type_text",
+            "press_keys",
+            "press_delete",
         }:
             return True
         if name != "open":
@@ -233,23 +312,56 @@ class ToolRegistry:
         if pending.confirm_id != confirm_id:
             return ToolResult("error", "nothing to confirm")
         self._pending = None
-        return await self._execute(self._tools[pending.name], pending.arguments)
+        return await self._execute(
+            self._tools[pending.name], pending.arguments, host_state=pending.host_state,
+        )
 
     def cancel_pending(self) -> ToolResult:
         self._pending = None
         return ToolResult("ok", "cancelled")
 
-    async def _execute(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+    async def _execute(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        host_state: Any = None,
+    ) -> ToolResult:
+        started = time.perf_counter()
+        call_token = object()
+        self._executions[call_token] = {
+            "name": tool.name,
+            "since": self._execution_clock().isoformat(),
+        }
         try:
-            async with asyncio.timeout(self._timeout_s):
-                value = await tool.run(arguments)
-        except McpToolError as exc:
-            return ToolResult("error", str(exc))
-        except Exception as exc:
-            return ToolResult("error", type(exc).__name__)
-        if isinstance(value, ToolResult):
-            return ToolResult(value.status, _bound_content(value.content), value.confirm_id)
-        return ToolResult("ok", _bound_content(_serialize(value)))
+            self._publish_execution()
+            try:
+                async with asyncio.timeout(self._timeout_s):
+                    if tool.execute_prepared is not None and host_state is not None:
+                        value = await tool.execute_prepared(arguments, host_state)
+                    else:
+                        value = await tool.run(arguments)
+            except McpToolError as exc:
+                result = ToolResult("error", str(exc))
+            except Exception as exc:
+                result = ToolResult("error", type(exc).__name__)
+            else:
+                if isinstance(value, ToolResult):
+                    result = ToolResult(
+                        value.status, _bound_content(value.content), value.confirm_id,
+                    )
+                else:
+                    result = ToolResult("ok", _bound_content(_serialize(value)))
+        finally:
+            self._executions.pop(call_token, None)
+            self._publish_execution()
+        from worker import traces as traces_mod
+        traces_mod.record_current_tool_call(
+            tool.name,
+            ms=round((time.perf_counter() - started) * 1000),
+            ok=result.status == "ok",
+        )
+        return result
 
 
 def load_apps(path: Path) -> dict[str, AppEntry]:
@@ -274,6 +386,131 @@ def load_apps(path: Path) -> dict[str, AppEntry]:
     return apps
 
 
+def _schema_accepts(schema: Any, value: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    one_of = schema.get("oneOf")
+    if one_of is not None:
+        if (
+            not isinstance(one_of, list)
+            or sum(_schema_accepts(candidate, value) for candidate in one_of) != 1
+        ):
+            return False
+    any_of = schema.get("anyOf")
+    if any_of is not None:
+        if (
+            not isinstance(any_of, list)
+            or not any(_schema_accepts(candidate, value) for candidate in any_of)
+        ):
+            return False
+    allowed = schema.get("enum")
+    if isinstance(allowed, list) and value not in allowed:
+        return False
+    value_type = schema.get("type")
+    if value_type is None:
+        required = schema.get("required")
+        if required is not None:
+            if (
+                not isinstance(value, dict)
+                or not isinstance(required, list)
+                or not all(isinstance(key, str) and key in value for key in required)
+            ):
+                return False
+        return True
+    if value_type == "object":
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            return False
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return False
+        if not all(isinstance(key, str) and key in value for key in required):
+            return False
+        if schema.get("additionalProperties") is False and any(
+            key not in properties for key in value
+        ):
+            return False
+        return all(
+            key not in properties or _schema_accepts(properties[key], item)
+            for key, item in value.items()
+        )
+    if value_type == "string":
+        if not isinstance(value, str):
+            return False
+        minimum = schema.get("minLength")
+        maximum = schema.get("maxLength")
+        return (
+            (not isinstance(minimum, int) or len(value) >= minimum)
+            and (not isinstance(maximum, int) or len(value) <= maximum)
+        )
+    if value_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    elif value_type == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+    elif value_type == "boolean":
+        return isinstance(value, bool)
+    elif value_type == "array":
+        if not isinstance(value, list):
+            return False
+        items = schema.get("items")
+        return items is None or all(_schema_accepts(items, item) for item in value)
+    elif value_type not in {"integer", "number"}:
+        return False
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    return (
+        (not isinstance(minimum, (int, float)) or value >= minimum)
+        and (not isinstance(maximum, (int, float)) or value <= maximum)
+    )
+
+
+def load_quick_actions(path: Path, registry: ToolRegistry) -> list[QuickAction]:
+    """Load up to fourteen static, registry-validated host actions."""
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        message = f"Dropped quick actions config: {type(exc).__name__}"
+        logger.warning("%s", message[:300])
+        return []
+    if not isinstance(loaded, list):
+        logger.warning("Dropped quick actions config: expected an ordered list")
+        return []
+
+    actions: list[QuickAction] = []
+    dropped = max(0, len(loaded) - 14)
+    registered = getattr(registry, "_tools", {})
+    if not isinstance(registered, dict):
+        registered = {}
+    for raw in loaded[:14]:
+        if not isinstance(raw, dict) or set(raw) != {"label", "tool", "args"}:
+            dropped += 1
+            continue
+        label, name, arguments = raw["label"], raw["tool"], raw["args"]
+        tool = registered.get(name) if isinstance(name, str) else None
+        if (
+            not isinstance(label, str)
+            or not 0 < len(label.strip()) <= 14
+            or tool is None
+            or name in _HOST_ONLY_TOOLS
+            or not isinstance(arguments, dict)
+            or not _schema_accepts(tool.input_schema, arguments)
+        ):
+            dropped += 1
+            continue
+        actions.append(QuickAction(label.strip(), name, deepcopy(arguments)))
+    if dropped:
+        noun = "action" if dropped == 1 else "actions"
+        message = f"Dropped {dropped} invalid quick {noun} from {path.name}"
+        logger.warning("%s", message[:300])
+    return actions
+
+
+def _desktopcontrol() -> Any:
+    return importlib.import_module("worker.desktopcontrol")
+
+
 def builtin(
     registry: ToolRegistry,
     apps: Mapping[str, AppEntry],
@@ -285,9 +522,13 @@ def builtin(
     profile_closer: Callable[[str], object] = desktopapps.close_profile,
     paired_url: Callable[[], str | None] | None = None,
     files: LocalFiles | None = None,
+    desktop: Any | None = None,
 ) -> None:
     aliases = _aliases(apps)
     registry._configure_open_aliases(aliases)
+
+    def desktop_api() -> Any:
+        return desktop if desktop is not None else _desktopcontrol()
 
     async def open_target(arguments: dict) -> ToolResult | dict:
         target = _text_argument(arguments, "target", maximum=2048)
@@ -296,11 +537,18 @@ def builtin(
             name, app = entry
             if app.exe is not None:
                 try:
-                    profile_opener(app.exe, None)
+                    opened = profile_opener(app.exe, None)
                 except desktopapps.DesktopAppError:
                     if app.url is None:
                         raise
                     opener(app.url)
+                else:
+                    if (
+                        isinstance(opened, Mapping)
+                        and opened.get("focused") is True
+                        and opened.get("existing") is True
+                    ):
+                        return ToolResult("ok", "focused existing window")
             elif app.url is not None:
                 dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
                 opener(dynamic_url or app.url)
@@ -368,6 +616,98 @@ def builtin(
         path = _text_argument(arguments, "path", maximum=2048)
         return await files.read_file(path)
 
+    async def list_desktop_windows(arguments: dict) -> dict[str, Any]:
+        values = _desktop_arguments(arguments, integers=("limit",))
+        limit = values.get("limit", 40)
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid limit")
+        inventory = desktop_api().list_windows(limit=limit)
+        return _bounded_window_inventory(inventory)
+
+    async def focus_desktop_window(arguments: dict) -> dict:
+        return desktop_api().focus_window(**_desktop_arguments(
+            arguments, window="required",
+        ))
+
+    async def desktop_window_action(arguments: dict) -> dict:
+        values = _desktop_arguments(
+            arguments,
+            ("action",), integers=("x", "y", "width", "height"), window="required",
+        )
+        action = _text_argument(arguments, "action", maximum=64).casefold()
+        return desktop_api().window_action(action, **values)
+
+    async def desktop_media_key(arguments: dict) -> dict:
+        _desktop_arguments(arguments, ("key",))
+        return desktop_api().media_key(
+            _text_argument(arguments, "key", maximum=32).casefold(),
+        )
+
+    async def desktop_click(arguments: dict) -> dict:
+        values = _desktop_arguments(
+            arguments, integers=("x", "y"), required=("x", "y"), window="optional",
+        )
+        return desktop_api().click(
+            values.pop("x"), values.pop("y"), **values,
+        )
+
+    async def desktop_type_text(arguments: dict) -> dict:
+        _desktop_arguments(arguments, ("text",))
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text or len(text) > 4000:
+            raise ValueError("invalid text")
+        return desktop_api().type_text(text)
+
+    async def desktop_press_keys(arguments: dict) -> ToolResult | dict:
+        _desktop_arguments(arguments, ("chord",))
+        api = desktop_api()
+        chord = api.normalize_chord(arguments.get("chord"))
+        if chord in _DESKTOP_DELETE_CHORDS:
+            return ToolResult("error", "delete chords require press_delete")
+        return api.press_keys(chord)
+
+    def prepare_delete(arguments: dict) -> _PreparedAction:
+        _desktop_arguments(arguments, ("chord",))
+        api = desktop_api()
+        chord = api.normalize_chord(arguments.get("chord"))
+        if chord not in _DESKTOP_DELETE_CHORDS:
+            raise ValueError("invalid delete chord")
+        identity = api.focused_window_identity()
+        title = identity.get("title")
+        pid = identity.get("pid")
+        hwnd = identity.get("_handle")
+        if (
+            not isinstance(title, str)
+            or not title
+            or len(title) > 512
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(hwnd, bool)
+            or not isinstance(hwnd, int)
+            or hwnd <= 0
+        ):
+            raise ValueError("invalid foreground window identity")
+        return _PreparedAction(
+            arguments={"chord": chord, "window": title, "pid": pid},
+            host_state=hwnd,
+        )
+
+    async def desktop_press_delete(arguments: dict) -> ToolResult:
+        return ToolResult("error", "delete confirmation state is unavailable")
+
+    async def execute_desktop_press_delete(
+        arguments: dict,
+        expected_hwnd: Any,
+    ) -> ToolResult | dict:
+        _desktop_arguments(arguments, ("chord", "window", "pid"))
+        try:
+            return desktop_api().press_delete(
+                arguments["chord"], expected_hwnd=expected_hwnd,
+            )
+        except Exception:
+            return ToolResult("error", "focused window changed; delete not executed")
+
     definitions = (
         ("open", "Open an allowlisted app or HTTPS URL.", {"target": {"type": "string"}}, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
@@ -402,6 +742,83 @@ def builtin(
         }
         registry.register(Tool(name, description, schema, run))
 
+    desktop_definitions = (
+        (
+            "list_windows", "List visible top-level windows without exposing native handles.",
+            _desktop_schema({"limit": {"type": "integer", "minimum": 1, "maximum": 100}}),
+            list_desktop_windows,
+        ),
+        (
+            "focus_window", "Focus one host-resolved visible window by title or pid.",
+            _desktop_schema(window="required"), focus_desktop_window,
+        ),
+        (
+            "window_action", "Minimize, maximize, restore, close, move, or resize a host-resolved window.",
+            _desktop_schema({
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "minimize", "maximize", "restore", "close", "move", "resize",
+                        "move:left-half", "move:right-half", "move:center",
+                    ],
+                },
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+            }, required=("action",), window="required"),
+            desktop_window_action,
+        ),
+        (
+            "media_key", "Press one allowlisted media key.",
+            _desktop_schema(
+                {"key": {"type": "string", "enum": list(_DESKTOP_MEDIA_KEYS)}},
+                required=("key",),
+            ), desktop_media_key,
+        ),
+        (
+            "click", "Click screen coordinates, or coordinates relative to a host-resolved window.",
+            _desktop_schema(
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                required=("x", "y"), window="optional",
+            ), desktop_click,
+        ),
+        (
+            "type_text", "Type Unicode text into the foreground application.",
+            _desktop_schema(
+                {"text": {"type": "string", "minLength": 1, "maxLength": 4000}},
+                required=("text",),
+            ), desktop_type_text,
+        ),
+        (
+            "press_keys", "Press one allowlisted non-delete key chord in the foreground application.",
+            _desktop_schema(
+                {"chord": {"type": "string", "enum": sorted(_DESKTOP_ALLOWED_CHORDS)}},
+                required=("chord",),
+            ), desktop_press_keys,
+        ),
+    )
+    for name, description, schema, run in desktop_definitions:
+        registry.register(Tool(name, description, schema, run))
+
+    delete_schema = {
+        "type": "object",
+        "properties": {
+            "chord": {"type": "string", "enum": list(_DESKTOP_DELETE_CHORDS)},
+        },
+        "required": ["chord"],
+        "additionalProperties": False,
+    }
+    registry.register(Tool(
+        "press_delete",
+        "Press a delete chord in the foreground application after confirmation.",
+        delete_schema,
+        desktop_press_delete,
+        policy="confirm",
+        prepare=prepare_delete,
+        execute_prepared=execute_desktop_press_delete,
+    ))
+
 
 def register_count_mail(
     registry: ToolRegistry,
@@ -411,40 +828,63 @@ def register_count_mail(
 
     async def count_mail(arguments: dict) -> ToolResult | dict:
         query = _text_argument(arguments, "query", maximum=1024)
-        total = 0
-        page_token = None
-        seen_tokens: set[str] = set()
-        for _page in range(4):
-            search_arguments = {
-                "query": query,
-                "page_size": 500,
-                "include_headers": False,
-            }
-            if page_token is not None:
-                search_arguments["page_token"] = page_token
-            try:
-                content = await search(search_arguments)
-            except RuntimeError as exc:
-                if str(exc) == "google not connected":
-                    return ToolResult("error", "Google isn't connected yet")
-                raise
-            found = _FOUND_MESSAGES.search(content)
-            if found is None:
-                return ToolResult("error", "unexpected mail search result")
-            page_count = int(found.group(1))
-            if page_count > 500:
-                return ToolResult("error", "unexpected mail search result")
-            total += page_count
-            token_match = _NEXT_PAGE_TOKEN.search(content)
-            page_token = token_match.group(1) if token_match is not None else None
-            if page_token is None:
-                return {"query": query, "count": total, "exact": True}
-            if page_count < 500:
-                return ToolResult("error", "unexpected mail search result")
-            if page_token in seen_tokens:
-                return {"query": query, "count": total, "exact": False}
-            seen_tokens.add(page_token)
-        return {"query": query, "count": total, "exact": page_token is None}
+
+        async def bounded_count(target_query: str) -> tuple[int, bool] | ToolResult:
+            total = 0
+            page_token = None
+            seen_tokens: set[str] = set()
+            for _page in range(4):
+                search_arguments = {
+                    "query": target_query,
+                    "page_size": 500,
+                    "include_headers": False,
+                }
+                if page_token is not None:
+                    search_arguments["page_token"] = page_token
+                try:
+                    content = await search(search_arguments)
+                except RuntimeError as exc:
+                    if str(exc) == "google not connected":
+                        return ToolResult("error", "Google isn't connected yet")
+                    raise
+                found = _FOUND_MESSAGES.search(content)
+                if found is None:
+                    return ToolResult("error", "unexpected mail search result")
+                page_count = int(found.group(1))
+                if page_count > 500:
+                    return ToolResult("error", "unexpected mail search result")
+                total += page_count
+                token_match = _NEXT_PAGE_TOKEN.search(content)
+                page_token = token_match.group(1) if token_match is not None else None
+                if page_token is None:
+                    return total, True
+                if page_count < 500:
+                    return ToolResult("error", "unexpected mail search result")
+                if page_token in seen_tokens:
+                    return total, False
+                seen_tokens.add(page_token)
+            return total, page_token is None
+
+        inbox_count = await bounded_count(query)
+        if isinstance(inbox_count, ToolResult):
+            return inbox_count
+        if re.search(r"(?:^|\s)in:inbox(?:\s|$)", query, re.IGNORECASE):
+            primary_query = query
+            if not re.search(r"(?:^|\s)category:primary(?:\s|$)", query, re.IGNORECASE):
+                primary_query += " category:primary"
+            primary_count = await bounded_count(primary_query)
+            if isinstance(primary_count, ToolResult):
+                return primary_count
+            inbox_total, inbox_exact = inbox_count
+            primary_total, primary_exact = primary_count
+            inbox_text = str(inbox_total) if inbox_exact else f"at least {inbox_total}"
+            primary_text = str(primary_total) if primary_exact else f"at least {primary_total}"
+            return ToolResult(
+                "ok",
+                f"{inbox_text} in your inbox, {primary_text} in Primary",
+            )
+        total, exact = inbox_count
+        return {"query": query, "count": total, "exact": exact}
 
     schema = {
         "type": "object", "properties": {"query": {"type": "string"}},
@@ -472,6 +912,90 @@ def _text_argument(arguments: Mapping[str, Any], name: str, *, maximum: int) -> 
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise ValueError(f"invalid {name}")
     return value.strip()
+
+
+def _desktop_arguments(
+    arguments: Mapping[str, Any], fields: tuple[str, ...] = (), *,
+    integers: tuple[str, ...] = (),
+    required: tuple[str, ...] = (),
+    window: Literal["required", "optional"] | None = None,
+) -> dict[str, Any]:
+    allowed = {*fields, *integers}
+    if window:
+        allowed.update(("title", "pid"))
+    if set(arguments) - allowed:
+        raise ValueError("unexpected argument")
+    values = {}
+    for name in integers:
+        value = arguments.get(name)
+        if name in required or name in arguments:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"invalid {name}")
+            values[name] = value
+    if window is None:
+        return values
+    has_title = "title" in arguments
+    has_pid = "pid" in arguments
+    if has_title and has_pid:
+        raise ValueError("provide title or pid, not both")
+    if not has_title and not has_pid:
+        if window == "required":
+            raise ValueError("missing title or pid")
+        return values
+    if has_title:
+        values["title"] = _text_argument(arguments, "title", maximum=512)
+        return values
+    pid = arguments.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("invalid pid")
+    values["pid"] = pid
+    return values
+
+
+def _desktop_schema(
+    properties: dict[str, dict[str, Any]] | None = None, *,
+    required: tuple[str, ...] = (),
+    window: Literal["required", "optional"] | None = None,
+) -> dict[str, Any]:
+    target_properties = deepcopy(_WINDOW_PROPERTIES) if window else {}
+    schema: dict[str, Any] = {
+        "type": "object", "properties": {**target_properties, **(properties or {})},
+        "additionalProperties": False,
+    }
+    if window == "required":
+        schema["oneOf"] = [
+            {"required": [target, *required]} for target in ("title", "pid")
+        ]
+    elif required:
+        schema["oneOf"] = [{"required": list(required)}]
+    return schema
+
+
+def _bounded_window_inventory(inventory: Any) -> dict[str, Any]:
+    if not isinstance(inventory, Mapping):
+        raise ValueError("invalid window inventory")
+    windows = inventory.get("windows")
+    total = inventory.get("total")
+    truncated = inventory.get("truncated")
+    if (
+        not isinstance(windows, list)
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < len(windows)
+        or not isinstance(truncated, bool)
+    ):
+        raise ValueError("invalid window inventory")
+    bounded = {
+        "windows": deepcopy(windows),
+        "total": total,
+        "truncated": truncated,
+    }
+    while len(_serialize(bounded)) > _CONTENT_LIMIT and bounded["windows"]:
+        bounded["windows"].pop()
+        bounded["truncated"] = True
+    if len(_serialize(bounded)) > _CONTENT_LIMIT:
+        raise ValueError("window inventory metadata is too large")
+    return bounded
 
 
 def _configured_url(value: Any) -> bool:
@@ -509,15 +1033,22 @@ def _serialize(value: Any) -> str:
 
 
 def _readback_summary(name: str, arguments: Mapping[str, Any]) -> str:
-    details = []
-    for key, value in arguments.items():
-        serialized = _serialize(value)
-        cleaned = _CONTROL_CHARACTERS.sub("", serialized)
-        if len(cleaned) > _READBACK_VALUE_LIMIT:
-            omitted = len(cleaned) - _READBACK_VALUE_LIMIT
-            cleaned = f"{cleaned[:_READBACK_VALUE_LIMIT]} …(+{omitted} chars)"
-        details.append(f"{key}: {cleaned}")
-    return f"{name} — " + ("; ".join(details) if details else "no arguments")
+    if name == "press_delete":
+        arguments = {key: arguments.get(key, "") for key in ("chord", "window", "pid")}
+        maximum = None
+    else:
+        maximum = _READBACK_VALUE_LIMIT
+    details = [
+        f"{key}: {_readback_value(value, maximum)}" for key, value in arguments.items()
+    ]
+    return f"{name} - " + ("; ".join(details) if details else "no arguments")
+
+
+def _readback_value(value: Any, maximum: int | None) -> str:
+    cleaned = _CONTROL_CHARACTERS.sub("", _serialize(value))
+    if maximum is None or len(cleaned) <= maximum:
+        return cleaned
+    return f"{cleaned[:maximum]} ...(+{len(cleaned) - maximum} chars)"
 
 
 def _bound_content(value: str) -> str:

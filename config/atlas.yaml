@@ -1,4 +1,6 @@
 fast_model: claude-haiku-4-5
+# Projected to the UI as /state user.name; no extra endpoint.
+user: {name: "Daniel"}
 google_account: daniel.zhang.t1@gmail.com
 turn_timeout_s: 12.0
 turn_ceiling_s: 30.0
@@ -12,6 +14,19 @@ work_workspace_path: "%LOCALAPPDATA%/Atlas/jobs"
 state_port: 4360
 stt_keyterms: [Atlas]
 
+traces: {enabled: true, path: "%LOCALAPPDATA%/Atlas/traces.db", retention_days: 30}
+pricing:
+  # Source: https://docs.anthropic.com/en/docs/about-claude/pricing
+  # Mode: standard; cache writes below are the default 5-minute rate.
+  # A 1-hour cache write is billed at 2x base input; cache_ttl selects that multiplier.
+  # Last verified: 2026-08-27
+  cache_ttl: 1h
+  claude-haiku-4-5:
+    input_per_mtok: 1.0
+    output_per_mtok: 5.0
+    cache_read_per_mtok: 0.1
+    cache_write_per_mtok: 1.25
+
 active_voice: mars
 voices:
   matilda: {vendor: elevenlabs, voice_id: XrExE9yKIg1WjnnlVkGX, model: eleven_turbo_v2_5}
@@ -24,3 +39,5 @@ wake_patience: 3
 tts_output_device: follow
 
 file_roots: [known:Desktop, known:Documents, known:Downloads, C:/Users/danie/kb]
+
+kb_bridge: {enabled: true, mutations: true, path: "C:/Users/danie/kb-worktrees/atlas-bridge/dashboard/atlas-bridge", origin: "http://127.0.0.1:5317"}

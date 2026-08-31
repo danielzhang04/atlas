@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from types import SimpleNamespace
+
+import pytest
 
 from worker import app, router
 from worker.router import Addressing
 from worker.engagement import ENGAGED, Engagement
 from worker.jobstore import JobState
 from worker.state import LISTENING, StatePublisher
+from worker.tools import Tool, ToolRegistry
 
 
 class FakeBrain:
@@ -23,6 +27,19 @@ class FakeBrain:
         self.contexts.append(context)
         for chunk in self.chunks:
             yield chunk
+
+
+class FakeSnapshotBrain:
+    def __init__(self) -> None:
+        self.refreshes = 0
+        self.settles = 0
+
+    def refresh_tools(self) -> bool:
+        self.refreshes += 1
+        return True
+
+    def mark_tools_settled(self) -> None:
+        self.settles += 1
 
 
 class FakeSession:
@@ -61,12 +78,156 @@ class FakeClock:
         return self.value
 
 
+def _dt(second: int) -> datetime:
+    return datetime(2026, 8, 22, 12, 0, second, tzinfo=timezone.utc)
+
+
+def _engage_typed(session, publisher, engagement, addressing, calls):
+    calls.append("engage")
+    engagement.wake()
+    addressing.mark_activity()
+    session.input.set_audio_enabled(True)
+    publisher.start_session()
+    publisher.set_state(LISTENING)
+
+
 def test_wake_model_callback_publishes_runtime_model():
     publisher = StatePublisher()
 
     app._wake_model_callback(publisher)("hey_atlas_v2")
 
     assert publisher.snapshot()["wake_model"] == "hey_atlas_v2"
+
+
+def test_typed_turn_wakes_and_is_addressed_without_spoken_vocabulary():
+    brain = FakeBrain(chunks=("Ready.",))
+    session = FakeSession()
+    session.input.set_audio_enabled(False)
+    publisher = StatePublisher()
+    engagement = Engagement(120)
+    addressing = Addressing(30, ())
+    engage_calls = []
+
+    asyncio.run(app._handle_typed_turn(
+        "show my calendar",
+        ready=True,
+        intents={},
+        brain=brain,
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        engage=lambda: _engage_typed(
+            session, publisher, engagement, addressing, engage_calls,
+        ),
+        sleep=lambda announce=True: None,
+    ))
+
+    assert engage_calls == ["engage"]
+    assert brain.calls == ["show my calendar"]
+    user_line = next(
+        line for line in publisher.snapshot()["transcript"] if line["role"] == "user"
+    )
+    assert user_line["source"] == "typed"
+
+
+def test_typed_reflex_uses_the_reflex_path_without_address_vocabulary():
+    session = FakeSession()
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The previous answer.")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_typed_turn(
+        "repeat that",
+        ready=True,
+        intents={"repeat": {"phrases": ["repeat that"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=Addressing(30, ()),
+        engage=lambda: None,
+        sleep=lambda announce=True: None,
+    ))
+
+    assert session.spoken == ["The previous answer."]
+    assert publisher.snapshot()["transcript"][-1]["source"] == "typed"
+
+
+def test_pending_confirmation_typed_yes_confirms_after_addressed_wake():
+    calls = []
+    registry = ToolRegistry()
+
+    async def execute(arguments):
+        calls.append(arguments)
+        return "done"
+
+    registry.register(Tool(
+        "confirm_action",
+        "Confirm it.",
+        {
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": False,
+        },
+        execute,
+        policy="confirm",
+    ))
+
+    class ConfirmingBrain(FakeBrain):
+        async def respond(self, text, *, context=None):
+            self.calls.append(text)
+            assert text == "yes"
+            pending = registry.pending
+            assert pending is not None
+            result = await registry.confirm(pending.confirm_id)
+            assert result.status == "ok"
+            yield "Done."
+
+    async def scenario():
+        pending = await registry.call("confirm_action", {"target": "report"})
+        assert pending.status == "needs_confirmation"
+        session = FakeSession()
+        publisher = StatePublisher()
+        engagement = Engagement(120)
+        addressing = Addressing(30, ())
+        await app._handle_typed_turn(
+            "yes",
+            ready=True,
+            intents={},
+            brain=ConfirmingBrain(),
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            engage=lambda: _engage_typed(
+                session, publisher, engagement, addressing, [],
+            ),
+            sleep=lambda announce=True: None,
+        )
+
+    asyncio.run(scenario())
+
+    assert registry.pending is None
+    assert calls == [{"target": "report"}]
+
+
+def test_typed_turn_rejects_before_the_voice_session_is_ready():
+    with pytest.raises(RuntimeError, match="voice session is not ready"):
+        asyncio.run(app._handle_typed_turn(
+            "hello",
+            ready=False,
+            intents={},
+            brain=FakeBrain(),
+            session=FakeSession(),
+            publisher=StatePublisher(),
+            engagement=Engagement(120),
+            addressing=Addressing(30, ()),
+            engage=lambda: None,
+            sleep=lambda announce=True: None,
+        ))
 
 
 def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
@@ -93,6 +254,47 @@ def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
         ("user", "tell me something"),
         ("atlas", "First sentence. Second sentence."),
     ]
+
+
+def test_mcp_prompt_snapshot_settles_once_after_two_staggered_servers():
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    class FakeMcp:
+        async def connect(self, registry, *, on_server):
+            registry.append("one")
+            on_server("one", registry)
+            await fake_sleep(1)
+            registry.append("two")
+            on_server("two", registry)
+
+    brain = FakeSnapshotBrain()
+    asyncio.run(app._connect_mcp_and_settle(FakeMcp(), [], brain))
+
+    assert brain.refreshes == 1
+    assert brain.settles == 1
+    assert delays == [1]
+
+
+def test_mcp_prompt_snapshot_refreshes_after_settle_callbacks():
+    class FakeMcp:
+        def __init__(self) -> None:
+            self.on_server = None
+
+        async def connect(self, registry, *, on_server):
+            self.on_server = on_server
+
+    mcp = FakeMcp()
+    brain = FakeSnapshotBrain()
+    asyncio.run(app._connect_mcp_and_settle(mcp, [], brain))
+    assert brain.refreshes == 1
+    assert brain.settles == 1
+
+    mcp.on_server("reconnected", [])
+    assert brain.refreshes == 2
 
 
 def test_submit_voice_turn_does_not_restore_listening_after_dismissal():
@@ -177,11 +379,47 @@ def test_tool_events_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged
     lines = [(line["role"], line["text"]) for line in publisher.snapshot()["transcript"]]
     assert lines == [
         ("tool", "open: ok"),
-        ("atlas", "Done — Draft verified."),
+        ("atlas", "Done -- Draft verified."),
         ("atlas", "That task hit a problem; it's in History."),
     ]
     assert engagement.state != ENGAGED
-    assert session.spoken == ["Done — Draft verified."]
+    assert session.spoken == ["Done -- Draft verified."]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_registry_tool_state_is_visible_only_while_execution_is_in_flight(fails):
+    async def scenario():
+        publisher = StatePublisher(clock=lambda: _dt(0))
+        registry = ToolRegistry(execution_clock=lambda: _dt(0))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def run(_arguments):
+            started.set()
+            await release.wait()
+            if fails:
+                raise RuntimeError("tool failure")
+            return "done"
+
+        registry.register(Tool(
+            "search_messages",
+            "Search messages.",
+            {"type": "object", "properties": {}},
+            run,
+        ))
+        registry.set_execution_observer(publisher.set_tool)
+        task = asyncio.create_task(registry.call("search_messages", {}))
+        await started.wait()
+        active = publisher.snapshot()["tool"]
+        release.set()
+        result = await task
+        return active, publisher.snapshot()["tool"], result
+
+    active, cleared, result = asyncio.run(scenario())
+
+    assert active == {"name": "search_messages", "since": _dt(0).isoformat()}
+    assert cleared is None
+    assert result.status == ("error" if fails else "ok")
 
 
 def test_engaged_completion_refreshes_silence_and_address_windows():
@@ -364,6 +602,144 @@ def test_addressed_turn_refreshes_engagement_and_reply_window():
     clock.value = 70
     assert engagement.tick() == "ENGAGED"
     assert addressing.is_addressed("ordinary follow up")
+
+
+def test_real_brain_turn_records_exact_metadata_steps_without_payloads(tmp_path):
+    from worker.brain import Brain
+    from worker.tools import Tool, ToolRegistry
+    from worker.traces import TraceRecorder
+
+    sentinels = {
+        "prompt": "PromptIdentifier94731", "argument": "ArgumentIdentifier94732",
+        "result": "ResultIdentifier94733", "output": "OutputIdentifier94734",
+        "exception": "ExceptionIdentifier94735",
+    }
+
+    class Stream:
+        def __init__(self, deltas, content, reason, usage):
+            self._deltas = deltas
+            self.final = SimpleNamespace(
+                content=content, stop_reason=reason, usage=SimpleNamespace(**usage),
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        @property
+        def text_stream(self):
+            async def iterate():
+                for delta in self._deltas:
+                    yield delta
+            return iterate()
+
+        async def get_final_message(self):
+            return self.final
+
+    tool_block = SimpleNamespace(
+        type="tool_use", id="toolu_1", name="lookup",
+        input={"query": sentinels["argument"]},
+    )
+    usages = {
+        "input_tokens": 10, "output_tokens": 2,
+        "cache_read_input_tokens": 30, "cache_creation_input_tokens": 4,
+    }
+    streams = [
+        Stream([], [tool_block], "tool_use", usages),
+        Stream([sentinels["output"]], [], "end_turn", usages),
+    ]
+
+    class Messages:
+        def stream(self, **_kwargs):
+            return streams.pop(0)
+
+    registry = ToolRegistry()
+
+    async def lookup(arguments):
+        assert arguments["query"] == sentinels["argument"]
+        try:
+            raise RuntimeError(sentinels["exception"])
+        except RuntimeError as exc:
+            return {"value": sentinels["result"], "error": str(exc)}
+
+    registry.register(Tool("lookup", "Look up a value.", {"type": "object"}, lookup))
+    brain = Brain(
+        SimpleNamespace(messages=Messages()), registry, model="fast", persona="",
+    )
+    recorder = TraceRecorder(
+        tmp_path / "traces.db", tool_names=registry.names(), model_names=("fast",),
+    )
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_audio_turn(
+        f"Atlas {sentinels['prompt']}",
+        intents={},
+        brain=brain,
+        session=FakeSession(),
+        publisher=StatePublisher(),
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    assert recorder.summary(days=1)["turns"] == 1
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        steps = connection.execute(
+            "SELECT kind,name,ok,tokens_in,tokens_out FROM steps ORDER BY seq"
+        ).fetchall()
+        turn = connection.execute("SELECT outcome,model FROM turns").fetchone()
+    assert steps == [
+        ("ROUTE", None, 1, 0, 0),
+        ("GENERATE", "fast", 1, 20, 4),
+        ("TOOL_CALL", "lookup", 1, 0, 0),
+        ("RESPOND", None, 1, 0, 0),
+    ]
+    assert turn == ("responded", "fast")
+    database_bytes = b"".join(
+        path.read_bytes() for path in tmp_path.glob("traces.db*") if path.is_file()
+    )
+    for sentinel in sentinels.values():
+        assert sentinel.encode("ascii") not in database_bytes
+
+
+def test_speech_failure_after_first_chunk_records_failed_response_timing(tmp_path, monkeypatch):
+    from worker.traces import TraceRecorder
+
+    class FailingSession(FakeSession):
+        async def say(self, source, *, add_to_chat_ctx):
+            assert add_to_chat_ctx is False
+            iterator = source.__aiter__()
+            assert await anext(iterator) == "Answer."
+            raise RuntimeError("speaker failed")
+
+    marks = iter((0.0, 0.001, 0.002, 0.100, 0.125, 0.130))
+    monkeypatch.setattr(app.time, "perf_counter", lambda: next(marks))
+    recorder = TraceRecorder(tmp_path / "traces.db")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    with pytest.raises(RuntimeError, match="speaker failed"):
+        asyncio.run(app._handle_audio_turn(
+            "atlas question", intents={}, brain=FakeBrain(chunks=("Answer.",)),
+            session=FailingSession(), publisher=StatePublisher(), engagement=engagement,
+            addressing=Addressing(30, ("atlas",)), sleep=lambda announce=True: None,
+            trace_recorder=recorder,
+        ))
+    assert recorder.summary(days=1)["turns"] == 1
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+        respond = connection.execute(
+            "SELECT ms,ok FROM steps WHERE kind='RESPOND'"
+        ).fetchone()
+    assert outcome == "speech_failed"
+    assert respond == (25, 0)
 
 
 def test_reply_restamps_clocks_before_turn_releases_ownership():
