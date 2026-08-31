@@ -47,7 +47,8 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
-.visually-hidden {
+.visually-hidden,
+.sr-only {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -88,8 +89,7 @@ input:focus-visible {
   min-width: 0;
   padding-left: .8rem;
   border-bottom: 1px solid var(--line);
-  background: rgb(8 9 12 / 94%);
-  backdrop-filter: blur(14px);
+  background: rgb(8 9 12 / 98%);
 }
 
 .no-drag {
@@ -275,7 +275,7 @@ main {
   position: relative;
   display: grid;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) 42px;
+  grid-template-rows: minmax(0, 1fr) auto;
   overflow: hidden;
   background: radial-gradient(circle at 50% 44%, rgb(30 52 67 / 28%), transparent 55%), var(--engine-field);
   box-shadow: inset 0 0 42px rgb(66 226 255 / 3%);
@@ -371,6 +371,16 @@ main {
   background: linear-gradient(180deg, rgb(11 12 16 / 0%), var(--field) 28%);
 }
 
+/* Unbounded content (a long userName in the greeting, a Bluetooth device name on
+   the audio line) must never wrap to a 2nd line: the bottom grid track is `auto`
+   (fix #1), so a wrap would grow this stack's height and shrink the canvas row. */
+.engine-status > * {
+  overflow: hidden;
+  max-width: 100%;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .engine-status strong {
   color: var(--white);
   font: 650 .62rem ui-monospace, "Cascadia Mono", monospace;
@@ -386,16 +396,24 @@ main {
 
 .engine-status .tool-strip {
   position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   overflow: hidden;
   min-width: 10rem;
-  padding: .18rem .58rem;
+  height: 1.15rem;
+  padding: 0 .58rem;
   border: 1px solid rgb(255 196 38 / 36%);
   color: rgb(255 222 128);
   background: rgb(255 196 38 / 7%);
   font: 600 .56rem ui-monospace, "Cascadia Mono", monospace;
   letter-spacing: .12em;
-  text-align: center;
   text-transform: uppercase;
+  visibility: hidden;
+}
+
+.engine-status .tool-strip.is-active {
+  visibility: visible;
   animation: tool-pulse 1.8s ease-in-out infinite;
 }
 
@@ -405,6 +423,9 @@ main {
   background: linear-gradient(180deg, transparent 0 42%, rgb(255 244 184 / 22%) 50%, transparent 58% 100%);
   content: "";
   transform: translateY(-100%);
+}
+
+.engine-status .tool-strip.is-active::after {
   animation: tool-scanline 1.35s linear infinite;
 }
 
@@ -1072,7 +1093,7 @@ main {
     animation: holoApproach 240ms ease-out both, holoScanSweep 310ms ease-out both;
   }
 
-  .engine-card {
+  .engine-card:not(.is-idle) {
     animation: holoIdle 6s ease-in-out infinite;
   }
 
