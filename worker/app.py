@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, deque
 import inspect
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -13,7 +15,7 @@ from typing import Any, Awaitable, Callable
 
 import yaml
 
-from livekit.agents import Agent, AgentSession, JobContext, StopResponse, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, JobContext, StopResponse, WorkerOptions, cli, stt
 from livekit.plugins import deepgram, silero
 
 from worker import brain as brain_mod
@@ -70,6 +72,41 @@ def _load_intents() -> dict:
 
 def _cfg() -> dict:
     return yaml.safe_load((ATLAS / "config" / "atlas.yaml").read_text(encoding="utf-8"))
+
+
+_VOICE_DEFAULTS = {
+    "min_interruption_words": 2,
+    "min_interruption_duration_s": 0.8,
+    "aec_warmup_duration_s": 4.0,
+}
+
+
+def _voice_config(cfg: dict) -> dict:
+    """Validate & resolve the `voice:` config section on load (see the
+    diagnosis comment at the AgentSession construction below). Missing
+    section or missing keys fall back to _VOICE_DEFAULTS; present keys are
+    type/range checked and raise, matching worker.runtime.build's style,
+    rather than silently falling back to a value nobody chose."""
+    raw = cfg.get("voice") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid Atlas configuration: voice")
+    words = raw.get("min_interruption_words", _VOICE_DEFAULTS["min_interruption_words"])
+    if isinstance(words, bool) or not isinstance(words, int) or words < 0:
+        raise ValueError("invalid Atlas configuration: voice.min_interruption_words")
+    duration = raw.get(
+        "min_interruption_duration_s", _VOICE_DEFAULTS["min_interruption_duration_s"],
+    )
+    if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or duration <= 0):
+        raise ValueError("invalid Atlas configuration: voice.min_interruption_duration_s")
+    warmup = raw.get("aec_warmup_duration_s", _VOICE_DEFAULTS["aec_warmup_duration_s"])
+    if isinstance(warmup, bool) or not isinstance(warmup, (int, float)) or warmup <= 0:
+        raise ValueError("invalid Atlas configuration: voice.aec_warmup_duration_s")
+    return {
+        "min_interruption_words": words,
+        "min_interruption_duration_s": float(duration),
+        "aec_warmup_duration_s": float(warmup),
+    }
 
 
 def _stt_keyterms(cfg: dict) -> list[str]:
@@ -135,12 +172,234 @@ async def _flush_store_and_stop_state_server(store, server) -> None:
     await server.stop()
 
 
+# --- CC5 rework: deterministic transcript echo-suppression ----------------
+# Adversarial review (2026-08-31/09-01) found the three AgentSession knobs
+# below do NOT stop the diagnosed bug:
+#   - aec_warmup_duration is one-shot per SESSION, not per-utterance
+#     (livekit-agents 1.6.6 voice/agent_session.py:1694-1748:
+#     _on_aec_warmup_expired permanently zeroes _aec_warmup_remaining after
+#     the FIRST "speaking" transition; _update_agent_state only arms the
+#     timer `if self._aec_warmup_remaining > 0`, so only Atlas's very first
+#     utterance of a session ever gets the grace period).
+#   - min_interruption_duration is never consulted on the STT
+#     interim-transcript path Atlas actually uses (turn_detection="stt").
+#     AgentActivity.on_interim_transcript (agent_activity.py:2072-2090)
+#     calls _interrupt_by_audio_activity() unconditionally on any non-empty
+#     interim text; that function (agent_activity.py:1896-1969) only gates
+#     on min_words (`interruption_options["min_words"]`, line ~1920) and the
+#     one-shot AEC warmup -- `min_duration` is read only by the separate
+#     VAD-activity path (on_vad_inference_done, ~line 2038), which STT-mode
+#     barely uses. The diagnosis's own example, "two fifty five", is 3
+#     words -- it clears min_interruption_words=2 and still interrupts.
+# The three knobs are kept as harmless defense-in-depth (min_words=2 still
+# blocks true one-word fragments on the STT path; the other two still help
+# a VAD-driven or first-utterance interruption) but are NOT the fix. THE
+# FIX is SpeechEchoGuard below: Atlas knows exactly what it is currently
+# saying (AtlasAgent.tts_node observes every chunk before speaking it) and
+# drops STT events that echo that text, before livekit's own interruption
+# or turn-detection logic ever sees them.
+_ECHO_NON_WORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_ECHO_FILTERED_EVENT_TYPES = frozenset({
+    stt.SpeechEventType.INTERIM_TRANSCRIPT,
+    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+    stt.SpeechEventType.FINAL_TRANSCRIPT,
+})
+
+
+def _echo_normalize(text: str) -> list[str]:
+    """casefold + strip punctuation -> word list, for fuzzy echo matching."""
+    if not isinstance(text, str) or not text:
+        return []
+    return _ECHO_NON_WORD_RE.sub(" ", text.casefold()).split()
+
+
+def _echo_contains_contiguous_bigram(pair: tuple[str, str], buffer_words: list[str]) -> bool:
+    first, second = pair
+    return any(
+        buffer_words[i] == first and buffer_words[i + 1] == second
+        for i in range(len(buffer_words) - 1)
+    )
+
+
+def _echo_is_match(
+    transcript_words: list[str], buffer_words: list[str], *, min_overlap_ratio: float,
+) -> bool:
+    """Tiered echo match rule (2026-09-01 rework, BLOCKER 1: a single common
+    word like "stop" was being silently erased whenever it happened to
+    overlap with what Atlas was saying -- worse than the min_words knob it
+    fronts, since it ate exactly the most likely genuine barge-in words):
+
+      - 1 token: NEVER an echo. livekit's own min_interruption_words=2
+        already can't be interrupted by a lone word, so the event needs to
+        survive to let plain confirmations ("yes", "no", "stop") through --
+        dropping it here would be strictly worse than not filtering at all.
+      - 2 tokens: an echo only if Atlas spoke those exact two words back to
+        back, contiguously and in that order -- "stop the" matches Atlas
+        having literally said "...stop the...", but "stop it" does NOT match
+        "...stop the music..." even though "stop" is common to both.
+      - 3+ tokens: the original rule -- an in-order (not necessarily
+        contiguous) subsequence of the buffer (catches a clean tail
+        fragment like "two fifty five" out of "...at two fifty five"), or at
+        least min_overlap_ratio of tokens present anywhere in the buffer
+        (for a short/garbled/reordered fragment).
+
+    Known limitation (does not need a tier of its own -- it's a floor on
+    accuracy, not a bug): this is exact/near-exact word matching, not
+    phonetic. A homophone-garbled STT transcription of an echo ("too fifty
+    fife" for "two fifty five") won't match here and falls back on whatever
+    the min_interruption_words knob alone provides -- i.e. no better than
+    before this fix for that specific failure mode.
+    """
+    n = len(transcript_words)
+    if n == 0:
+        return False
+    if n == 1:
+        return False
+    if n == 2:
+        return _echo_contains_contiguous_bigram(
+            (transcript_words[0], transcript_words[1]), buffer_words,
+        )
+    remaining = iter(buffer_words)
+    if all(word in remaining for word in transcript_words):
+        return True
+    available = Counter(buffer_words)
+    matched = 0
+    for word in transcript_words:
+        if available[word] > 0:
+            matched += 1
+            available[word] -= 1
+    return (matched / n) >= min_overlap_ratio
+
+
+class SpeechEchoGuard:
+    """Drop STT transcripts that are an echo of Atlas's own recent TTS
+    output. Fed by AtlasAgent.tts_node (record_spoken, once per chunk, in
+    the order Atlas will actually speak them) and consulted by
+    AtlasAgent.stt_node (note_speaking on every STT event, should_drop on
+    every transcript-bearing one).
+
+    Filter window: while the session is in the "speaking" agent_state, plus
+    a short `tail_s` afterward (echo can arrive slightly after playout ends
+    too). Outside that window nothing is ever dropped, regardless of buffer
+    content -- genuine barge-in during silence, or speech from well after
+    Atlas finished, always passes through untouched. See _echo_is_match for
+    the tiered content-match rule (BLOCKER 1 fix).
+
+    Eviction is anchored to the SPEECH lifecycle, not to when record_spoken
+    happened to be called (2026-09-01 rework, BLOCKER 2: record_spoken fires
+    as LLM/TTS text drains, which has no backpressure from actual audio
+    playout -- an 18s-long reply can be fully recorded by T=3s, so a fixed
+    window measured from record-time expired long before the tail of a long
+    reply's audio, and its own echo, ever arrived). So: while agent_state is
+    "speaking", the buffer is never time-evicted -- it holds the ENTIRE
+    current utterance regardless of length, bounded only by `max_words` (a
+    memory cap, not a content-relevance one). The eviction clock starts only
+    once speaking is confirmed to have stopped (`note_speaking`/`should_drop`
+    observing speaking=False after having seen speaking=True); tail_s and
+    buffer_window_s both then run from THAT moment, not from individual
+    words' record time.
+
+    Known tradeoff: a user who deliberately echoes Atlas immediately after
+    it stops speaking ("yes, 2:55" right after Atlas says "...2:55") can
+    still be dropped if it lands inside the short tail window and matches
+    closely enough (3+ words -- a lone "yes" is protected by the 1-token
+    rule above regardless of timing). This is accepted -- the tail window is
+    short (~1s default) and near-total-overlap is required for anything but
+    a clean in-order subsequence, so it only bites genuinely Atlas-shaped
+    phrasing said immediately after Atlas stops, not ordinary conversation.
+    """
+
+    def __init__(
+        self,
+        *,
+        tail_s: float = 1.0,
+        buffer_window_s: float = 10.0,
+        max_words: int = 500,
+        min_overlap_ratio: float = 0.8,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._tail_s = tail_s
+        self._buffer_window_s = buffer_window_s
+        self._max_words = max_words
+        self._min_overlap_ratio = min_overlap_ratio
+        self._clock = clock
+        self._buffer: deque[str] = deque()
+        self._speaking_last_seen_at: float | None = None
+        self._dropped_count = 0
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped_count
+
+    def record_spoken(self, text: str) -> None:
+        """Feed a chunk of text Atlas is about to speak. Capped only by
+        word count -- see the class docstring (BLOCKER 2) for why this must
+        NOT time-evict against the moment it was called."""
+        words = _echo_normalize(text)
+        if not words:
+            return
+        self._buffer.extend(words)
+        while len(self._buffer) > self._max_words:
+            self._buffer.popleft()
+
+    def note_speaking(self, speaking: bool) -> None:
+        """Sample the live agent_state. Called from AtlasAgent.stt_node on
+        EVERY STT event (not just transcript-bearing ones) so the "last
+        confirmed speaking" anchor stays fresh through a long reply even
+        when generation has already finished draining text (BLOCKER 2);
+        should_drop also calls this, so a caller that only ever calls
+        should_drop (as every test here does) still gets correct behavior.
+        """
+        now = self._clock()
+        if speaking:
+            self._speaking_last_seen_at = now
+        else:
+            self._maybe_clear_stale_buffer(now)
+
+    def _maybe_clear_stale_buffer(self, now: float) -> None:
+        if self._speaking_last_seen_at is None:
+            return
+        if (now - self._speaking_last_seen_at) > self._buffer_window_s:
+            self._buffer.clear()
+
+    def _within_filter_window(self, now: float, *, speaking: bool) -> bool:
+        if speaking:
+            return True
+        if self._speaking_last_seen_at is None:
+            return False
+        return (now - self._speaking_last_seen_at) <= self._tail_s
+
+    def should_drop(self, transcript: str, *, speaking: bool) -> bool:
+        now = self._clock()
+        self.note_speaking(speaking)
+        if not self._within_filter_window(now, speaking=speaking):
+            return False
+        transcript_words = _echo_normalize(transcript)
+        if not transcript_words or not self._buffer:
+            return False
+        if not _echo_is_match(
+            transcript_words, list(self._buffer), min_overlap_ratio=self._min_overlap_ratio,
+        ):
+            return False
+        self._dropped_count += 1
+        if self._dropped_count == 1 or self._dropped_count % 20 == 0:
+            # Rule 10: bounded, and never the transcript text itself -- a
+            # running count only.
+            logger.debug(
+                "echo guard dropped a self-barge-in-shaped transcript (total=%d)",
+                self._dropped_count,
+            )
+        return True
+# ---------------------------------------------------------------------------
+
+
 class AtlasAgent(Agent):
     """Suppress autonomous LiveKit replies after the host handles a finalized turn."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.turn_handler = None
+        self.echo_guard = SpeechEchoGuard()
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         handler = self.turn_handler
@@ -151,9 +410,53 @@ class AtlasAgent(Agent):
     def tts_node(self, text, model_settings):
         async def _clean():
             async for chunk in text:
-                yield sanitize.sanitize_for_tts(chunk)
+                cleaned = sanitize.sanitize_for_tts(chunk)
+                self.echo_guard.record_spoken(cleaned)
+                yield cleaned
 
         return Agent.default.tts_node(self, _clean(), model_settings)
+
+    async def stt_node(self, audio, model_settings):
+        """THE FIX (CC5 rework): drop STT events that echo what Atlas is
+        currently saying, before they ever reach livekit's own
+        interruption/turn-detection logic.
+
+        Agent.stt_node is a documented, first-class override seam
+        ("You can override this node with your own implementation", livekit
+        -agents 1.6.6 voice/agent.py:345-369) -- not a monkeypatch.
+        AgentActivity binds AudioRecognition directly to
+        `self._agent.stt_node` (voice/agent_activity.py:1000), so a
+        dropped event here never reaches on_interim_transcript /
+        on_final_transcript (:2072-2131) and therefore never calls
+        _interrupt_by_audio_activity and never becomes a recognized user
+        turn -- one filter point kills both bad effects of the diagnosed
+        echo.
+
+        Only INTERIM/PREFLIGHT/FINAL transcript events carry text worth
+        checking; START_OF_SPEECH/END_OF_SPEECH/RECOGNITION_USAGE (and
+        anything with no alternatives) pass through untouched, as does any
+        event outside the SpeechEchoGuard filter window (see its
+        docstring) or that doesn't match the recently-spoken buffer --
+        i.e. genuine user speech, including genuine barge-in, is never
+        touched by this filter.
+
+        note_speaking is called for EVERY event, not just transcript ones
+        (BLOCKER 2 fix): livekit-agents also emits START_OF_SPEECH,
+        END_OF_SPEECH, and periodic RECOGNITION_USAGE events, which arrive
+        regardless of whether there is text to filter, keeping the guard's
+        "last confirmed speaking" anchor from going stale during long
+        stretches with no transcript-bearing event.
+        """
+        default_stream = Agent.default.stt_node(self, audio, model_settings)
+        async for event in default_stream:
+            speaking = self.session.agent_state == "speaking"
+            self.echo_guard.note_speaking(speaking)
+            if event.type in _ECHO_FILTERED_EVENT_TYPES and event.alternatives:
+                if self.echo_guard.should_drop(
+                    event.alternatives[0].text, speaking=speaking,
+                ):
+                    continue
+            yield event
 
 
 class TurnOwnership:
@@ -670,6 +973,7 @@ async def entrypoint(ctx: JobContext) -> None:
     wakeword.shutting_down.clear()
     envload.load_private_environment()
     cfg = _cfg()
+    voice_cfg = _voice_config(cfg)
     trace_cfg = cfg.get("traces") if isinstance(cfg.get("traces"), dict) else {}
     pricing_cfg = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
     trace_recorder = None
@@ -924,13 +1228,131 @@ async def entrypoint(ctx: JobContext) -> None:
         keyterms = _stt_keyterms(cfg)
         if keyterms:
             stt_kwargs["keyterm"] = keyterms
+        # --- Self-barge-in diagnosis + fix (CC5, reworked after adversarial
+        # review found the original three-knobs-only mitigation didn't stop
+        # the bug) -----------------------------------------------------------
+        # Atlas's own TTS output re-enters the laptop mic (acoustic loopback,
+        # not a room echo), gets transcribed by deepgram, and is delivered as
+        # a normal user turn 1-2ms after playout starts -- fast enough that
+        # it reads as a barge-in on Atlas's own speech, not a real
+        # interruption. Proven in the field: fragments like "two fifty five"
+        # arriving as user turns cut ~30% of responses short before AEC had
+        # time to converge. Before this unit, AgentSession was constructed
+        # with zero interruption tuning -- every default applied.
+        #
+        # THE FIX is AtlasAgent.stt_node/SpeechEchoGuard (defined above,
+        # right before AtlasAgent): Atlas already knows exactly what it is
+        # currently saying (every chunk flows through AtlasAgent.tts_node
+        # before reaching TTS), so it can drop STT events that echo that
+        # text -- deterministically, without gating the mic -- before
+        # livekit's own interruption/turn-detection logic ever sees them.
+        # See the comment on SpeechEchoGuard and AtlasAgent.stt_node for the
+        # full mechanism and the hook-point evidence.
+        #
+        # The three AgentSession knobs below are kept as harmless
+        # defense-in-depth, NOT as the fix -- their real, measured semantics
+        # (verified by reading the installed livekit-agents 1.6.6 source, not
+        # assumed) are weaker than the first pass of this unit believed:
+        #   - min_interruption_words=2 (voice.min_interruption_words): the
+        #     ONE knob that actually gates the STT interim-transcript path
+        #     Atlas uses (agent_activity.py:1896-1969,
+        #     _interrupt_by_audio_activity, ~line 1920). Still only blocks
+        #     fragments shorter than 2 words -- "two fifty five" is 3 words
+        #     and clears it, which is exactly why the knob alone was
+        #     insufficient and SpeechEchoGuard exists.
+        #   - min_interruption_duration=0.8s (voice.min_interruption_duration_s):
+        #     NOT consulted on the STT path at all. on_interim_transcript
+        #     (agent_activity.py:2072-2090) calls
+        #     _interrupt_by_audio_activity() unconditionally on any non-empty
+        #     interim text; `min_duration` is only read by the separate
+        #     VAD-activity path (on_vad_inference_done, ~line 2038). This
+        #     knob only helps a VAD-driven interruption, which STT turn
+        #     detection barely exercises -- kept for that residual case, not
+        #     for the diagnosed bug.
+        #   - aec_warmup_duration=4.0s (voice.aec_warmup_duration_s): a
+        #     ONE-SHOT per-session grace period, not per-utterance.
+        #     agent_session.py:1694-1701's _on_aec_warmup_expired permanently
+        #     zeroes _aec_warmup_remaining the first time it fires, and
+        #     _update_agent_state (:1734-1748) only arms the timer while that
+        #     value is still > 0 -- so only Atlas's very first utterance of a
+        #     session ever gets the grace period. Every later response (the
+        #     common case, and where the field evidence came from) gets none
+        #     of it. Kept because the first utterance still benefits.
+        # All three are still config-driven from config/atlas.yaml's `voice:`
+        # section, validated on load by _voice_config() above -- see that
+        # file's `voice:` comment for the same corrected semantics.
+        #
+        # The airtight fallback -- session.input.set_audio_enabled(False) for
+        # the duration of agent speech, the same primitive _sleep_session
+        # already uses to gate the mic while Atlas is asleep (see app.py:549,
+        # `if not session.input.audio_enabled: return False` /
+        # `session.input.set_audio_enabled(False)`) -- is still NOT
+        # implemented here. It would also suppress genuine user barge-in
+        # while Atlas is talking, and that's Daniel's pending decision, not a
+        # default this unit should ship silently. SpeechEchoGuard is meant to
+        # make that fallback unnecessary for the common case: it only drops
+        # transcripts that match what Atlas is currently saying, so genuine
+        # barge-in (different words) is untouched.
+        # ---------------------------------------------------------------
         session = AgentSession(
             stt=deepgram.STTv2(**stt_kwargs),
             vad=silero.VAD.load(),
             llm=None,
             tts=_build_tts(cfg),
             turn_detection="stt",
+            min_interruption_words=voice_cfg["min_interruption_words"],
+            min_interruption_duration=voice_cfg["min_interruption_duration_s"],
+            aec_warmup_duration=voice_cfg["aec_warmup_duration_s"],
         )
+
+        # F3 observability (CC5), scoped to what's cheap here: SpeechHandle
+        # exposes a clean, synchronous `.interrupted` bool
+        # (livekit.agents.voice.speech_handle.SpeechHandle.interrupted --
+        # `self._interrupt_fut.done()`), and AgentSession emits a
+        # "speech_created" event synchronously, in-line inside
+        # AgentActivity.say() (agent_activity.py:1346-1349), before any
+        # await -- i.e. in the same asyncio-task/contextvars context as the
+        # `session.say(...)` call that created it. That means a listener
+        # registered here can read worker.traces' active (recorder, turn)
+        # pair via traces_mod.active_turn() and get the *same* turn that
+        # worker/app.py's response funnel (_submit_voice_turn, protected
+        # region) is about to record a RESPOND step for -- without this unit
+        # touching that funnel's call sites. SpeechHandle also registers its
+        # internal done-callback in __init__, before any caller ever awaits
+        # the handle, so a done-callback added here fires (via
+        # asyncio.Future's call_soon ordering) before session.say()'s own
+        # await resumes -- i.e. before _submit_voice_turn's
+        # record_current_respond() runs -- so there is no race. See
+        # worker/traces.py (mark_speech_interrupted, _Turn.speech_interrupted,
+        # TraceRecorder.respond) for the other half of this.
+        #
+        # Deliberately NOT implemented: mirroring the same flag onto the
+        # published transcript line (a `truncated: true` field on the atlas
+        # chat line) as the diagnosis's item 2 also asked for. That requires
+        # either touching worker/app.py's response funnel at the
+        # `publisher.add_line("atlas", response)` call (CC1's protected
+        # region, :227-241) or adding an "amend last line" surface to
+        # worker/state.py (outside this unit's file scope: config + this
+        # session-construction region + traces only). Skipped rather than
+        # contorted around either boundary; the RESPOND trace step already
+        # carries the same signal for now, and this is a small follow-up
+        # once CC1's funnel work lands.
+        def _on_speech_created(event) -> None:
+            from worker import traces as traces_mod
+
+            active = traces_mod.active_turn()
+            if active is None:
+                return
+            _, active_turn = active
+
+            def _mark_if_interrupted(handle) -> None:
+                if handle.interrupted:
+                    traces_mod.mark_speech_interrupted(active_turn)
+
+            event.speech_handle.add_done_callback(_mark_if_interrupted)
+
+        session.on("speech_created", _on_speech_created)
+
         agent = AtlasAgent(
             instructions="Atlas voice I/O is host controlled.",
             llm=None,
