@@ -207,6 +207,36 @@ def load_mcp_config(path: Path, *, atlas_path: Path | None = None) -> dict:
     return value
 
 
+_FILE_ROOTS_ARGV_TOKEN = "{file_roots}"
+_FILE_ROOTS_ENABLED_REFERENCE = "file_roots.enabled"
+
+
+def _validated_file_roots(atlas: Mapping) -> tuple[str, ...]:
+    """The exact validation worker/runtime.py applies to file_roots before
+    building the built-in LocalFiles tools -- reused here so a malformed
+    file_roots entry fails the same way for both consumers of it."""
+    raw_file_roots = atlas.get("file_roots", ())
+    if (
+        isinstance(raw_file_roots, (str, bytes))
+        or not isinstance(raw_file_roots, (list, tuple))
+        or not all(isinstance(root, str) and root.strip() for root in raw_file_roots)
+    ):
+        raise ValueError("invalid Atlas configuration: file_roots")
+    return tuple(raw_file_roots)
+
+
+def _resolve_file_roots_argv(atlas: Mapping) -> list[str]:
+    """Expand file_roots (config/atlas.yaml) into resolved, existing
+    directory paths for the files MCP server's argv, via the same resolver
+    (worker/localfiles.py's resolve_file_roots, known: alias handling
+    included) worker/runtime.py uses to build the built-in localfiles
+    tools -- one place turns file_roots into real filesystem access, not
+    two resolvers that could drift apart."""
+    from .localfiles import resolve_file_roots
+
+    return [str(root) for root in resolve_file_roots(_validated_file_roots(atlas))]
+
+
 def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     if not isinstance(server_cfg, dict):
         return server_cfg
@@ -225,6 +255,18 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
         bridge.update(configured)
 
     def setting(reference: Any) -> Any:
+        # "file_roots.enabled" is a narrow special case, not a general
+        # namespace like kb_bridge.* -- the files MCP server (Track C2) is
+        # gated by the exact same signal worker/runtime.py already uses to
+        # decide whether the built-in LocalFiles tools exist at all
+        # (`if raw_roots else None`), so there is one place that grants
+        # filesystem access, not a second independent toggle. This checks
+        # the RESOLVED directory count, not just non-empty raw strings: a
+        # typo'd or unmounted root must read as disabled here too (see the
+        # file_roots_token_used guard below for the second, structural half
+        # of this fix).
+        if reference == _FILE_ROOTS_ENABLED_REFERENCE:
+            return bool(_resolve_file_roots_argv(atlas))
         if not isinstance(reference, str) or not reference.startswith("kb_bridge."):
             raise ValueError("invalid MCP Atlas config reference")
         name = reference.removeprefix("kb_bridge.")
@@ -233,10 +275,19 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
         return bridge[name]
 
     resolved = dict(server_cfg)
-    resolved_argv = [
-        item.replace("{kb_bridge.path}", str(bridge["path"]))
-        for item in command
-    ]
+    resolved_argv: list[str] = []
+    file_roots_token_used = False
+    resolved_file_root_count = 0
+    for item in command:
+        if item == _FILE_ROOTS_ARGV_TOKEN:
+            file_roots_token_used = True
+            expanded = _resolve_file_roots_argv(atlas)
+            resolved_file_root_count = len(expanded)
+            resolved_argv.extend(expanded)
+        else:
+            resolved_argv.append(item.replace("{kb_bridge.path}", str(bridge["path"])))
+    if not resolved_argv:
+        raise ValueError("invalid MCP command argv")
     resolved["command"] = resolved_argv[0]
     resolved["args"] = resolved_argv[1:]
     resolved["exact_environment"] = True
@@ -246,6 +297,21 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     enabled = setting(enabled_from)
     if not isinstance(enabled, bool):
         raise ValueError("invalid MCP enabled_from value")
+    if file_roots_token_used and resolved_file_root_count == 0:
+        # Mirrors LocalFiles.__init__'s own `if not roots: raise ValueError`
+        # guard: never let this server spawn with a {file_roots} token that
+        # resolved to zero real directories, even if enabled_from itself
+        # said True (e.g. a future config mistake that points enabled_from
+        # at an unrelated flag). Without this, the argv still contains
+        # [npx, -y, package] -- non-empty -- so the argv-empty check above
+        # never fires, and today's pinned server happening to refuse to
+        # start with zero directory args is not something Atlas may rely
+        # on across version bumps. A typo'd or unmounted file_roots entry
+        # must surface as not_configured, never as a healthy connect that
+        # then fails every call with "Access denied" (adversarial review,
+        # docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C2, finding F1).
+        enabled = False
+        resolved["disabled_reason"] = "config_entry_missing"
     resolved["enabled"] = enabled
     env_from = resolved.pop("env_from", {})
     if not isinstance(env_from, dict) or not all(
@@ -261,6 +327,20 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     child_env["SystemRoot"] = os.environ.get("SystemRoot", "C:/Windows")
     resolved["env"] = child_env
     return resolved
+
+
+# not_configured detail keys a resolved server_cfg's disabled_reason may pick
+# in place of the generic "disabled" -- a closed allowlist so an unexpected
+# or param-requiring key (e.g. "signed_missing") can never reach
+# render_status_detail and raise. See _resolve_command_config's
+# file_roots_token_used guard for the one producer of "config_entry_missing"
+# today.
+_NOT_CONFIGURED_DISABLED_REASONS = frozenset({"disabled", "config_file_missing", "config_entry_missing"})
+
+
+def _not_configured_detail_key(server_cfg: Any) -> str:
+    reason = server_cfg.get("disabled_reason") if isinstance(server_cfg, Mapping) else None
+    return reason if reason in _NOT_CONFIGURED_DISABLED_REASONS else "disabled"
 
 
 def _environment_value(value: Any) -> str:
@@ -478,7 +558,7 @@ class McpServers:
                 "state": "not_configured" if disabled else "connecting",
                 "detail": render_status_detail(
                     "not_configured" if disabled else "connecting",
-                    "disabled" if disabled else "pending",
+                    _not_configured_detail_key(server_cfg) if disabled else "pending",
                 ),
             }
         if any(

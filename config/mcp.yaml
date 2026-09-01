@@ -7,8 +7,15 @@
 # connect-time warning in mcp_client.py is for), 2-3x the ~30-50
 # model-accuracy threshold once combined with kb (32) and the ~19 built-in
 # host tools. Curating the surface, not adding new servers, is the point
-# (see docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0). Curated total:
-# kb 32 + google 14 + chrome-devtools 7 + ~19 built-in = 72 (was 116).
+# (see docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0). C0 curated
+# total: kb 32 + google 14 + chrome-devtools 7 + ~19 built-in = 72 (was
+# 116). Track C2 then adds the files server's 13 tools on top: 72 + 13 =
+# 85, back over the ~30-50 (and even the looser 72) accuracy budget C0 set.
+# The plan (Track C, C2 row) prioritizes the files domain over holding that
+# number this wave; flagged here for the per-turn tool-projection follow-up
+# C0's budget work implied (e.g. only project domains relevant to the
+# turn instead of the full curated surface) rather than re-cutting
+# elsewhere to force 85 back under 72.
 servers:
   kb:
     command: [node, "{kb_bridge.path}/dist/server.js"]
@@ -66,6 +73,51 @@ servers:
     expose: [navigate_page, take_snapshot, click, fill, take_screenshot,
              list_pages, wait_for]
     instant: [list_pages, take_snapshot, take_screenshot]
+  files:
+    # Official @modelcontextprotocol/server-filesystem (npm, stdio via
+    # npx), version-pinned (not @latest -- see
+    # docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C2). "{file_roots}"
+    # is expanded by mcp_client._resolve_command_config into the SAME
+    # file_roots list (below in this file: atlas.yaml, known: aliases
+    # resolved) that worker/runtime.py hands to the built-in LocalFiles
+    # tools -- one place grants filesystem access, not two independently
+    # configured allowlists.
+    #
+    # THE ROOTS TRAP (survey): the MCP roots protocol REPLACES this CLI
+    # allowlist if the client advertises roots support. Atlas's
+    # ClientSession (mcp_client._stdio_session) passes no
+    # list_roots_callback, so per mcp/client/session.py's initialize() the
+    # roots capability is never advertised (stays None in
+    # ClientCapabilities) -- confirmed live against the real server, which
+    # logs "Client does not support MCP Roots, using allowed directories
+    # set from server args" on connect. No suppression code was needed;
+    # verified for real by tests/test_mcp_filesystem_live.py, which spawns
+    # the actual npx server and asserts list_allowed_directories returns
+    # exactly the resolved file_roots.
+    command: [npx, -y, "@modelcontextprotocol/server-filesystem@2026.8.31", "{file_roots}"]
+    enabled_from: file_roots.enabled
+    domain: files
+    # The real server ships 14 tools; read_file is a deprecated alias of
+    # read_text_file from the same build and is left out of expose: to
+    # avoid registering a duplicate read tool (9 reads + 4 mutations = 13,
+    # matching the survey). NO delete tool exists on this server at all --
+    # that is a structural guardrail, not a policy choice made here.
+    expose: [read_text_file, read_media_file, read_multiple_files,
+             list_directory, list_directory_with_sizes, directory_tree,
+             search_files, get_file_info, list_allowed_directories,
+             write_file, edit_file, create_directory, move_file]
+    instant: [read_text_file, read_media_file, read_multiple_files,
+              list_directory, list_directory_with_sizes, directory_tree,
+              search_files, get_file_info, list_allowed_directories]
+    # write_/edit_/create_/move_ are not in instant_prefixes and are absent
+    # from instant: above, so all four mutations default to confirm (see
+    # policy_for) -- asserted directly in
+    # test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation.
+    describe:
+      write_file: "Create a new file, or completely overwrite an existing one, with exact content under an allowed folder. The host will read back the exact path and content and wait for Daniel's yes before this runs."
+      edit_file: "Apply exact line-based find/replace edits to an existing text file under an allowed folder. The host will read back the exact path and edits and wait for Daniel's yes before this runs."
+      create_directory: "Create a new folder (and any missing parent folders) under an allowed folder. The host will read back the exact path and wait for Daniel's yes before this runs."
+      move_file: "Move or rename a file or folder between allowed locations. The host will read back the exact source and destination and wait for Daniel's yes before this runs."
 defaults:
   instant_prefixes: [get_, list_, search_, query_, read_, check_]
   # Forces confirm even over an explicit instant: entry or the prefix
