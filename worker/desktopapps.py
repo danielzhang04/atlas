@@ -404,7 +404,14 @@ def _resolve_executable(executable: str) -> str:
             ("local_app_data", "Microsoft/WindowsApps/Spotify.exe"),
             ("roaming_app_data", "Spotify/Spotify.exe"),
         ],
-        "explorer.exe": [("windows", "System32/explorer.exe")],
+        # explorer.exe ships at %WINDIR%\explorer.exe on every NT release --
+        # there has never been a System32\explorer.exe, so the old candidate
+        # could not resolve and open_folder had never worked live. No
+        # System32 fallback: a permanently dead candidate is false
+        # reassurance. C:\Windows is TrustedInstaller/admin-write-only, the
+        # same trust boundary as System32, and the publisher check below is
+        # unchanged.
+        "explorer.exe": [("windows", "explorer.exe")],
         "chrome.exe": [
             ("program_files", "Google/Chrome/Application/chrome.exe"),
             ("program_files_x86", "Google/Chrome/Application/chrome.exe"),

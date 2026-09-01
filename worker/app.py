@@ -172,6 +172,14 @@ class TurnOwnership:
             raise RuntimeError("voice turn has no asyncio task")
         previous = self._task
         if previous is not None and previous is not task and not previous.done():
+            # cancel() only REQUESTS cancellation and is not awaited, so the
+            # outgoing turn can still be unwinding while this one starts: the
+            # two overlap on shared registry state (the per-turn file-handle
+            # table, cleared by brain.respond -> registry.begin_turn). That
+            # overlap is fail-closed by construction rather than by timing --
+            # handle ids are monotonic for the life of the registry, so an id
+            # the cancelled turn minted can never be re-minted here and a
+            # stale reference resolves to nothing instead of to a new target.
             previous.cancel()
         self._task = task
         try:

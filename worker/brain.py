@@ -127,6 +127,9 @@ class _Registry(Protocol):
     def schemas(self) -> list[dict[str, Any]]:
         ...
 
+    def begin_turn(self) -> None:
+        ...
+
     async def call(
         self,
         name: str,
@@ -491,6 +494,9 @@ class Brain:
     async def respond(self, transcript: str, *, context: str | None = None) -> AsyncIterator[str]:
         if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > MAX_TRANSCRIPT:
             raise ValueError("transcript must contain 1 to 4096 characters")
+        # Per-turn host state (the file-handle table) dies here, before any
+        # tool of this turn can run: a handle minted last turn never resolves.
+        self.registry.begin_turn()
         if not self._first_turn_seen:
             self._first_turn_seen = True
             self._arm_cache_floor_check()
