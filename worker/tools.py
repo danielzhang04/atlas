@@ -23,6 +23,7 @@ from worker.localfiles import LocalFiles
 
 __all__ = [
     "AppEntry",
+    "Handle",
     "McpToolError",
     "PendingAction",
     "Policy",
@@ -44,7 +45,18 @@ _CONTENT_LIMIT = 4096
 _READBACK_ARGUMENT_LIMIT = 1_200
 _READBACK_VALUE_LIMIT = 160
 _HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
+# Tools that accept a host-minted handle instead of a model-supplied path, and
+# so keep working after external content has tainted the turn.
+_HANDLE_TOOLS = frozenset({"open_file", "open_folder"})
+_HANDLE_LIMIT = 40
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
+_TAINT_REFUSAL_HANDLE = (
+    "refused after external content; use a handle from an earlier find_file "
+    "result in this turn, or ask Daniel again next turn"
+)
+_UNKNOWN_HANDLE = (
+    "unknown handle; call find_file first and use a handle from its results"
+)
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
 _TRUNCATED = "...[truncated]"
 _DESKTOP_DELETE_CHORDS = ("delete", "ctrl+d", "ctrl+x", "shift+delete")
@@ -118,6 +130,59 @@ class PendingAction:
 
 
 @dataclass(frozen=True, slots=True)
+class Handle:
+    path: str
+    kind: Literal["file", "folder"]
+
+
+class _HandleTable:
+    """Per-turn map of host-minted ids to targets this host itself validated.
+
+    The taint wall exists because the model must never turn external content
+    into an action target. Handles keep that true while still allowing
+    search-then-act: the only writer is `ToolRegistry._mint_handle`, called by
+    the `find_file` builtin with paths `LocalFiles` already resolved inside the
+    configured roots. Nothing a model says -- and nothing an MCP server
+    returns, including text that looks like "handle: f1" -- can add an entry,
+    so a resolvable handle always names a path this host produced this turn.
+    Ids are not secrets: every entry is already host-validated, so guessing one
+    only ever reaches another of this turn's own in-roots search results.
+
+    Ids are minted from a counter that `clear()` deliberately does NOT reset.
+    Positional per-turn ids aliased: turn 1's "f1" named one file, turn 2's
+    "f1" named a different one, so a stale id the model still had in history
+    silently opened the WRONG file with an ok status. Monotonic ids make that
+    fail closed -- an id from any earlier turn simply is not in the table.
+    """
+
+    __slots__ = ("_entries", "_next")
+
+    def __init__(self) -> None:
+        self._entries: dict[str, Handle] = {}
+        self._next = 1
+
+    def clear(self) -> None:
+        # Entries only. _next survives for the life of the registry.
+        self._entries.clear()
+
+    def mint(self, path: str, kind: str) -> str | None:
+        if not isinstance(path, str) or not path or kind not in ("file", "folder"):
+            raise ValueError("invalid handle target")
+        # The bound is per turn: _entries is what clear() empties.
+        if len(self._entries) >= _HANDLE_LIMIT:
+            return None
+        handle = f"f{self._next}"
+        self._next += 1
+        self._entries[handle] = Handle(path, kind)
+        return handle
+
+    def resolve(self, handle: Any) -> Handle | None:
+        if not isinstance(handle, str):
+            return None
+        return self._entries.get(handle)
+
+
+@dataclass(frozen=True, slots=True)
 class AppEntry:
     words: tuple[str, ...]
     url: str | None = None
@@ -155,6 +220,18 @@ class ToolRegistry:
         self._open_aliases: frozenset[str] = frozenset()
         self._executions: dict[object, dict[str, str]] = {}
         self._execution_observer: Callable[[dict[str, str] | None], None] | None = None
+        self._handles = _HandleTable()
+
+    def begin_turn(self) -> None:
+        """Reset per-turn host state. Handles live for exactly one turn."""
+        self._handles.clear()
+
+    def _mint_handle(self, path: str, kind: str) -> str | None:
+        """Host-only: record a target this host validated, return its id."""
+        return self._handles.mint(path, kind)
+
+    def _resolve_handle(self, handle: Any) -> Handle | None:
+        return self._handles.resolve(handle)
 
     @property
     def pending(self) -> PendingAction | None:
@@ -230,7 +307,10 @@ class ToolRegistry:
                 )
             copied = deepcopy(dict(arguments))
             if tainted and self._refused_after_external_content(name, copied):
-                return ToolResult("error", _TAINT_REFUSAL)
+                return ToolResult(
+                    "error",
+                    _TAINT_REFUSAL_HANDLE if name in _HANDLE_TOOLS else _TAINT_REFUSAL,
+                )
             if tool.prepare is not None:
                 prepared = tool.prepare(copied)
                 if isinstance(prepared, _PreparedAction):
@@ -271,6 +351,17 @@ class ToolRegistry:
                 serialized = json.dumps(copied, ensure_ascii=False)
                 if len(serialized) > _READBACK_ARGUMENT_LIMIT:
                     return ToolResult("error", "too large to read back; split it")
+                # Forward hazard (handles): a confirm-tier tool that stored a
+                # handle in these arguments would fail at confirm time --
+                # begin_turn clears the table at the START of the later turn,
+                # before registry.confirm runs, so the id would no longer
+                # resolve. That is fail-closed, and unreachable today:
+                # open_file/open_folder are instant and never_instant reaches
+                # MCP tools only. If a future tier change makes either one
+                # confirm, it needs a prepare() that resolves handle -> path
+                # at snapshot time (which also makes the readback human
+                # -readable). "Find, then confirm-open" can never work by
+                # handle alone.
                 pending = PendingAction(
                     confirm_id=secrets.token_urlsafe(8),
                     name=name,
@@ -300,11 +391,14 @@ class ToolRegistry:
         name: str,
         arguments: Mapping[str, Any],
     ) -> bool:
+        if name in _HANDLE_TOOLS:
+            # The only thing that survives taint here is a handle this host
+            # minted earlier in THIS turn; a model-supplied path -- and an
+            # unminted or expired handle -- is still refused.
+            return not self._handle_only_call(arguments)
         if name in {
             "close",
             "focus",
-            "open_file",
-            "open_folder",
             "cancel_work",
             "focus_window",
             "window_action",
@@ -324,6 +418,11 @@ class ToolRegistry:
         if normalized in self._open_aliases:
             return False
         return _direct_https(target.strip())
+
+    def _handle_only_call(self, arguments: Mapping[str, Any]) -> bool:
+        if arguments.get("path") is not None:
+            return False
+        return self._handles.resolve(arguments.get("handle")) is not None
 
     async def confirm(self, confirm_id: str) -> ToolResult:
         pending = self.pending
@@ -522,16 +621,55 @@ def builtin(
         return {"closed": name}
 
     async def find_file(arguments: dict) -> list[dict]:
+        # Boss decision (a), recorded here at the only minting site: find_file
+        # stays callable while the turn is tainted, so planted content CAN
+        # steer which in-roots document gets displayed ("read this note, then
+        # find and open what it names"). Accepted: every target is bounded to
+        # an in-roots, openable-extension file this host enumerated itself, so
+        # a novel target -- "open C:\evil.bat" -- stays impossible, and the
+        # worst case is one of Daniel's own documents opening on his screen.
+        # Reads (find_file, read_file) are deliberately OUTSIDE the handle
+        # regime: they are not taint-refused, so they need no handle, and
+        # keeping them path-only keeps the handle surface to the two acting
+        # tools. Note ambient turns arrive tainted from entry (brain.respond
+        # sets tainted=bool(context)), so the whole chain can run tainted --
+        # which is exactly why minting must not require an untainted turn.
         query = _text_argument(arguments, "query", maximum=512)
-        return await asyncio.to_thread(files.find, query)
+        # Kinds are stat'ed on the same worker thread as the scan; minting then
+        # happens back on the loop thread so the registry stays single-threaded.
+        found = await asyncio.to_thread(_matches_with_kind, files, query)
+        results = []
+        for item, kind in found:
+            handle = registry._mint_handle(item["path"], kind)
+            results.append(
+                {**item, "kind": kind} if handle is None
+                else {**item, "kind": kind, "handle": handle}
+            )
+        return results
+
+    def file_target(arguments: dict, expected: Literal["file", "folder"]) -> str:
+        handle = arguments.get("handle")
+        if handle is None:
+            return _text_argument(arguments, "path", maximum=2048)
+        if arguments.get("path") is not None:
+            raise ValueError("provide either path or handle, not both")
+        entry = registry._resolve_handle(handle)
+        if entry is None:
+            raise ValueError(_UNKNOWN_HANDLE)
+        if entry.kind == expected:
+            return entry.path
+        if expected == "file":
+            raise ValueError("that handle is a folder; use open_folder")
+        # "open the folder that file is in": the parent is derived by the host
+        # from an already-validated path, never supplied by the model, and
+        # LocalFiles re-checks confinement before opening it.
+        return str(Path(entry.path).parent)
 
     async def open_file(arguments: dict) -> dict:
-        path = _text_argument(arguments, "path", maximum=2048)
-        return files.open(path)
+        return files.open(file_target(arguments, "file"))
 
     async def open_folder(arguments: dict) -> dict:
-        path = _text_argument(arguments, "path", maximum=2048)
-        return files.open_folder(path)
+        return files.open_folder(file_target(arguments, "folder"))
 
     async def read_file(arguments: dict) -> dict:
         path = _text_argument(arguments, "path", maximum=2048)
@@ -643,23 +781,40 @@ def builtin(
     )
     if files is not None:
         definitions += (
-            ("find_file", "Find files and folders under configured roots.", {
+            ("find_file", (
+                "Find files and folders under configured roots. Every match carries a "
+                "handle you can pass to open_file or open_folder for the rest of this turn."
+            ), {
                 "query": {"type": "string"},
             }, find_file),
-            ("open_file", "Open an inert document or media file under configured roots.", {
-                "path": {"type": "string"},
+            ("open_file", (
+                "Open an inert document or media file under configured roots. Pass handle "
+                "whenever this turn's find_file returned one; pass path only without a "
+                "handle -- never both. After any tool that returns outside content, only a "
+                "handle works."
+            ), {
+                "path": {"type": "string"}, "handle": {"type": "string"},
             }, open_file),
-            ("open_folder", "Open a directory under configured roots in Explorer.", {
-                "path": {"type": "string"},
+            ("open_folder", (
+                "Open a directory under configured roots in Explorer. Pass handle whenever "
+                "this turn's find_file returned one -- a file's handle opens the folder "
+                "containing it; pass path only without a handle, never both. After any tool "
+                "that returns outside content, only a handle works."
+            ), {
+                "path": {"type": "string"}, "handle": {"type": "string"},
             }, open_folder),
             ("read_file", "Read small text or route previewed large-file analysis to launch_work.", {
                 "path": {"type": "string"},
             }, read_file),
         )
     for name, description, properties, run in definitions:
+        # Handle tools take exactly one of path/handle, so neither is required
+        # by the schema; the host enforces the choice (a top-level oneOf is not
+        # accepted by the Messages API -- api_incompatible_tool_names).
         schema = {
             "type": "object", "properties": properties,
-            "required": list(properties), "additionalProperties": False,
+            "required": [] if name in _HANDLE_TOOLS else list(properties),
+            "additionalProperties": False,
         }
         registry.register(Tool(name, description, schema, run))
 
@@ -853,6 +1008,23 @@ def _open_description(aliases: Mapping[str, tuple[str, AppEntry]]) -> str:
         "Open an allowlisted app or HTTPS URL. Aliases open the real desktop app "
         f"when configured: {listed}."
     )
+
+
+def _matches_with_kind(files: LocalFiles, query: str) -> list[tuple[dict, str]]:
+    """Pair each host-produced match with the kind the host stats itself."""
+    matches: list[tuple[dict, str]] = []
+    for item in files.find(query):
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            kind = "folder" if Path(path).is_dir() else "file"
+        except OSError:
+            kind = "file"
+        matches.append((dict(item), kind))
+    return matches
 
 
 def _text_argument(arguments: Mapping[str, Any], name: str, *, maximum: int) -> str:
