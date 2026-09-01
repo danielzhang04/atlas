@@ -103,9 +103,117 @@ def test_state_signal_assets_and_security_headers():
     assert "const INPUT_BANDS = 24" in script[2]
     assert "const UNIQUE_BANDS = 48" in script[2]
     assert "new Float32Array(BAR_COUNT)" in script[2]
-    assert "function drawParticles(now)" in script[2]
+    assert "function drawParticles(now, dt)" in script[2]
     assert "Math.min(2" in script[2]
     assert "new Path2D()" in script[2]
+    # CC4: rotation must be integrated (accumulator += rate * dt every
+    # frame), not re-derived every frame from absolute uptime
+    # (`particleAngle[i] + seconds * particleSpeed[i] * drift`, where drift
+    # itself changes every frame with motion/frameEnergy). The old formula
+    # re-scrambled the whole orbit history any time drift changed -- with
+    # ambient mic noise driving frameEnergy every audio tick, that was
+    # visible as choppy, non-continuous particle rotation. Persistent
+    # per-particle accumulator array, initialized to zero (the additional
+    # rotation beyond each particle's fixed initial-phase offset in
+    # particleAngle[i], which is untouched).
+    assert "const particleOrbitAngle = new Float32Array(PARTICLE_COUNT);" in script[2]
+    assert "particleAngle[index] + seconds * particleSpeed[index] * drift" not in script[2]
+    assert "particleOrbitAngle[index] = wrapAngle(particleOrbitAngle[index] + step);" in script[2]
+    assert "const orbit = particleAngle[index] + particleOrbitAngle[index];" in script[2]
+    # Same integration for the 4 non-particle rotations (tick ring, segment
+    # ring, scanner sweep, core dashed ring): scalar accumulators advanced
+    # by rate * dt and wrapped, in place of `now * rate`.
+    assert "let tickRingAngle = 0;" in script[2]
+    assert "let segmentRingAngle = 0;" in script[2]
+    assert "let scannerAngle = 0;" in script[2]
+    assert "let coreDashAngle = 0;" in script[2]
+    assert "function wrapAngle(angle) {" in script[2]
+    assert "context.rotate(now * .000018 * (1 + motion[0]));" not in script[2]
+    assert "context.rotate(-now * speed * 1.32);" not in script[2]
+    assert "const rotation = now * (.00018 + motion[4] * .00034);" not in script[2]
+    assert "context.rotate(-now * (.000025 + motion[0] * .00014));" not in script[2]
+    assert "tickRingAngle = wrapAngle(tickRingAngle + .000018 * (1 + motion[0]) * dt);" in script[2]
+    assert "segmentRingAngle = wrapAngle(segmentRingAngle + speed * 1.32 * dt);" in script[2]
+    assert "scannerAngle = wrapAngle(scannerAngle + (.00018 + motion[4] * .00034) * dt);" in script[2]
+    assert "coreDashAngle = wrapAngle(coreDashAngle + (.000025 + motion[0] * .00014) * dt);" in script[2]
+    # The accumulator must actually be what gets rotated, not just advanced
+    # and ignored (scanner's is covered indirectly: `const rotation =
+    # scannerAngle;` feeds the existing `context.rotate(rotation);` call).
+    assert "context.rotate(tickRingAngle);" in script[2]
+    assert "context.rotate(-segmentRingAngle);" in script[2]
+    assert "const rotation = scannerAngle;" in script[2]
+    assert "context.rotate(-coreDashAngle);" in script[2]
+    # dt threaded into every rotation-bearing draw* call from draw() (moved
+    # ahead of prepareFrameSignal so it can feed it too -- see frameEnergy
+    # smoothing pin below).
+    assert "function drawTickRing(now, dt)" in script[2]
+    assert "function drawSegmentRings(now, dt)" in script[2]
+    assert "function drawScanner(now, dt)" in script[2]
+    assert "function drawCore(now, dt)" in script[2]
+    assert "drawTickRing(now, dt);" in script[2]
+    assert "drawSegmentRings(now, dt);" in script[2]
+    assert "drawScanner(now, dt);" in script[2]
+    assert "drawParticles(now, dt);" in script[2]
+    assert "drawCore(now, dt);" in script[2]
+    # frameEnergy must be smoothed (frame-rate-independent exponential decay
+    # toward the raw `energy` signal, the same idiom drawWaveform uses), not
+    # a direct per-frame assignment -- ambient mic noise updates `energy` on
+    # every audio tick, and a direct assignment fed that noise straight into
+    # the rotation rates and size/alpha pulses that read frameEnergy.
+    assert "function prepareFrameSignal(now, previewState, dt)" in script[2]
+    assert "frameEnergy = energy;" not in script[2]
+    assert "frameEnergy += (energy - frameEnergy) * smoothing;" in script[2]
+    # R2 (CC4): rolling max per-frame particle angle delta (degrees),
+    # exposed on __atlasEngineMetrics and reset alongside the frame
+    # histogram, so the ~1.5 deg/frame bound is measurable live.
+    assert "maxAngleStepDeg: 0," in script[2]
+    assert "metrics.maxAngleStepDeg = 0;" in script[2]
+    assert "if (maxStepDeg > metrics.maxAngleStepDeg) metrics.maxAngleStepDeg = maxStepDeg;" in script[2]
+    # CC6: comet-trail redesign -- fewer, larger, glowing particles (42 -> 16)
+    # with a persistent soft-trail layer, instead of many small pinpricks
+    # with no trail. Tuning constants grouped in one block for one-line
+    # Daniel-driven edits.
+    assert "const PARTICLE_COUNT = 16;" in script[2]
+    assert "const PARTICLE_COUNT = 42;" not in script[2]
+    assert "const PARTICLE_SIZE_BASE = 4.4;" in script[2]
+    assert "const PARTICLE_SIZE_STEP = 2.6;" in script[2]
+    assert "const PARTICLE_GLOW_RADIUS_PX = 48;" in script[2]
+    assert "const TRAIL_FADE_ALPHA = .12;" in script[2]
+    assert "const TRAIL_RESOLUTION_SCALE = 1;" in script[2]
+    assert (
+        "const size = (PARTICLE_SIZE_BASE + index % 3 * PARTICLE_SIZE_STEP) * (1 + frameEnergy * .4);"
+    ) in script[2]
+    # Trail canvas: created once (not per-frame), persists across frames,
+    # faded via destination-out (composites correctly under any backdrop,
+    # unlike a translucent-rect fill that would need to track the backdrop's
+    # actual color/texture), then particles are stamped onto it and it is
+    # blitted into the main context -- above the backdrop, below every ring/
+    # waveform/core element (drawParticles now runs right after
+    # drawBackdrop() in draw(), not after drawScanner()).
+    assert 'const trailCanvas = document.createElement("canvas");' in script[2]
+    assert "const trailContext = trailCanvas.getContext(" in script[2]
+    assert 'trailContext.globalCompositeOperation = "destination-out";' in script[2]
+    assert "trailContext.globalAlpha = TRAIL_FADE_ALPHA;" in script[2]
+    assert "trailContext.fillRect(0, 0, trailCanvas.width, trailCanvas.height);" in script[2]
+    assert 'trailContext.globalCompositeOperation = "screen";' in script[2]
+    assert "context.drawImage(trailCanvas, 0, 0, width, height);" in script[2]
+    draw_order = script[2].split("drawBackdrop();", 1)[1].split("return dt;", 1)[0]
+    assert draw_order.index("drawParticles(now, dt);") < draw_order.index("drawTickRing(now, dt);")
+    assert draw_order.index("drawParticles(now, dt);") < draw_order.index("drawCore(now, dt);")
+    # Trail canvas is deliberately 1x CSS-px resolution (TRAIL_RESOLUTION_SCALE),
+    # not pixelRatio-scaled like the ring sprites -- a full-canvas fade runs
+    # every frame here, unlike the ring sprites which only rebuild on resize
+    # or a color change.
+    assert "trailCanvas.width = Math.round(width * TRAIL_RESOLUTION_SCALE);" in script[2]
+    assert "trailCanvas.height = Math.round(height * TRAIL_RESOLUTION_SCALE);" in script[2]
+    # Freeze-on-pause + clear-on-start: pauseLoop() must NOT clear the trail
+    # (drawParticles() simply stops running while paused, so it freezes on
+    # its own), and start() must clear it so a resumed session never shows a
+    # stale, already-faded trail ghost from before the pause.
+    pause_loop_body = script[2].split("function pauseLoop()", 1)[1].split("function frame(now)", 1)[0]
+    assert "trailContext.clearRect" not in pause_loop_body
+    start_body = script[2].split("function start()", 1)[1].split("function stop()", 1)[0]
+    assert "trailContext.clearRect(0, 0, trailCanvas.width, trailCanvas.height);" in start_body
     # Waveform easing must be frame-rate-independent exponential decay, not a
     # linear `k * rate` (which overshoots ~19% at 30fps and hard-snaps to target
     # for dt >= ~52ms): factor = 1 - (1-k)^(dt/16.67), no Math.min cap needed
@@ -147,8 +255,8 @@ def test_state_signal_assets_and_security_headers():
     # every frame; the frame path only rotates + drawImages them.
     assert "const tickRingSprite = document.createElement" in script[2]
     assert "const segmentRingSprite = document.createElement" in script[2]
-    draw_tick_ring = script[2].split("function drawTickRing(now)", 1)[1].split("function drawSegmentRings", 1)[0]
-    draw_segment_rings = script[2].split("function drawSegmentRings(now)", 1)[1].split("function drawScanner", 1)[0]
+    draw_tick_ring = script[2].split("function drawTickRing(now, dt)", 1)[1].split("function drawSegmentRings", 1)[0]
+    draw_segment_rings = script[2].split("function drawSegmentRings(now, dt)", 1)[1].split("function drawScanner", 1)[0]
     assert "context.drawImage(" in draw_tick_ring and "tickRingSprite," in draw_tick_ring
     assert "context.stroke(minorTickPath)" not in draw_tick_ring
     assert "context.drawImage(" in draw_segment_rings and "segmentRingSprite," in draw_segment_rings
@@ -163,7 +271,7 @@ def test_state_signal_assets_and_security_headers():
         "function segmentRingColorNow()", 1
     )[0]
     render_segment_sprite = script[2].split("function renderSegmentRingSprite(", 1)[1].split(
-        "function drawTickRing(now)", 1
+        "function drawTickRing(now, dt)", 1
     )[0]
     for sprite_body, sprite_name in ((render_tick_sprite, "tickRingSprite"), (render_segment_sprite, "segmentRingSprite")):
         assert "const deviceSize = Math.max(2, Math.round(size * pixelRatio));" in sprite_body
@@ -215,10 +323,10 @@ def test_state_signal_assets_and_security_headers():
     # every core stroke (the dashed core ring above all) inherited round
     # caps. The rings stroke into sprite contexts now, so those two set it
     # explicitly rather than depending on a leak.
-    draw_scanner = script[2].split("function drawScanner(now)", 1)[1].split(
-        "function drawParticles(now)", 1
+    draw_scanner = script[2].split("function drawScanner(now, dt)", 1)[1].split(
+        "function drawParticles(now, dt)", 1
     )[0]
-    draw_core = script[2].split("function drawCore(now)", 1)[1].split(
+    draw_core = script[2].split("function drawCore(now, dt)", 1)[1].split(
         "// CONVENTION", 1
     )[0]
     assert 'context.lineCap = "round";' in draw_scanner
