@@ -553,7 +553,14 @@ def _record_tool(
     name: str,
     result: tools_mod.ToolResult,
 ) -> None:
-    publisher.add_line("tool", f"{name}: {result.status}")
+    # Tool calls used to be mirrored into the transcript ring as a "tool"
+    # role line; that cluttered the chat with rows Daniel didn't want to see.
+    # worker/tools.py already records every tool call into the traces DB
+    # independently (traces_mod.record_current_tool_call), so nothing here
+    # needs to publish a line. Kept as the on_tool callback target (wired at
+    # the bottom of this module) in case a future non-transcript cue (e.g. a
+    # UI ping) needs the hook.
+    return None
 
 
 def _terminal_line(job) -> str:
