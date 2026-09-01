@@ -168,6 +168,22 @@ servers:
     # from instant: above, so all four mutations default to confirm (see
     # policy_for) -- asserted directly in
     # test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation.
+    # Taint classification. Every MCP tool defaults to true (fail closed):
+    # its output is assumed to be text Atlas did not author, which taints the
+    # rest of the turn. list_allowed_directories is the one exception, and it
+    # rests on the tool's contract rather than on a judgement about its text:
+    # its entire response is the CLI allowlist this host passed the server on
+    # the command line (asserted against the real server in
+    # tests/test_mcp_filesystem_live.py). That trust extends exactly as far as
+    # the pinned package above -- the version is pinned but not
+    # integrity-checked, so npx resolving a different build of that version
+    # would move this tool's behavior out from under the claim.
+    # Classifying it as content-bearing
+    # meant that asking Atlas which folders it can reach silently disarmed
+    # every path-bearing tool for the rest of the turn. Add an entry here
+    # only for a tool whose output is demonstrably host-authored.
+    content_bearing:
+      list_allowed_directories: false
     describe:
       read_text_file: "Read the text of a file under a writable folder (Desktop, Documents, Downloads). Only the first 4KB comes back; anything longer is truncated, so use launch_work for a whole large file. Daniel's other roots, including kb, are read with find_file and read_file instead."
       search_files: "Find files by name pattern under a writable folder and return their paths as plain text. Prefer find_file for anything Daniel may want opened: it returns a handle open_file and open_folder accept, which this tool's plain paths are not."

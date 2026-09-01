@@ -844,10 +844,21 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
     )
     assert atlas["file_write_roots"] == ["known:Desktop", "known:Documents", "known:Downloads"]
     # The write list is a strict subset of the read list, and kb is in the
-    # difference -- the whole point of the split.
-    assert set(atlas["file_write_roots"]) < set(atlas["file_roots"])
+    # difference -- the whole point of the split. Read entries may be either a
+    # bare path string or the {path:, name:} naming form, so both are reduced
+    # to their path before comparing.
+    read_paths = {
+        root["path"] if isinstance(root, dict) else root
+        for root in atlas["file_roots"]
+    }
+    assert set(atlas["file_write_roots"]) < read_paths
     assert not any("kb" in root.casefold() for root in atlas["file_write_roots"])
-    assert any("kb" in root.casefold() for root in atlas["file_roots"])
+    assert any("kb" in root.casefold() for root in read_paths)
+    # Widening the READ scope to all of home must never widen the WRITE scope:
+    # the home root is a read entry only, and writes stay the three known
+    # folders the server is actually spawned with.
+    assert {"path": "C:/Users/danie", "name": "home"} in atlas["file_roots"]
+    assert not any("danie" == Path(root).name for root in atlas["file_write_roots"])
     # The resolved argv the server actually spawns with contains no kb path.
     assert not any("kb" in argument.casefold() for argument in server["args"])
 
@@ -3268,3 +3279,71 @@ def test_missing_exposed_tools_helper_is_bounded_and_names_only():
     assert mcp_client._missing_exposed_tools(
         frozenset({"kept", "gone", "also_gone"}), listed,
     ) == ("also_gone", "gone")
+
+
+# --- content_bearing: -------------------------------------------------------
+
+def _mirrored(server_cfg, name="widget"):
+    servers = McpServers({"servers": {}})
+    return servers._mirror_tool(
+        "demo", server_cfg, {}, SimpleNamespace(),
+        SimpleNamespace(
+            name=name, description="d",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+
+
+def test_content_bearing_defaults_true_for_every_unconfigured_mcp_tool():
+    # Fail closed: an unlisted remote tool is assumed to return text Atlas did
+    # not author, which is the premise the taint wall rests on.
+    assert mcp_client._tool_content_bearing({}, "widget") is True
+    assert mcp_client._tool_content_bearing({"content_bearing": {}}, "widget") is True
+    assert mcp_client._tool_content_bearing(
+        {"content_bearing": {"other": False}}, "widget",
+    ) is True
+    assert _mirrored({}).content_bearing is True
+
+
+def test_content_bearing_config_can_mark_one_tool_host_authored():
+    server_cfg = {"content_bearing": {"list_allowed_directories": False}}
+
+    assert mcp_client._tool_content_bearing(
+        server_cfg, "list_allowed_directories",
+    ) is False
+    # Marking one tool never leaks to its neighbours on the same server.
+    assert mcp_client._tool_content_bearing(server_cfg, "read_text_file") is True
+    assert _mirrored(server_cfg, "list_allowed_directories").content_bearing is False
+    assert _mirrored(server_cfg, "read_text_file").content_bearing is True
+
+
+@pytest.mark.parametrize(
+    "value", ["false", 0, 1, None, [], {}, "no"],
+)
+def test_content_bearing_rejects_anything_that_is_not_a_bool(value):
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": {"widget": value}}, "widget")
+
+
+def test_content_bearing_rejects_a_malformed_map():
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": ["not", "a", "map"]}, "widget")
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": "false"}, "widget")
+
+
+def test_checked_in_files_config_untaints_only_list_allowed_directories():
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "mcp.yaml").read_text(encoding="utf-8"),
+    )["servers"]
+    files = raw["files"]
+
+    # Exactly one tool, on exactly one server, is declared host-authored --
+    # and it is the one whose whole response is this host's own CLI argv.
+    assert files["content_bearing"] == {"list_allowed_directories": False}
+    assert all("content_bearing" not in server for name, server in raw.items()
+               if name != "files")
+    # Every other exposed files tool keeps tainting, reads included.
+    for tool in files["expose"]:
+        expected = tool != "list_allowed_directories"
+        assert mcp_client._tool_content_bearing(files, tool) is expected

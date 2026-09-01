@@ -193,3 +193,54 @@ def test_prompt_ab_refuses_to_probe_when_a_stubbed_tool_is_missing():
     with pytest.raises(SystemExit):
         from scripts import prompt_ab
         prompt_ab.stub_side_effecting_tools(registry, Recorder())
+
+
+def test_the_checked_in_file_roots_are_named_and_reach_the_schema_text():
+    """The roots Daniel actually has, named, in the text the model reads.
+
+    Atlas once told Daniel he had no local kb folder while kb sat in
+    file_roots: nothing in the system text, the capability list, or any tool
+    description named the roots, so the only way to learn them was a tool call
+    that then tainted the turn. This pins the fix at the seam that matters --
+    the real config, through the real registry, into the real schema.
+    """
+    import yaml
+
+    from worker.localfiles import LocalFiles, valid_file_root
+    from worker.tools import builtin as real_builtin
+
+    atlas = yaml.safe_load(
+        (ATLAS / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )
+    roots = atlas["file_roots"]
+
+    assert all(valid_file_root(root) for root in roots)
+    configured = {
+        (root["name"] if isinstance(root, dict) else root.removeprefix("known:"))
+        .rsplit("/", 1)[-1].casefold()
+        for root in roots
+    }
+    assert configured == {"desktop", "documents", "downloads", "kb", "home"}
+
+    files = LocalFiles(roots)
+    registry = ToolRegistry()
+    real_builtin(
+        registry, {"gmail": AppEntry(url="https://mail.test/", words=("gmail",))},
+        _DummyWork(), opener=lambda _url: None, files=files,
+    )
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+    resolved = sorted(files.root_names)
+
+    # Whatever resolved on this machine is what the model is told about, and
+    # the enum it may choose from is exactly that same list -- never a wider
+    # promise than the host can keep.
+    assert resolved, "no configured file root resolved on this machine"
+    # Every configured root earns a name. A root that resolves but is silently
+    # unnamed (a drive root, a duplicate name, a root inside a hidden
+    # directory) is still real for confinement yet invisible in the enum --
+    # readable, unnameable, and only a log line says so.
+    assert len(files.root_names) == len(roots)
+    assert schemas["open_folder"]["input_schema"]["properties"]["root"]["enum"] == resolved
+    for name in ("find_file", "open_folder"):
+        assert f"Roots: {', '.join(resolved)}." in schemas[name]["description"]
+    assert set(resolved) <= configured
