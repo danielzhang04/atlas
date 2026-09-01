@@ -42,6 +42,10 @@ _KB_BRIDGE_DEFAULTS = {
     "origin": "http://127.0.0.1:5317",
 }
 _TRUNCATED = "…[truncated]"
+_DEFAULT_NEVER_INSTANT = (
+    "delete", "remove", "trash", "send", "purchase", "revoke", "permission", "share",
+)
+_DESCRIPTION_LIMIT = 512
 
 
 SessionFactory = Callable[
@@ -268,10 +272,32 @@ def _environment_value(value: Any) -> str:
 
 
 def policy_for(server_cfg: Mapping, defaults: Mapping, tool_name: str) -> Policy:
+    # Precedence: never_instant > instant > prefix heuristic. never_instant is
+    # a name-substring backstop that forces confirm even over an explicit
+    # instant: entry, so a mistaken or misleadingly-named mutation (e.g. a
+    # "get_" tool that actually shares/deletes) cannot become instant by
+    # config error. Matching is casefolded on both sides (pattern and tool
+    # name) so it survives camelCase remote tool names too. (instant_when
+    # sits above this too, but it is argument-conditional and applied later
+    # as an `escalate` hook, not here.)
+    normalized_name = tool_name.casefold()
+    if any(pattern in normalized_name for pattern in _never_instant_patterns(defaults)):
+        return "confirm"
     if "instant" in server_cfg:
         return "instant" if tool_name in server_cfg.get("instant", ()) else "confirm"
     prefixes = defaults.get("instant_prefixes", ())
     return "instant" if any(tool_name.startswith(prefix) for prefix in prefixes) else "confirm"
+
+
+def _never_instant_patterns(defaults: Mapping) -> tuple[str, ...]:
+    patterns = defaults.get("never_instant", _DEFAULT_NEVER_INSTANT)
+    if (
+        not isinstance(patterns, (list, tuple))
+        or not patterns  # an empty list would silently disable the backstop
+        or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+    ):
+        raise ValueError("invalid MCP never_instant pattern list")
+    return tuple(pattern.casefold() for pattern in patterns)
 
 
 def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
@@ -281,6 +307,103 @@ def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
     ):
         raise ValueError("invalid MCP blocked tool list")
     return frozenset(blocked)
+
+
+def _exposed_tools(server_cfg: Mapping) -> frozenset[str] | None:
+    """Return the allowed remote tool names, or None to mirror all of them.
+
+    Absent `expose:` preserves today's behavior (mirror everything not
+    blocked). When present, only names in this list are ever mirrored;
+    combined with `blocked:` via AND, so blocked always wins on overlap.
+    """
+    if "expose" not in server_cfg:
+        return None
+    expose = server_cfg.get("expose")
+    if not isinstance(expose, (list, tuple)) or not all(
+        isinstance(name, str) and name for name in expose
+    ):
+        raise ValueError("invalid MCP expose tool list")
+    return frozenset(expose)
+
+
+_MISSING_EXPOSE_WARNING_LIMIT = 500
+
+
+def _missing_exposed_tools(exposed: frozenset[str] | None, listed_tools: Any) -> tuple[str, ...]:
+    """Names in expose: that the server did not actually offer this connect.
+
+    Surfaces upstream renames/typos (an expose: entry silently mirroring
+    nothing looks identical to an intentional cut otherwise).
+    """
+    if exposed is None:
+        return ()
+    listed_names = frozenset(getattr(tool, "name", None) for tool in listed_tools)
+    return tuple(sorted(exposed - listed_names))
+
+
+def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_description: str) -> str:
+    describe = server_cfg.get("describe", {})
+    if not isinstance(describe, Mapping):
+        raise ValueError("invalid MCP describe map")
+    if remote_tool_name in describe:
+        override = describe[remote_tool_name]
+        if not isinstance(override, str) or not override:
+            raise ValueError("invalid MCP describe value")
+        return override
+    return remote_description
+
+
+def _server_domain(server_cfg: Mapping) -> str | None:
+    domain = server_cfg.get("domain")
+    if domain is not None and (not isinstance(domain, str) or not domain):
+        raise ValueError("invalid MCP domain")
+    return domain
+
+
+def _compile_instant_when(server_cfg: Mapping, remote_tool_name: str) -> Callable[[Mapping], bool] | None:
+    """Compile instant_when rules for one tool into an escalate callable.
+
+    instant_when: {tool_name: {arg_name: [allowed values, ...]}} is an
+    ALLOWLIST, not a denylist: the call escalates instant -> confirm UNLESS
+    every listed arg's call-time value is a string that case/whitespace-
+    normalizes (``.strip().casefold()``) to one of its allowed values. A
+    missing arg or a non-string value (list, dict, number, None, ...) also
+    escalates -- fail closed rather than assuming the safe default applies.
+
+    An allowlist (rather than a denylist of dangerous values) is required
+    because the remote tool itself normalizes its argument the same way
+    (e.g. workspace-mcp's manage_event does ``action.lower().strip()``), so
+    a denylist of exact strings like "delete" would miss "Delete" or
+    " delete " and fail open. Comparing both sides after the same
+    normalization closes that gap regardless of what the disallowed values
+    turn out to be.
+    """
+    all_rules = server_cfg.get("instant_when", {})
+    if not isinstance(all_rules, Mapping):
+        raise ValueError("invalid MCP instant_when config")
+    rules = all_rules.get(remote_tool_name)
+    if rules is None:
+        return None
+    if not isinstance(rules, Mapping) or not rules:
+        raise ValueError("invalid MCP instant_when rule")
+    compiled: dict[str, frozenset[str]] = {}
+    for arg_name, values in rules.items():
+        if (
+            not isinstance(arg_name, str) or not arg_name
+            or not isinstance(values, (list, tuple)) or not values
+            or not all(isinstance(value, str) and value for value in values)
+        ):
+            raise ValueError("invalid MCP instant_when rule")
+        compiled[arg_name] = frozenset(value.strip().casefold() for value in values)
+
+    def escalate(arguments: Mapping) -> bool:
+        for arg_name, allowed in compiled.items():
+            value = arguments.get(arg_name)
+            if not isinstance(value, str) or value.strip().casefold() not in allowed:
+                return True
+        return False
+
+    return escalate
 
 
 @asynccontextmanager
@@ -466,10 +589,18 @@ class McpServers:
                     if self._session_generations.get(name, 0) != generation:
                         await self._notify_held_session(name, session)
                 blocked = _blocked_tools(server_cfg)
+                exposed = _exposed_tools(server_cfg)
+                missing = _missing_exposed_tools(exposed, listed.tools)
+                if missing:
+                    _LOGGER.warning(
+                        "MCP server %s expose: names not offered by the server: %s",
+                        name,
+                        ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
+                    )
                 mirrored = [
                     self._mirror_tool(name, server_cfg, defaults, session, tool)
                     for tool in listed.tools
-                    if tool.name not in blocked
+                    if tool.name not in blocked and (exposed is None or tool.name in exposed)
                 ]
             self._call_settings[name] = (
                 server_cfg,
@@ -781,7 +912,7 @@ class McpServers:
             remote_tool.inputSchema,
             server_cfg.get("account_param"),
         )
-        description = remote_tool.description or ""
+        description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
 
         async def run(arguments: dict) -> str:
             text = await self._call_session(
@@ -795,10 +926,12 @@ class McpServers:
 
         return Tool(
             name=f"{server_name}__{remote_tool.name}",
-            description=description[:512],
+            description=description[:_DESCRIPTION_LIMIT],
             input_schema=schema,
             policy=policy_for(server_cfg, defaults, remote_tool.name),
             run=run,
+            domain=_server_domain(server_cfg),
+            escalate=_compile_instant_when(server_cfg, remote_tool.name),
         )
 
     async def call_raw(

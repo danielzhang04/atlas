@@ -1,8 +1,20 @@
+# expose: curates which remote tools are mirrored at all (absent = mirror
+# all, kb's current behavior since it's already curated server-side as the
+# bridge). google and chrome-devtools are trimmed here: their real servers
+# listed ~38 and ~27 tools at the time of the C0 survey (see
+# handoffs/2026-08-27-atlas-xwave.md /health line -- server counts drift
+# upstream over time, which is exactly what the missing-exposed-tools
+# connect-time warning in mcp_client.py is for), 2-3x the ~30-50
+# model-accuracy threshold once combined with kb (32) and the ~19 built-in
+# host tools. Curating the surface, not adding new servers, is the point
+# (see docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0). Curated total:
+# kb 32 + google 14 + chrome-devtools 7 + ~19 built-in = 72 (was 116).
 servers:
   kb:
     command: [node, "{kb_bridge.path}/dist/server.js"]
     enabled_from: kb_bridge.enabled
     session_channel: true
+    domain: kb
     env_from:
       ATLAS_KB_BRIDGE_ENABLED: kb_bridge.enabled
       ATLAS_KB_MUTATIONS_ENABLED: kb_bridge.mutations
@@ -17,15 +29,52 @@ servers:
   google:
     from_claude_config: google-workspace
     account_param: user_google_email
+    domain: google
+    # Core 14-tool set (plan Track C0): the 10 existing instant reads below,
+    # plus send_gmail_message/draft_gmail_message (product decision -- both
+    # stay confirm: not in instant: below, and never_instant's "send"
+    # pattern backstops send_gmail_message even if that ever changes), plus
+    # the two tiered mutations named in the plan. get_drive_shareable_link
+    # stays out of instant: its name reads like a read but it creates a
+    # sharing grant (never_instant's "share" pattern also backstops this if
+    # it is ever added to instant: by mistake). manage_event is instant for
+    # everyday scheduling but instant_when escalates everything except
+    # action: create -- an ALLOWLIST, not a denylist of dangerous actions,
+    # because upstream workspace-mcp normalizes action via
+    # `.lower().strip()` (gcalendar/calendar_tools.py) before comparing, so
+    # a denylist of exact strings like "delete" would fail open on "Delete"
+    # or " delete "; instant_when normalizes both sides the same way and
+    # requires an explicit match to stay instant instead.
+    expose: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
+             list_gmail_labels, get_events, list_calendars, query_freebusy,
+             search_drive_files, list_drive_items, get_drive_file_content,
+             send_gmail_message, draft_gmail_message,
+             get_drive_shareable_link, manage_event]
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
-              search_drive_files, list_drive_items, get_drive_file_content]
+              search_drive_files, list_drive_items, get_drive_file_content,
+              manage_event]
+    instant_when:
+      manage_event: {action: [create]}
   chrome-devtools:
     from_claude_config: chrome-devtools
+    domain: browser
     blocked: [get_network_request, list_network_requests]
-    instant: [list_pages, list_console_messages, get_console_message,
-              take_snapshot, take_screenshot]
+    # ~8 actually-useful tools (plan Track C0); network tools stay blocked
+    # even though they are already excluded by expose (defense in depth for
+    # call_raw and any future config edit that widens expose).
+    expose: [navigate_page, take_snapshot, click, fill, take_screenshot,
+             list_pages, wait_for]
+    instant: [list_pages, take_snapshot, take_screenshot]
 defaults:
   instant_prefixes: [get_, list_, search_, query_, read_, check_]
+  # Forces confirm even over an explicit instant: entry or the prefix
+  # heuristic - a fail-closed backstop against misleadingly-named or
+  # mistakenly-classified mutations. Matching is casefolded on both sides
+  # (survives camelCase remote tool names) and an empty list is rejected
+  # (it would silently disable the backstop). This is the built-in default:
+  # omit never_instant entirely to use it, or override with a non-empty
+  # replacement list to narrow it.
+  never_instant: [delete, remove, trash, send, purchase, revoke, permission, share]
   call_timeout_s: 8
   connect_timeout_s: 60

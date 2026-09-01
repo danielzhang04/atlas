@@ -11,7 +11,7 @@ import subprocess
 import sys
 from types import ModuleType
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -32,6 +32,10 @@ except ModuleNotFoundError:
         input_schema: dict
         run: Callable[[dict], Awaitable[Any]]
         policy: Literal["instant", "confirm"] = "instant"
+        prepare: Any = None
+        execute_prepared: Any = None
+        domain: str | None = None
+        escalate: Callable[[Mapping], bool] | None = None
 
     class McpToolError(RuntimeError):
         pass
@@ -697,14 +701,107 @@ def test_checked_in_chrome_devtools_config_has_explicit_safe_policy():
     defaults = config["defaults"]
 
     assert server["from_claude_config"] == "chrome-devtools"
+    assert server["domain"] == "browser"
     assert set(server["blocked"]) == {
         "get_network_request",
         "list_network_requests",
     }
-    for name in ("list_pages", "get_console_message", "take_snapshot", "take_screenshot"):
+    assert set(server["expose"]) == {
+        "navigate_page", "take_snapshot", "click", "fill",
+        "take_screenshot", "list_pages", "wait_for",
+    }
+    for name in ("list_pages", "take_snapshot", "take_screenshot"):
         assert policy_for(server, defaults, name) == "instant"
-    for name in ("navigate_page", "click", "fill", "evaluate_script"):
+    for name in ("navigate_page", "click", "fill", "wait_for"):
         assert policy_for(server, defaults, name) == "confirm"
+
+
+def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["google"]
+    defaults = config["defaults"]
+
+    assert server["domain"] == "google"
+    assert set(server["expose"]) == {
+        "search_gmail_messages", "get_gmail_message_content", "get_gmail_thread_content",
+        "list_gmail_labels", "get_events", "list_calendars", "query_freebusy",
+        "search_drive_files", "list_drive_items", "get_drive_file_content",
+        "send_gmail_message", "draft_gmail_message",
+        "get_drive_shareable_link", "manage_event",
+    }
+    for name in (
+        "search_gmail_messages", "get_gmail_message_content", "get_gmail_thread_content",
+        "list_gmail_labels", "get_events", "list_calendars", "query_freebusy",
+        "search_drive_files", "list_drive_items", "get_drive_file_content",
+    ):
+        assert policy_for(server, defaults, name) == "instant"
+    # Named in the plan as tiered mutations: a name-lying read (creates a
+    # sharing grant) stays confirm outright, and the multi-op calendar tool
+    # is instant except when its action argument requests anything other
+    # than create (instant_when is an allowlist, see _compile_instant_when).
+    assert policy_for(server, defaults, "get_drive_shareable_link") == "confirm"
+    assert policy_for(server, defaults, "manage_event") == "instant"
+    assert server["instant_when"]["manage_event"] == {"action": ["create"]}
+    # Product decision: send_gmail_message/draft_gmail_message are exposed
+    # (everyday send/draft is the point) but not in instant: -- and
+    # never_instant's "send" pattern independently forces confirm on
+    # send_gmail_message even if it were ever added there by mistake.
+    assert "send_gmail_message" not in server["instant"]
+    assert "draft_gmail_message" not in server["instant"]
+    assert policy_for(server, defaults, "send_gmail_message") == "confirm"
+    assert policy_for(server, defaults, "draft_gmail_message") == "confirm"
+
+
+def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path):
+    """Net prompt surface: kb (32, a commented constant -- kb tools require a
+    live bridge connection this test does not make; see
+    handoffs/2026-08-27-atlas-xwave.md) + google (38->14) +
+    chrome-devtools (27->7) + built-in host tools (constructed here via the
+    real builtin()/register_count_mail() registration path, not guessed)
+    = 72, down from 116 (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0).
+    """
+    from worker.localfiles import LocalFiles
+    from worker.tools import ToolRegistry, builtin, register_count_mail
+
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    google_expose = config["servers"]["google"]["expose"]
+    chrome_expose = config["servers"]["chrome-devtools"]["expose"]
+    assert len(google_expose) == 14
+    assert len(chrome_expose) == 7
+
+    class _FakeJob:
+        job_id = "job"
+        title = "t"
+        state = "done"
+        created_at = "now"
+
+    class _FakeWork:
+        def launch(self, _title, _brief):
+            return _FakeJob()
+
+        def active(self):
+            return []
+
+        def recent(self, _n):
+            return []
+
+        def cancel(self, _job_id):
+            return _FakeJob()
+
+    async def _search(_arguments):
+        return "Found 0 messages matching x"
+
+    builtin_registry = ToolRegistry()
+    files = LocalFiles([str(tmp_path)], opener=lambda _path: None)
+    builtin(builtin_registry, {}, _FakeWork(), files=files)
+    register_count_mail(builtin_registry, _search)
+    builtin_count = len(builtin_registry.schemas())
+
+    KB_COUNT = 32  # commented constant: see docstring above
+
+    total = KB_COUNT + len(google_expose) + len(chrome_expose) + builtin_count
+    assert total <= 72
+    assert total < 116  # net new prompt surface must be negative
 
 
 def test_blocked_server_tools_are_never_registered_or_callable():
@@ -1732,3 +1829,435 @@ def test_kb_tool_descriptions_do_not_claim_to_enforce_t3():
 
     assert "T3 approvals" not in tool.description
     assert tool.policy == "confirm"
+
+
+# --- expose: -----------------------------------------------------------
+
+def test_exposed_tools_returns_none_when_absent_and_a_frozenset_when_present():
+    assert mcp_client._exposed_tools({}) is None
+    assert mcp_client._exposed_tools({"expose": ["a", "b"]}) == frozenset({"a", "b"})
+
+
+def test_exposed_tools_rejects_a_malformed_list():
+    with pytest.raises(ValueError, match="expose"):
+        mcp_client._exposed_tools({"expose": ["a", 1]})
+    with pytest.raises(ValueError, match="expose"):
+        mcp_client._exposed_tools({"expose": "not-a-list"})
+
+
+def test_expose_and_blocked_overlap_blocked_always_wins():
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(
+                    name=name, description=f"{name} tool",
+                    inputSchema={"type": "object", "properties": {}},
+                )
+                for name in ("kept", "overlapping", "unexposed")
+            ])
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "demo": {
+                        "command": "unused",
+                        "expose": ["kept", "overlapping"],
+                        "blocked": ["overlapping"],
+                        "instant": ["kept", "overlapping"],
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        await servers.connect(registry)
+        registered = registry.names()
+        await servers.close()
+        return registered
+
+    assert asyncio.run(scenario()) == ["demo__kept"]
+
+
+# --- never_instant: ------------------------------------------------------
+
+def test_never_instant_forces_confirm_over_an_explicit_instant_listing():
+    server_cfg = {"instant": ["delete_thing", "get_thing"]}
+    defaults = {}
+    assert policy_for(server_cfg, defaults, "get_thing") == "instant"
+    assert policy_for(server_cfg, defaults, "delete_thing") == "confirm"
+
+
+def test_never_instant_default_list_covers_the_documented_patterns():
+    server_cfg = {
+        "instant": [
+            "purchase_item", "revoke_access", "trash_note", "share_file",
+            "remove_item", "send_message", "set_permission",
+        ],
+    }
+    defaults = {}
+    for name in server_cfg["instant"]:
+        assert policy_for(server_cfg, defaults, name) == "confirm"
+
+
+def test_never_instant_matching_is_case_insensitive_on_both_sides():
+    server_cfg = {"instant": ["DeleteFile", "sendEmail", "listFiles"]}
+    defaults = {}
+    assert policy_for(server_cfg, defaults, "DeleteFile") == "confirm"
+    assert policy_for(server_cfg, defaults, "sendEmail") == "confirm"
+    assert policy_for(server_cfg, defaults, "listFiles") == "instant"
+
+
+def test_never_instant_config_patterns_are_also_casefolded():
+    server_cfg = {"instant": ["DELETE_THING"]}
+    defaults = {"never_instant": ["Delete"]}
+    assert policy_for(server_cfg, defaults, "DELETE_THING") == "confirm"
+
+
+def test_never_instant_rejects_an_empty_pattern_list():
+    """An empty list would silently disable the destructive-action backstop
+    -- reject it rather than let it slip through as "no restrictions"."""
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({"instant": ["delete_thing"]}, {"never_instant": []}, "delete_thing")
+
+
+def test_never_instant_can_be_narrowed_by_a_non_empty_replacement_list():
+    server_cfg = {"instant": ["delete_thing", "purchase_item"]}
+    defaults = {"never_instant": ["purchase"]}
+    assert policy_for(server_cfg, defaults, "delete_thing") == "instant"
+    assert policy_for(server_cfg, defaults, "purchase_item") == "confirm"
+
+
+def test_never_instant_rejects_a_malformed_pattern_list():
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({}, {"never_instant": ["ok", 7]}, "get_thing")
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({}, {"never_instant": "not-a-list"}, "get_thing")
+
+
+# --- instant_when: -----------------------------------------------------
+
+def test_instant_when_is_an_allowlist_that_escalates_unless_the_value_matches():
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate is not None
+    assert escalate({"action": "create"}) is False
+    assert escalate({"action": "delete"}) is True
+    assert escalate({"action": "update"}) is True
+
+
+@pytest.mark.parametrize("value", ["delete", "Delete", " delete ", "DELETE", "  DeLeTe"])
+def test_instant_when_escalates_case_and_whitespace_variants_of_a_disallowed_value(value):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate({"action": value}) is True
+
+
+@pytest.mark.parametrize("value", ["create", " Create ", "CREATE", "CreAte"])
+def test_instant_when_allows_case_and_whitespace_variants_of_an_allowed_value(value):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate({"action": value}) is False
+
+
+@pytest.mark.parametrize("arguments", [
+    {},                                # missing entirely
+    {"action": ["create"]},            # list, not a string
+    {"action": {"value": "create"}},   # dict, not a string
+    {"action": 7},                     # int, not a string
+    {"action": None},                  # None, not a string
+])
+def test_instant_when_escalates_on_missing_or_non_string_values(arguments):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate(arguments) is True
+
+
+def test_instant_when_absent_for_a_tool_yields_no_escalate_hook():
+    assert mcp_client._compile_instant_when(
+        {"instant_when": {"other_tool": {"x": ["y"]}}}, "manage_event",
+    ) is None
+    assert mcp_client._compile_instant_when({}, "manage_event") is None
+
+
+@pytest.mark.parametrize("rules", [
+    {"manage_event": {}},
+    {"manage_event": {"action": []}},
+    {"manage_event": {7: ["create"]}},
+    {"manage_event": "create"},
+    {"manage_event": {"action": [7]}},
+    {"manage_event": {"action": [""]}},
+])
+def test_instant_when_rejects_malformed_rules(rules):
+    with pytest.raises(ValueError, match="instant_when"):
+        mcp_client._compile_instant_when({"instant_when": rules}, "manage_event")
+
+
+def test_instant_when_rejects_a_non_mapping_top_level_config():
+    with pytest.raises(ValueError, match="instant_when"):
+        mcp_client._compile_instant_when({"instant_when": ["not", "a", "map"]}, "manage_event")
+
+
+# --- describe: ---------------------------------------------------------
+
+def test_describe_overrides_the_mirrored_description():
+    assert mcp_client._tool_description(
+        {"describe": {"manage_event": "Host-authored description."}},
+        "manage_event", "Remote description.",
+    ) == "Host-authored description."
+    assert mcp_client._tool_description(
+        {}, "manage_event", "Remote description.",
+    ) == "Remote description."
+
+
+def test_describe_override_is_truncated_at_the_same_512_char_bound():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo",
+        {"describe": {"widget": "x" * 600}},
+        {},
+        SimpleNamespace(),
+        SimpleNamespace(
+            name="widget", description="short",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+    assert len(tool.description) == 512
+    assert tool.description == "x" * 512
+
+
+def test_describe_rejects_a_non_string_empty_or_malformed_map():
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": {"widget": ""}}, "widget", "remote")
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": {"widget": 7}}, "widget", "remote")
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": ["not", "a", "map"]}, "widget", "remote")
+
+
+# --- domain: ---------------------------------------------------------------
+
+def test_domain_is_stored_on_mirrored_tools_when_configured():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo", {"domain": "google"}, {}, SimpleNamespace(),
+        SimpleNamespace(name="widget", description="d", inputSchema={"type": "object", "properties": {}}),
+    )
+    assert tool.domain == "google"
+
+
+def test_domain_absent_leaves_mirrored_tool_domain_none():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo", {}, {}, SimpleNamespace(),
+        SimpleNamespace(name="widget", description="d", inputSchema={"type": "object", "properties": {}}),
+    )
+    assert tool.domain is None
+
+
+def test_domain_rejects_a_non_string_or_empty_value():
+    with pytest.raises(ValueError, match="domain"):
+        mcp_client._server_domain({"domain": 7})
+    with pytest.raises(ValueError, match="domain"):
+        mcp_client._server_domain({"domain": ""})
+
+
+# --- function-proof: all five keys through a real connect ------------------
+
+def _c0_curation_server() -> FastMCP:
+    """A fake remote server shaped like the real one this config targets:
+    the mutation tool's argument is named `action` (workspace-mcp 1.25.2's
+    real manage_event parameter, gcalendar/calendar_tools.py:1316), not the
+    `operation` name the config/fixture were mistakenly fitted to before
+    the F2/F3 fix."""
+    server = FastMCP("test-c0")
+
+    @server.tool(description="Read calendar events.")
+    def get_events(calendar: str = "primary") -> str:
+        return "events"
+
+    @server.tool(description="List calendars.")
+    def list_calendars() -> str:
+        return "calendars"
+
+    @server.tool(description="Delete a calendar event.")
+    def delete_event(event_id: str) -> str:
+        return f"deleted {event_id}"
+
+    @server.tool(description="Create, update, or delete an event.")
+    def manage_event(action: str, event_id: str = "") -> str:
+        return f"{action} {event_id}"
+
+    @server.tool(description="Secret internal tool that must never be exposed.")
+    def secret_tool() -> str:
+        return "secret"
+
+    @server.tool(description="A network-inspection tool that stays blocked.")
+    def blocked_tool() -> str:
+        return "blocked"
+
+    return server
+
+
+def test_function_proof_registry_ends_up_with_exactly_the_curated_surface():
+    """Spins the same fake-MCP-server fixture used elsewhere in this file
+    (FastMCP + create_connected_server_and_client_session) with 6 tools,
+    shaped like the real upstream server (manage_event's argument is named
+    `action`), and a config exercising all five new keys (expose,
+    never_instant, instant_when, describe, domain) at once, connects for
+    real through McpServers, and checks the registry lands on exactly the
+    curated set with the right policies, escalate hook, host-authored
+    description, and domain label."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "command": "unused",
+                        "domain": "google",
+                        "expose": ["get_events", "list_calendars", "delete_event", "manage_event"],
+                        "blocked": ["blocked_tool"],
+                        "instant": ["get_events", "list_calendars", "delete_event", "manage_event"],
+                        "instant_when": {
+                            "manage_event": {"action": ["create"]},
+                        },
+                        "describe": {
+                            "manage_event": "Create, update, or delete a calendar event (host-authored).",
+                        },
+                    },
+                },
+                "defaults": {
+                    "instant_prefixes": ["get_", "list_"],
+                    "never_instant": [
+                        "delete", "remove", "trash", "send", "purchase",
+                        "revoke", "permission", "share",
+                    ],
+                    "connect_timeout_s": 1,
+                },
+            },
+            session_factory=_memory_factory(_c0_curation_server()),
+        )
+        await servers.connect(registry)
+        tools = dict(registry._tools)
+        await servers.close()
+        return tools
+
+    tools = asyncio.run(scenario())
+
+    # Exactly the exposed subset: secret_tool (never exposed) and
+    # blocked_tool (exposed AND blocked -- blocked wins) are both absent.
+    assert set(tools) == {
+        "google__get_events", "google__list_calendars",
+        "google__delete_event", "google__manage_event",
+    }
+    assert tools["google__get_events"].policy == "instant"
+    assert tools["google__get_events"].description == "Read calendar events."
+    assert tools["google__list_calendars"].policy == "instant"
+    # never_instant's "delete" pattern forces confirm even though
+    # delete_event was named in this server's instant: list.
+    assert tools["google__delete_event"].policy == "confirm"
+    # manage_event stays instant at the base policy; escalation to confirm
+    # is argument-conditional via instant_when's allowlist, not baked into
+    # the policy. It escalates for anything except an exact (normalized)
+    # "create", including values that only differ by case/whitespace, and
+    # for a missing or non-string action.
+    assert tools["google__manage_event"].policy == "instant"
+    assert tools["google__manage_event"].escalate is not None
+    assert tools["google__manage_event"].escalate({"action": "create"}) is False
+    assert tools["google__manage_event"].escalate({"action": " Create "}) is False
+    assert tools["google__manage_event"].escalate({"action": "delete"}) is True
+    assert tools["google__manage_event"].escalate({"action": "Delete"}) is True
+    assert tools["google__manage_event"].escalate({}) is True
+    assert tools["google__manage_event"].description == (
+        "Create, update, or delete a calendar event (host-authored)."
+    )
+    assert all(tool.domain == "google" for tool in tools.values())
+
+
+def test_missing_exposed_tools_logs_one_bounded_warning_with_names_only(caplog):
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(
+                    name="kept", description="kept tool",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+            ])
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "demo": {
+                        "command": "unused",
+                        "expose": ["kept", "renamed_tool", "another_missing_tool"],
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        with caplog.at_level("WARNING"):
+            await servers.connect(registry)
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "demo" in message
+    assert "renamed_tool" in message
+    assert "another_missing_tool" in message
+    assert "kept" not in message  # only the missing names are listed, not the mirrored ones
+
+
+def test_missing_exposed_tools_says_nothing_when_everything_is_offered(caplog):
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {"command": "unused", "instant": ["get_events"]},
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_server()),
+        )
+        with caplog.at_level("WARNING"):
+            await servers.connect(registry)
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    assert not any("expose" in record.getMessage() for record in caplog.records)
+
+
+def test_missing_exposed_tools_helper_is_bounded_and_names_only():
+    listed = [
+        SimpleNamespace(name="kept", description="d", inputSchema={"type": "object", "properties": {}}),
+    ]
+    assert mcp_client._missing_exposed_tools(None, listed) == ()
+    assert mcp_client._missing_exposed_tools(frozenset({"kept"}), listed) == ()
+    assert mcp_client._missing_exposed_tools(
+        frozenset({"kept", "gone", "also_gone"}), listed,
+    ) == ("also_gone", "gone")

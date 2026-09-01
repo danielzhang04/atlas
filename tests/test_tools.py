@@ -261,6 +261,115 @@ def test_confirmation_refuses_serialized_arguments_over_readback_limit():
     assert registry.pending is None
 
 
+def test_pending_action_also_blocks_a_tool_that_escalates_to_confirm():
+    """Regression for the pending-clobber bug: an outstanding declared-confirm
+    pending action (A) must also block a second call whose "instant" policy
+    escalates to confirm (B) -- not just a second call that is declared
+    confirm outright. Before the fix, B's own self._pending = pending write
+    silently replaced A, and confirm(A) then failed with "nothing to
+    confirm" even though Daniel never got to answer A."""
+    calls = []
+    registry = ToolRegistry()
+    registry.register(_tool(
+        "first", run=lambda args: _return(calls.append(("first", args))), policy="confirm",
+    ))
+    registry.register(Tool(
+        name="second", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("second", args))),
+        policy="instant", escalate=lambda _args: True,
+    ))
+
+    pending_first = _call(registry, "first", {"n": 1})
+    blocked = _call(registry, "second", {"n": 2})
+
+    assert blocked == ToolResult(
+        "error",
+        "a previous action is still awaiting Daniel's yes or no",
+    )
+    assert registry.pending is not None
+    assert registry.pending.confirm_id == pending_first.confirm_id
+    assert registry.pending.name == "first"
+    assert calls == []
+    assert asyncio.run(registry.confirm(pending_first.confirm_id)).status == "ok"
+    assert calls == [("first", {"n": 1})]
+
+
+def test_escalate_moves_instant_to_confirm_but_never_the_reverse():
+    """Directional property: escalate can turn an instant call into a confirm
+    (readback, no execution) for this call, and a False/absent escalate
+    leaves an instant tool executing immediately -- it never manufactures an
+    instant result out of a confirm-policy tool (see the reflection-style
+    test below for that half of the guarantee)."""
+    calls = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="always_escalate", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("always_escalate", args)) or "ran"),
+        policy="instant", escalate=lambda _args: True,
+    ))
+    registry.register(Tool(
+        name="never_escalate", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("never_escalate", args)) or "ran"),
+        policy="instant", escalate=lambda _args: False,
+    ))
+
+    escalated = _call(registry, "always_escalate", {"x": 1})
+    assert escalated.status == "needs_confirmation"
+    assert calls == []
+    assert asyncio.run(registry.confirm(escalated.confirm_id)).status == "ok"
+    assert calls == [("always_escalate", {"x": 1})]
+
+    kept_instant = _call(registry, "never_escalate", {"y": 2})
+    assert kept_instant.status == "ok"
+    assert calls[-1] == ("never_escalate", {"y": 2})
+
+
+def test_escalate_raising_is_treated_as_escalation_fail_closed():
+    registry = ToolRegistry()
+
+    def broken(_args):
+        raise RuntimeError("rule blew up")
+
+    registry.register(Tool(
+        name="risky", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"),
+        policy="instant", escalate=broken,
+    ))
+
+    result = _call(registry, "risky", {})
+
+    assert result.status == "needs_confirmation"
+
+
+def test_escalate_is_structurally_ignored_once_policy_is_already_confirm():
+    """Reflection-style guard: a confirm-policy tool must never consult
+    escalate at all, so even a poisoned escalate that raises AssertionError
+    on every call cannot surface -- proving there is no code path that lets
+    escalate run for (and thereby de-escalate) a confirm-policy tool."""
+    def must_not_be_called(_args):
+        raise AssertionError("escalate must not be consulted for a confirm-policy tool")
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="dangerous", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"),
+        policy="confirm", escalate=must_not_be_called,
+    ))
+
+    result = _call(registry, "dangerous", {})
+
+    assert result.status == "needs_confirmation"
+
+
+def test_tool_domain_field_is_optional_and_stored_for_later_use():
+    assert _tool("plain").domain is None
+    labeled = Tool(
+        name="labeled", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"), domain="google",
+    )
+    assert labeled.domain == "google"
+
+
 def test_open_resolves_aliases_https_and_rejects_other_targets():
     opened = []
     registry = ToolRegistry()
