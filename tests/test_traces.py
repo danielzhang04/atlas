@@ -300,3 +300,44 @@ def test_configured_fast_model_has_a_pricing_row():
         "cache_read_per_mtok", "cache_write_per_mtok",
     }
     assert all(isinstance(rate, (int, float)) and rate > 0 for rate in rates.values())
+
+
+def test_interrupted_is_a_first_class_outcome_not_replaced_with_other(tmp_path: Path):
+    """A barge-in is its own outcome, distinct from a turn that failed.
+
+    Without it in the vocabulary the row would be stored as "other", which
+    reads the same as a bug in the host and buries the one signal that says
+    Daniel simply talked over the answer.
+    """
+    recorder = _recorder(tmp_path / "traces.db")
+    _record_turn(recorder, outcome="interrupted")
+    _record_turn(recorder, outcome="empty")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcomes = connection.execute(
+            "SELECT outcome FROM turns ORDER BY started_at"
+        ).fetchall()
+    assert sorted(outcomes) == [("empty",), ("interrupted",)]
+
+
+def test_speech_was_interrupted_reads_the_active_turn(tmp_path: Path):
+    from worker import traces
+
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+
+    # No active turn at all (the text lane, tests): honest silence stays the
+    # default, so the host still speaks its fallback.
+    assert traces.speech_was_interrupted() is False
+
+    token = traces.activate(recorder, turn)
+    try:
+        assert traces.speech_was_interrupted() is False
+        traces.mark_speech_interrupted(turn)
+        assert traces.speech_was_interrupted() is True
+    finally:
+        traces.reset(token)
+        recorder.close()
+
+    assert traces.speech_was_interrupted() is False

@@ -557,3 +557,29 @@ def test_stt_node_notes_speaking_state_even_on_non_transcript_events(monkeypatch
 
     assert result == [events[0]]
     assert agent.echo_guard.dropped_count == 1
+
+
+def test_within_echo_window_reports_the_same_window_should_drop_filters_in():
+    """The reflex lane's gate on destroying a pending action (unit DD-1).
+
+    A one-token "stop" is never dropped as an echo, so the only way to tell a
+    self-echo from a real one is WHEN it arrived: inside the speaking window
+    (or its short tail) it may be Atlas's own voice; after that it cannot be.
+    """
+    guard, clock = _guard(tail_s=1.0)
+
+    # Nothing has been said yet: an utterance now is certainly Daniel's.
+    assert guard.within_echo_window() is False
+
+    guard.record_spoken("the draft is ready, yes or no?")
+    guard.note_speaking(True)
+    assert guard.within_echo_window() is True
+
+    # Speech stops; the tail is still suspect...
+    guard.note_speaking(False)
+    clock.advance(0.5)
+    assert guard.within_echo_window() is True
+
+    # ...and past the tail it is the quiet period again.
+    clock.advance(1.0)
+    assert guard.within_echo_window() is False

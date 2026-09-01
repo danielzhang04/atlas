@@ -20,8 +20,11 @@ _EMPTY = {"turns": 0, "avg_ms": 0.0, "tool_calls": 0, "input_tokens": 0,
           "cache_hit_ratio": 0.0, "cost_usd": 0.0}
 _WAKE_KINDS = frozenset({"ambient", "reflex", "reply", "text", "wake"})
 _OUTCOMES = frozenset({
-    "asleep", "cancelled", "dismissed", "empty", "error", "ignored", "responded",
-    "speech_failed",
+    # "interrupted" is a turn that produced no speech BECAUSE Daniel barged in.
+    # It used to be recorded as "empty", which put a real failure and a normal
+    # interruption in the same bucket -- and made the host apologise for it.
+    "asleep", "cancelled", "dismissed", "empty", "error", "ignored",
+    "interrupted", "responded", "speech_failed",
 })
 _UNRESOLVED = re.compile(r"%(?:[^%]+)%|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})")
 _STOP = object()
@@ -82,6 +85,15 @@ def active_turn() -> tuple["TraceRecorder", _Turn] | None:
     time) that need to attribute a signal to the in-flight turn without
     going through record_current_respond/generate/tool_call."""
     return _ACTIVE.get()
+def speech_was_interrupted() -> bool:
+    """Did a barge-in cut the in-flight turn's speech?
+
+    Read by the response funnels: a turn that ends with nothing said because
+    Daniel talked over it is not a turn that failed, and must not be answered
+    with an apology. False whenever there is no active turn (text lane, tests),
+    which keeps the honest-silence fallback the default."""
+    active = _ACTIVE.get()
+    return active is not None and active[1].speech_interrupted is True
 def mark_speech_interrupted(turn: _Turn) -> None:
     """Record that a speech handle created during `turn` was interrupted;
     read by TraceRecorder.respond() when it records the RESPOND step."""

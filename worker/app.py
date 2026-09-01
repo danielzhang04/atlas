@@ -5,6 +5,7 @@ import asyncio
 from collections import Counter, deque
 import inspect
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
@@ -40,6 +41,9 @@ WAKE_LINE = "Hey boss. What can I do for you?"
 # Spoken when a reflex reaches no branch that says anything -- "repeat" with
 # nothing to repeat, or an intent this funnel does not route.
 REPEAT_FALLBACK = "I don't have anything to repeat yet. "
+# A reflex "cancel" that drops a pending action says so. Silence there reads as
+# the cancel not landing, and the pending would still be waiting.
+PENDING_CANCELLED_REPLY = "Cancelled. "
 REFLEX_FALLBACK = "I heard that, but I don't have a way to act on it. "
 SLEEP_LINE = "Okay, sleeping. Wake me when you need something."
 _BG_TASKS: set[asyncio.Task] = set()
@@ -476,6 +480,18 @@ class SpeechEchoGuard:
             return False
         return (now - self._speaking_last_seen_at) <= self._tail_s
 
+    def within_echo_window(self) -> bool:
+        """Was Atlas speaking (or just finished) when this transcript landed?
+
+        The same window `should_drop` filters in, read without a transcript.
+        A one-token utterance is never treated as an echo by design -- livekit
+        needs two words to interrupt, and a lone "stop" must always be able to
+        stop the speaking -- but that also means a self-echoed "stop" reaches
+        the reflex lane. Destroying a pending action is not something a
+        possible echo may do, so the reflex lane asks this first.
+        """
+        return self._within_filter_window(self._clock(), speaking=False)
+
     def should_drop(self, transcript: str, *, speaking: bool) -> bool:
         now = self._clock()
         self.note_speaking(speaking)
@@ -641,11 +657,17 @@ async def _submit_voice_turn(
             spoken.append(chunk)
             yield chunk
 
+    from worker import traces as traces_mod
+
     responded = False
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
         if spoken:
             responded = True
+        elif traces_mod.speech_was_interrupted():
+            # Daniel talked over this turn. The silence is his, not a fault, so
+            # the host says nothing at all -- an apology here is a false one.
+            logger.info("voice turn produced no speech after a barge-in")
         else:
             # Last funnel before the speaker: whatever went wrong upstream, an
             # addressed turn never ends without Atlas saying something. Spoken
@@ -657,7 +679,6 @@ async def _submit_voice_turn(
             await session.say(brain_mod.EMPTY_TURN_REPLY, add_to_chat_ctx=False)
             publisher.add_line("atlas", brain_mod.EMPTY_TURN_REPLY)
     finally:
-        from worker import traces as traces_mod
         traces_mod.record_current_respond(
             ms=(round((time.perf_counter() - respond_started) * 1000)
                 if respond_started is not None else 0),
@@ -692,6 +713,8 @@ async def _handle_reflex(
     dismiss,
     cancel_turn=None,
     on_spoken=None,
+    registry=None,
+    speaking_probe=None,
     source: str | None = None,
 ) -> bool:
     if not isinstance(text, str) or not text.strip():
@@ -704,9 +727,30 @@ async def _handle_reflex(
     if intent == "dismiss":
         dismiss()
     elif intent == "cancel":
+        # Stopping the speech is unconditional: whoever said it, and whether or
+        # not it was Atlas's own voice coming back, "stop" stops the talking.
         session.interrupt()
         if cancel_turn is not None:
             cancel_turn()
+        # Dropping the PENDING action is not unconditional. A one-token
+        # "cancel" or "stop" is never filtered as an echo (the guard passes
+        # 1-token transcripts by design), so a word Atlas itself just said
+        # could otherwise destroy a single-use mutating action nobody
+        # cancelled. Mid-speech it only stops the readback; the pending
+        # survives for an explicit follow-up in the quiet after it.
+        echoing = bool(speaking_probe()) if callable(speaking_probe) else False
+        if echoing:
+            logger.info("reflex cancel arrived mid-speech; pending action kept")
+        # The reflex lane never reaches the brain, so "cancel" used to stop the
+        # speech and the in-flight turn while leaving the pending action alive:
+        # Daniel cancelled, heard nothing, and the next plain "yes" -- about
+        # anything -- still had a mutating action waiting to consume it.
+        if not echoing and getattr(registry, "pending", None) is not None:
+            registry.cancel_pending()
+            await session.say(PENDING_CANCELLED_REPLY, add_to_chat_ctx=False)
+            publisher.add_line("atlas", PENDING_CANCELLED_REPLY)
+            if on_spoken is not None:
+                on_spoken()
     elif intent == "repeat" and repeated:
         await session.say(repeated, add_to_chat_ctx=False)
         if on_spoken is not None:
@@ -740,6 +784,7 @@ async def _handle_audio_turn_inner(
     sleep,
     turn_ownership: TurnOwnership | None = None,
     source: str = "speech",
+    speaking_probe=None,
     _trace=None,
     _trace_meta: dict | None = None,
 ) -> str:
@@ -795,6 +840,16 @@ async def _handle_audio_turn_inner(
         )
         if cancel_allowed:
             _mark(addressed=False, wake_kind="reflex", outcome="cancelled")
+
+            def _cancel_spoken() -> None:
+                # "Cancelled." is a real reply, so the follow-up ("do the other
+                # one instead") must not need the wake word again -- the same
+                # rule the repeat lane and the empty-turn fallback follow.
+                if engagement.state != engagement_mod.ENGAGED:
+                    return
+                engagement.interacted()
+                addressing.mark_activity()
+
             await _handle_reflex(
                 text,
                 intents=intents,
@@ -802,6 +857,9 @@ async def _handle_audio_turn_inner(
                 publisher=publisher,
                 dismiss=_dismiss,
                 cancel_turn=ownership.cancel,
+                on_spoken=_cancel_spoken,
+                registry=getattr(brain, "registry", None),
+                speaking_probe=speaking_probe,
                 source=line_source,
             )
             return ""
@@ -864,14 +922,24 @@ async def _handle_audio_turn_inner(
             context=context,
             source=line_source,
         )
-        # Derived from the answer itself, not signalled out of the funnel: an
-        # empty response IS the empty outcome, so the two cannot drift apart,
-        # and every path that returns "" -- including the funnel's own input
-        # guard -- is recorded honestly without knowing it is being watched.
+        # Derived from the answer itself, not signalled out of the funnel: a
+        # silent turn IS the silent outcome, so the two cannot drift apart, and
+        # every path that returns "" -- including the funnel's own input guard
+        # -- is recorded honestly without knowing it is being watched. Which
+        # KIND of silence comes from the same turn flag the funnel reads.
+        from worker import traces as traces_mod
+        if response:
+            outcome = "responded"
+        elif traces_mod.speech_was_interrupted():
+            # A barge-in, not a failed turn. Recorded apart from "empty" so the
+            # trace agrees with the funnel above, which stays silent for it.
+            outcome = "interrupted"
+        else:
+            outcome = "empty"
         _mark(
             addressed=True,
             wake_kind="reply" if reply_window else "wake",
-            outcome="responded" if response else "empty",
+            outcome=outcome,
         )
         # The window used to be refreshed only `if response`, so a silent turn
         # closed the addressing window and the next follow-up needed the wake
@@ -897,6 +965,7 @@ async def _handle_audio_turn(
     sleep,
     turn_ownership: TurnOwnership | None = None,
     source: str = "speech",
+    speaking_probe=None,
     trace_recorder=None,
 ) -> str:
     if trace_recorder is None or not isinstance(text, str) or not text.strip():
@@ -911,6 +980,7 @@ async def _handle_audio_turn(
             sleep=sleep,
             turn_ownership=turn_ownership,
             source=source,
+            speaking_probe=speaking_probe,
         )
 
     from worker import traces as traces_mod
@@ -930,6 +1000,7 @@ async def _handle_audio_turn(
             sleep=sleep,
             turn_ownership=turn_ownership,
             source=source,
+            speaking_probe=speaking_probe,
             _trace=(trace_recorder, turn),
             _trace_meta=metadata,
         )
@@ -1559,6 +1630,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 addressing=addressing,
                 sleep=_sleep,
                 turn_ownership=turn_ownership,
+                speaking_probe=agent.echo_guard.within_echo_window,
                 trace_recorder=_traces(),
             )
 
@@ -1616,10 +1688,102 @@ def _console_input_args(
     return ["--input-device", str(index)]
 
 
+WORKER_LOG_MAX_BYTES = 256 * 1024
+WORKER_LOG_BACKUPS = 2
+WORKER_LOG_MESSAGE_LIMIT = 200
+# A token that looks like a path, a URL, or an address. Kept deliberately
+# blunt: "1/3" (a retry count) survives, "C:\Users\...", "~/.claude/projects",
+# "https://host/x" and "someone@example.test" do not.
+_UNSAFE_LOG_TOKEN = re.compile(r"[\\~@]|[A-Za-z]:[\\/]|/[A-Za-z]")
+# Secret shapes, as defense in depth: nothing in the atlas.* tree is supposed
+# to log one, and rule 1 keeps them out of reach in the first place, but a
+# persistent file is the wrong place to find out that something did.
+_SECRET_LOG_TOKEN = re.compile(
+    r"(?:sk-|bearer|eyJ)|\b[0-9a-fA-F]{16,}\b", re.IGNORECASE,
+)
+
+
+class _HostShapedFormatter(logging.Formatter):
+    """Write the host's own sentence and stop where it stops being one.
+
+    A file handler on the whole atlas.* tree persists every WARNING any module
+    raises, including ones this unit does not own and ones not written yet.
+    Most are already host-shaped -- fixed text plus a count, a category, an
+    exception type -- but not all: a traceback carries absolute source paths
+    and the original OSError text, and the file-root warnings interpolate
+    configured paths. Rule 10 is a property of the FILE, so it is enforced
+    here, where every record must pass, instead of trusting 60-odd call sites
+    to stay disciplined.
+
+    This enforces the SHAPE of what is written; it is not a promise that any
+    particular caller is well behaved. Tracebacks never reach the file (the
+    console lane still gets them -- the record is read, never mutated), and
+    every line is capped. Redaction runs to the END of the message rather than
+    over the one offending token: paths with spaces are the norm on Windows,
+    so "root C:\\Users\\d\\Tax Returns 2025 is unavailable" would otherwise
+    keep the half that actually says something about Daniel. The host's fixed
+    prefix survives because it is written before the interpolation.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = " ".join(str(record.getMessage()).split())
+        kept = []
+        for token in message.split(" "):
+            if _UNSAFE_LOG_TOKEN.search(token) or _SECRET_LOG_TOKEN.search(token):
+                kept.append("<redacted>")
+                break
+            kept.append(token)
+        redacted = " ".join(kept)[:WORKER_LOG_MESSAGE_LIMIT]
+        return f"{self.formatTime(record)} {record.levelname} {record.name} {redacted}"
+
+
+def _configure_worker_logging(local_app_data=None):
+    """Persist worker WARNING+ lines to one bounded rotating file.
+
+    These lines existed only in the console the desktop drains, so the ones
+    worth reading after the fact -- a claim the guard refused, a turn that said
+    nothing, a dropped trace record -- were gone by the time anyone asked what
+    happened. What makes keeping them safe is not the call sites' good manners
+    but _HostShapedFormatter above, which every record goes through (rule 10).
+    The file is opened on the first record (delay=True), so a worker that never
+    warns leaves nothing behind.
+    """
+    root = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
+    if not root:
+        return None
+    try:
+        path = Path(root) / "Atlas" / "logs" / "worker.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=WORKER_LOG_MAX_BYTES,
+            backupCount=WORKER_LOG_BACKUPS,
+            encoding="utf-8",
+            delay=True,
+        )
+    except Exception:
+        return None
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(_HostShapedFormatter())
+    handler._atlas_worker_file_handler = True
+    atlas_logger = logging.getLogger("atlas")
+    for existing in list(atlas_logger.handlers):
+        if getattr(existing, "_atlas_worker_file_handler", False):
+            atlas_logger.removeHandler(existing)
+            existing.close()
+    atlas_logger.addHandler(handler)
+    # Only ever lowers the floor to WARNING, never raises it: the console lane
+    # keeps whatever level the worker runtime configured for INFO and below.
+    if atlas_logger.getEffectiveLevel() > logging.WARNING:
+        atlas_logger.setLevel(logging.WARNING)
+    return handler
+
+
 def main() -> int:
     global _worker_exit_code
     _worker_exit_code = 0
     jobobject.assign_current_process()
+    _configure_worker_logging()
     try:
         cfg = _cfg()
         sys.argv.extend(_console_output_args(sys.argv, cfg))

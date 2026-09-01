@@ -203,7 +203,8 @@ def test_pending_action_blocks_every_new_confirm_policy_proposal_until_consumed(
     blocked = _call(registry, "second", {"n": 2})
     assert blocked == ToolResult(
         "error",
-        "a previous action is still awaiting Daniel's yes or no",
+        "a previous action is still awaiting Daniel's yes or no: first - n: 1. "
+        "Ask him to confirm or cancel that one first.",
     )
     assert registry.pending is not None
     assert registry.pending.confirm_id == old.confirm_id
@@ -228,7 +229,8 @@ def test_pending_action_refusal_precedes_tainted_confirm_policy_refusal():
 
     assert result == ToolResult(
         "error",
-        "a previous action is still awaiting Daniel's yes or no",
+        "a previous action is still awaiting Daniel's yes or no: first - no arguments. "
+        "Ask him to confirm or cancel that one first.",
     )
 
 
@@ -364,7 +366,8 @@ def test_pending_action_also_blocks_a_tool_that_escalates_to_confirm():
 
     assert blocked == ToolResult(
         "error",
-        "a previous action is still awaiting Daniel's yes or no",
+        "a previous action is still awaiting Daniel's yes or no: first - n: 1. "
+        "Ask him to confirm or cancel that one first.",
     )
     assert registry.pending is not None
     assert registry.pending.confirm_id == pending_first.confirm_id
@@ -2357,3 +2360,33 @@ def test_exactly_one_target_is_settled_before_the_taint_gate(tmp_path):
     # A single target still works in both directions.
     assert _call(registry, "open_folder", {"root": "downloads"}, tainted=True).status == "ok"
     assert _call(registry, "open_folder", {"handle": handle}, tainted=True).status == "ok"
+
+
+def test_pending_collision_refusal_names_the_action_and_stays_bounded():
+    """The refusal has to be answerable, not just correct.
+
+    "a previous action is still awaiting Daniel's yes or no" named nothing and
+    offered no way out: the model could only relay a dead end. It now says
+    which action is waiting and what clears it -- trimmed, so one collision
+    cannot spend the whole reply reading arguments aloud.
+    """
+    registry = ToolRegistry()
+    registry.register(_tool("first", policy="confirm"))
+    registry.register(_tool("second", policy="confirm"))
+
+    _call(registry, "first", {"body": "x" * 400})
+    blocked = _call(registry, "second", {"n": 1})
+
+    assert blocked.status == "error"
+    assert blocked.content.startswith(
+        "a previous action is still awaiting Daniel's yes or no: first - body: "
+    )
+    assert blocked.content.endswith("Ask him to confirm or cancel that one first.")
+    # Bounded: the pending's own readback summary is trimmed to the cap before
+    # it is quoted, whatever size the arguments were.
+    quoted = blocked.content.split(": ", 1)[1].rsplit(". Ask him", 1)[0]
+    assert len(quoted) == 120
+    assert "\n" not in blocked.content
+    # The pending action is untouched by the refusal.
+    assert registry.pending is not None
+    assert registry.pending.name == "first"

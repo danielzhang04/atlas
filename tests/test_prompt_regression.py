@@ -244,3 +244,46 @@ def test_the_checked_in_file_roots_are_named_and_reach_the_schema_text():
     for name in ("find_file", "open_folder"):
         assert f"Roots: {', '.join(resolved)}." in schemas[name]["description"]
     assert set(resolved) <= configured
+
+
+def test_system_text_names_one_tool_for_two_named_actions():
+    """The prompt half of the supersede fix.
+
+    The host now refuses to read "create the draft and send it" as a yes; this
+    is what stops the model from answering the same sentence with two calls, or
+    with a draft it then claims to have sent. There is no send-a-draft tool,
+    so the only honest answer is the single tool that does both.
+    """
+    text = build_system_text()
+
+    assert (
+        "When Daniel names two actions one tool already does, call the single tool "
+        "that does both:\nsend_gmail_message writes and sends in one step. Draft only "
+        "when he says draft; there is no\nsend-a-draft tool."
+    ) in text
+    assert "Call independent tools together in one turn." in text
+
+
+def test_system_text_tells_the_model_to_relay_a_pending_collision_and_stop():
+    text = build_system_text()
+
+    assert (
+        "If a tool is refused because an action is still awaiting Daniel's yes or no, "
+        "relay that refusal\nexactly as the result words it, in one sentence, and stop; "
+        "call no other tool that turn."
+    ) in text
+
+
+def test_system_text_asks_for_a_word_when_the_host_cancelled_a_pending_action():
+    """H3(c): the host tells the model; the model tells Daniel.
+
+    The supersede path drops a readback Daniel was answering. He hears about
+    it only if the reply says so, and the model only knows because of the
+    [host: ...] note the brain injects for that turn.
+    """
+    text = build_system_text()
+
+    assert (
+        "A [host: ...] note is the host talking, not Daniel. If it says a pending "
+        "action was cancelled, say\nthat in one clause before you propose the new one."
+    ) in text

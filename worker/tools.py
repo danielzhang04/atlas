@@ -203,6 +203,27 @@ class PendingAction:
     host_state: Any = None
 
 
+_PENDING_COLLISION_SUMMARY_LIMIT = 120
+
+
+def _pending_collision(pending: PendingAction) -> str:
+    """Refuse a second confirm-tier call while one is still pending.
+
+    The refusal used to name no action and offer no way out ("a previous action
+    is still awaiting Daniel's yes or no"), so the model relayed a dead end:
+    Daniel heard that something was waiting but not WHAT, and neither he nor the
+    model could tell which answer would clear it. The pending's own readback
+    summary is already bounded when it is built and is trimmed again here, so
+    one collision cannot spend the reply on a wall of arguments.
+    """
+    summary = " ".join(str(pending.summary).split())[:_PENDING_COLLISION_SUMMARY_LIMIT]
+    detail = f": {summary}" if summary else ""
+    return (
+        f"a previous action is still awaiting Daniel's yes or no{detail}. "
+        "Ask him to confirm or cancel that one first."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Handle:
     path: str
@@ -386,10 +407,7 @@ class ToolRegistry:
             return ToolResult("error", "unknown tool")
         try:
             if tool.policy == "confirm" and self.pending is not None:
-                return ToolResult(
-                    "error",
-                    "a previous action is still awaiting Daniel's yes or no",
-                )
+                return ToolResult("error", _pending_collision(self.pending))
             copied = deepcopy(dict(arguments))
             # Exactly-one(path/handle/root) is settled BEFORE the taint gate,
             # because the taint gate's own reasoning depends on it: "a root-only
@@ -440,10 +458,7 @@ class ToolRegistry:
                 # "instant" going in (rule 5: one expiring, single-use
                 # pending action).
                 if self.pending is not None:
-                    return ToolResult(
-                        "error",
-                        "a previous action is still awaiting Daniel's yes or no",
-                    )
+                    return ToolResult("error", _pending_collision(self.pending))
                 # Large arguments CONDENSE the readback; they never refuse
                 # the call (BB-wave review, finding 5). The old refusal
                 # ("too large to read back; split it") was advice that

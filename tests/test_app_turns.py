@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import sqlite3
 from types import SimpleNamespace
@@ -1421,3 +1424,381 @@ def test_repeat_reflex_that_speaks_records_a_responded_outcome(tmp_path):
     with sqlite3.connect(tmp_path / "traces.db") as connection:
         outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
     assert outcome == "responded"
+
+
+# --- Unit DD-1: cancel really cancels, and a barge-in is not a failure ------
+
+
+def _confirm_registry():
+    async def _run(_arguments):
+        return "sent"
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="send_message",
+        description="Send a message.",
+        input_schema={"type": "object", "properties": {}},
+        run=_run,
+        policy="confirm",
+    ))
+    return registry
+
+
+def test_reflex_cancel_drops_the_pending_action_and_says_so():
+    """The reflex lane never reaches the brain, so it has to do this itself.
+
+    "cancel" used to stop the speech and the in-flight turn while leaving the
+    pending mutating action alive and unmentioned: Daniel heard nothing, and
+    the next plain "yes" -- about anything at all -- still had an action
+    waiting to consume it.
+    """
+    # The real cancel vocabulary from config/intents.yaml -- every phrase that
+    # reaches this lane has to clear the pending action, not just "cancel".
+    intents = {"cancel": {"phrases": ["cancel", "never mind", "stop"]}}
+    session = FakeSession()
+    publisher = StatePublisher()
+    registry = _confirm_registry()
+
+    async def scenario():
+        for phrase in ("cancel", "never mind", "stop"):
+            await registry.call("send_message", {})
+            assert registry.pending is not None
+            handled = await app._handle_reflex(
+                phrase,
+                intents=intents,
+                session=session,
+                publisher=publisher,
+                dismiss=lambda: None,
+                registry=registry,
+            )
+            assert handled is True
+            assert registry.pending is None
+
+    asyncio.run(scenario())
+    assert session.interruptions == 3
+    assert session.spoken == [app.PENDING_CANCELLED_REPLY] * 3
+    assert [(line["role"], line["text"]) for line in publisher.snapshot()["transcript"]] == [
+        ("user", "cancel"),
+        ("atlas", app.PENDING_CANCELLED_REPLY),
+        ("user", "never mind"),
+        ("atlas", app.PENDING_CANCELLED_REPLY),
+        ("user", "stop"),
+        ("atlas", app.PENDING_CANCELLED_REPLY),
+    ]
+
+
+def test_reflex_cancel_with_nothing_pending_stays_silent():
+    """Unchanged behavior: cancelling an in-flight turn says nothing."""
+    session = FakeSession()
+    publisher = StatePublisher()
+    registry = _confirm_registry()
+    cancelled = []
+
+    handled = asyncio.run(app._handle_reflex(
+        "cancel",
+        intents={"cancel": {"phrases": ["cancel"]}},
+        session=session,
+        publisher=publisher,
+        dismiss=lambda: None,
+        cancel_turn=lambda: cancelled.append(True),
+        registry=registry,
+    ))
+
+    assert handled is True
+    assert cancelled == [True]
+    assert session.interruptions == 1
+    assert session.spoken == []
+    assert [line["role"] for line in publisher.snapshot()["transcript"]] == ["user"]
+
+
+class BargeInBrain:
+    """A turn whose speech Daniel talked over: nothing said, flag set."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def respond(self, text, *, context=None):
+        from worker import traces as traces_mod
+
+        self.calls.append(text)
+        active = traces_mod.active_turn()
+        if active is not None:
+            traces_mod.mark_speech_interrupted(active[1])
+        if False:  # pragma: no cover - an async generator that yields nothing
+            yield ""
+
+
+def test_a_barge_in_is_not_apologised_for_and_is_recorded_as_interrupted(tmp_path):
+    from worker.traces import TraceRecorder
+
+    session = FakeSession()
+    publisher = StatePublisher()
+    engagement = Engagement(120)
+    engagement.wake()
+    recorder = TraceRecorder(tmp_path / "traces.db")
+
+    response = asyncio.run(app._handle_audio_turn(
+        "atlas what is the plan",
+        intents={},
+        brain=BargeInBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    recorder.close()
+
+    assert response == ""
+    # The empty stream reached the speaker and the host added nothing after it.
+    assert session.spoken == [[]]
+    assert app.brain_mod.EMPTY_TURN_REPLY not in session.spoken
+    assert [line["role"] for line in publisher.snapshot()["transcript"]] == ["user"]
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+    # Not "empty" -- and not silently downgraded to "other" either, which is
+    # what an outcome missing from the trace vocabulary would become.
+    assert outcome == "interrupted"
+
+
+def test_worker_file_log_is_bounded_and_warning_only(tmp_path):
+    handler = app._configure_worker_logging(tmp_path)
+    atlas_logger = logging.getLogger("atlas")
+    try:
+        assert isinstance(handler, RotatingFileHandler)
+        assert handler.maxBytes == 256 * 1024
+        assert handler.backupCount == 2
+        assert handler.level == logging.WARNING
+        assert Path(handler.baseFilename) == tmp_path / "Atlas" / "logs" / "worker.log"
+        assert handler in atlas_logger.handlers
+        # Replacing it leaves exactly one, and closes the old one.
+        second = app._configure_worker_logging(tmp_path)
+        tagged = [
+            existing for existing in atlas_logger.handlers
+            if getattr(existing, "_atlas_worker_file_handler", False)
+        ]
+        assert tagged == [second]
+    finally:
+        for existing in list(atlas_logger.handlers):
+            if getattr(existing, "_atlas_worker_file_handler", False):
+                atlas_logger.removeHandler(existing)
+                existing.close()
+
+
+def test_worker_file_log_keeps_host_shapes_and_not_what_daniel_said(tmp_path):
+    """Rule 10: the persisted line says WHAT happened, never what was said."""
+    utterance = "atlas read me the message from my accountant"
+    handler = app._configure_worker_logging(tmp_path)
+    atlas_logger = logging.getLogger("atlas")
+    engagement = Engagement(120)
+    engagement.wake()
+    try:
+        asyncio.run(app._submit_voice_turn(
+            utterance,
+            brain=FakeBrain(chunks=()),
+            session=FakeSession(),
+            publisher=StatePublisher(),
+            engagement=engagement,
+        ))
+        handler.flush()
+        payload = Path(handler.baseFilename).read_text(encoding="utf-8")
+    finally:
+        atlas_logger.removeHandler(handler)
+        handler.close()
+
+    assert "voice turn produced no speech; speaking the host fallback" in payload
+    assert "WARNING" in payload
+    assert utterance not in payload
+    assert "accountant" not in payload
+
+
+def _worker_log(tmp_path, emit):
+    handler = app._configure_worker_logging(tmp_path)
+    atlas_logger = logging.getLogger("atlas")
+    try:
+        emit()
+        handler.flush()
+        return Path(handler.baseFilename).read_text(encoding="utf-8")
+    finally:
+        atlas_logger.removeHandler(handler)
+        handler.close()
+
+
+def test_worker_file_log_never_persists_a_traceback(tmp_path):
+    """Rule 10 is a property of the FILE, not of 60 well-behaved call sites.
+
+    A traceback carries absolute source paths for the whole install tree plus
+    the original OSError text -- which is usually a path too. The console lane
+    still gets it; the file must not.
+    """
+    logger = logging.getLogger("atlas.probe")
+
+    def emit():
+        try:
+            raise PermissionError(r"C:\Users\danie\Atlas\config\atlas.yaml denied")
+        except PermissionError:
+            logger.exception("could not flush the job store during shutdown")
+
+    payload = _worker_log(tmp_path, emit)
+
+    assert "could not flush the job store during shutdown" in payload
+    assert "Traceback" not in payload
+    assert "PermissionError" not in payload
+    assert "atlas.yaml" not in payload
+    assert "danie" not in payload
+
+
+def test_worker_file_log_redacts_from_the_first_unsafe_token_to_end_of_message(tmp_path):
+    """Redaction runs to the end of the message, not over one token.
+
+    Windows paths have spaces in them ("Tax Returns 2025"), so redacting only
+    the token that carried the backslash left the half that actually says
+    something about Daniel sitting in the file.
+    """
+    logger = logging.getLogger("atlas.probe")
+
+    def emit():
+        logger.warning("skipping file root %s: directory is unavailable", r"C:\Users\danie\Desktop")
+        logger.warning("skipping file root %s", r"C:\Users\danie\Documents\Tax Returns 2025 Draft")
+        logger.warning("skipping file root %s: hidden directories are not roots", "~/.claude/projects")
+        logger.warning("mail from %s failed", "someone@example.test")
+        logger.warning("fetch of %s failed", "https://mail.example.test/inbox")
+        logger.warning("wake input failed; retrying in %.1f seconds (%d/%d)", 0.5, 1, 3)
+        logger.warning("overlong %s", "x" * 4_000)
+
+    payload = _worker_log(tmp_path, emit)
+
+    # The host's fixed prefix is written before the interpolation, so it
+    # survives; everything from the unsafe token onward does not.
+    assert "skipping file root <redacted>" in payload
+    assert "mail from <redacted>" in payload
+    assert "fetch of <redacted>" in payload
+    for leaked in (
+        "danie", "Desktop", "Documents", "Tax", "Returns", "2025", "Draft",
+        ".claude", "projects", "example.test", "https", "directory is unavailable",
+    ):
+        assert leaked not in payload
+    # A count is not a path: blunt redaction must not eat the useful part.
+    assert "retrying in 0.5 seconds (1/3)" in payload
+    # Every message is capped, so one huge record cannot push the useful
+    # history out of the rotation window on its own.
+    overlong = next(line for line in payload.splitlines() if " overlong " in line)
+    assert len(overlong.split(" atlas.probe ", 1)[1]) == app.WORKER_LOG_MESSAGE_LIMIT
+
+
+def test_worker_file_log_redacts_secret_shapes_as_defense_in_depth(tmp_path):
+    """Nothing in atlas.* should ever log one; the file does not rely on that."""
+    logger = logging.getLogger("atlas.probe")
+
+    def emit():
+        logger.warning("provider rejected key %s", "sk-ant-api03-EXAMPLENOTREAL")
+        logger.warning("auth header was %s", "Bearer EXAMPLENOTREALTOKEN")
+        logger.warning("session token %s expired", "eyJhbGciOiJIUzI1NiJ9.EXAMPLE")
+        logger.warning("pairing token %s rejected", "0123456789abcdef0123")
+
+    payload = _worker_log(tmp_path, emit)
+
+    assert payload.count("<redacted>") == 4
+    for leaked in ("sk-ant", "EXAMPLENOTREAL", "eyJ", "0123456789abcdef"):
+        assert leaked not in payload
+    # The host's own words still say what happened.
+    assert "provider rejected key <redacted>" in payload
+    assert "pairing token <redacted>" in payload
+
+
+# --- Unit DD-1 rework: a possible echo may stop speech, never a pending ----
+
+
+def test_reflex_cancel_mid_speech_stops_the_readback_but_keeps_the_pending():
+    """A one-token "stop" is never filtered as an echo -- by design.
+
+    livekit needs two words to interrupt, and a lone "stop" has to be able to
+    stop Atlas mid-sentence, so the echo guard passes it through. That makes
+    it exactly the word most likely to arrive as Atlas's own voice coming back
+    off the speakers -- which must not be allowed to destroy a single-use
+    mutating action nobody cancelled.
+    """
+    session = FakeSession()
+    publisher = StatePublisher()
+    registry = _confirm_registry()
+    cancelled = []
+
+    async def scenario():
+        await registry.call("send_message", {})
+        return await app._handle_reflex(
+            "stop",
+            intents={"cancel": {"phrases": ["cancel", "never mind", "stop"]}},
+            session=session,
+            publisher=publisher,
+            dismiss=lambda: None,
+            cancel_turn=lambda: cancelled.append(True),
+            registry=registry,
+            speaking_probe=lambda: True,
+        )
+
+    assert asyncio.run(scenario()) is True
+    # The speech stops and the in-flight turn is still cancelled...
+    assert session.interruptions == 1
+    assert cancelled == [True]
+    # ...but the readback Daniel was answering survives for an explicit
+    # follow-up in the quiet afterwards, and nothing was said about it.
+    assert registry.pending is not None
+    assert session.spoken == []
+    assert [line["role"] for line in publisher.snapshot()["transcript"]] == ["user"]
+
+
+def test_reflex_cancel_in_the_quiet_period_still_drops_the_pending():
+    session = FakeSession()
+    publisher = StatePublisher()
+    registry = _confirm_registry()
+
+    async def scenario():
+        await registry.call("send_message", {})
+        return await app._handle_reflex(
+            "cancel",
+            intents={"cancel": {"phrases": ["cancel", "never mind", "stop"]}},
+            session=session,
+            publisher=publisher,
+            dismiss=lambda: None,
+            registry=registry,
+            speaking_probe=lambda: False,
+        )
+
+    assert asyncio.run(scenario()) is True
+    assert registry.pending is None
+    assert session.spoken == [app.PENDING_CANCELLED_REPLY]
+
+
+def test_reflex_cancel_refreshes_the_addressing_window_when_it_speaks():
+    """"Cancelled." is a reply, so the follow-up needs no wake word."""
+    session = FakeSession()
+    publisher = StatePublisher()
+    engagement = Engagement(120)
+    engagement.wake()
+    addressing = Addressing(30, ("atlas",))
+    registry = _confirm_registry()
+
+    async def scenario():
+        await registry.call("send_message", {})
+        assert app._address_window_open(addressing) is False
+        brain = FakeBrain()
+        brain.registry = registry
+        await app._handle_audio_turn_inner(
+            "cancel",
+            intents={"cancel": {"phrases": ["cancel"]}},
+            brain=brain,
+            session=session,
+            publisher=publisher,
+            engagement=engagement,
+            addressing=addressing,
+            sleep=lambda announce=True: None,
+            source="typed",
+        )
+
+    asyncio.run(scenario())
+
+    assert registry.pending is None
+    assert session.spoken == [app.PENDING_CANCELLED_REPLY]
+    assert app._address_window_open(addressing) is True

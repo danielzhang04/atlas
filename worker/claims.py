@@ -71,6 +71,9 @@ _REFUSAL_ROUTES = (
     ("count_mail", "mail"), ("open", "open"),
 )
 logger = logging.getLogger("atlas.brain")
+# The claim label is already a verb from the closed action pattern; the cap
+# holds even if that pattern ever grows a longer alternative.
+_CLAIM_LABEL_LIMIT = 24
 
 
 class ClaimGuard:
@@ -114,7 +117,16 @@ class ClaimGuard:
     def evaluate(self, sentence: str, tool_evidence: list[tuple[str, bool]]) -> str | None:
         for claim in self._claims(sentence):
             if not any(ok and self._supports(name, claim) for name, ok in tool_evidence):
-                logger.warning("unbacked action claim suppressed (claim=%s)", claim)
+                # A label, never the model's sentence: this WARNING is now
+                # persisted (worker.log), and the sentence it suppressed is
+                # generated prose about Daniel's own request. The verb comes
+                # from the closed action pattern; the length is what is left
+                # of the diagnostic value.
+                logger.warning(
+                    "unbacked action claim suppressed (claim=%s chars=%d)",
+                    claim[:_CLAIM_LABEL_LIMIT],
+                    len(sentence),
+                )
                 if self._substituted:
                     # Item 6: only the first rebuttal is spoken. The caller
                     # (brain.py) emits it as the LAST chunk of the turn, so
