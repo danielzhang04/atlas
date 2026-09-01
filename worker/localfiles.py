@@ -14,7 +14,7 @@ from typing import Callable, Mapping, Sequence
 
 from .desktopapps import _launch_folder, known_folder_path
 
-__all__ = ["LocalFiles"]
+__all__ = ["LocalFiles", "resolve_file_roots"]
 logger = logging.getLogger("atlas.localfiles")
 _SKIPPED_DIRECTORIES = frozenset({".git", "node_modules", ".venv", "__pycache__"})
 _MAX_DEPTH = 6
@@ -372,6 +372,20 @@ class LocalFiles:
             )
         except TimeoutError:
             return {"error": _CLOUD_PLACEHOLDER_ERROR}
+
+
+def resolve_file_roots(
+    roots: Sequence[Path | str],
+    known_folder_resolver: Callable[[str], Path] = known_folder_path,
+) -> tuple[Path, ...]:
+    """Resolve a file_roots list (config/atlas.yaml) into existing directory
+    paths, exactly the way LocalFiles resolves its own roots (known: alias
+    handling included). Public so other consumers of the same file_roots
+    list -- currently the files MCP server's argv in worker/mcp_client.py --
+    share this one resolver instead of growing a second one that could
+    drift from it."""
+    resolved, _folders = LocalFiles._resolve_roots(roots, known_folder_resolver)
+    return resolved
 
 
 def _decode_text(raw: bytes, *, truncated: bool) -> str:

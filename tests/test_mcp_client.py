@@ -752,13 +752,65 @@ def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
     assert policy_for(server, defaults, "draft_gmail_message") == "confirm"
 
 
+def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation():
+    """Official @modelcontextprotocol/server-filesystem (Track C2): 9 reads
+    instant, the 4 mutations (write_file, edit_file, create_directory,
+    move_file) confirm by omission from instant: -- there is no delete tool
+    on this server at all, a structural guardrail rather than a policy
+    choice made here."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["files"]
+    defaults = config["defaults"]
+
+    assert server["domain"] == "files"
+    # enabled_from is consumed during spec-resolution (see
+    # _resolve_command_config); the checked-in atlas.yaml's non-empty
+    # file_roots resolves it to True here. The reference itself and its
+    # empty/malformed-file_roots behavior are covered directly by
+    # test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty
+    # and test_file_roots_reference_rejects_malformed_file_roots_config.
+    assert server["enabled"] is True
+    read_tools = {
+        "read_text_file", "read_media_file", "read_multiple_files",
+        "list_directory", "list_directory_with_sizes", "directory_tree",
+        "search_files", "get_file_info", "list_allowed_directories",
+    }
+    mutation_tools = {"write_file", "edit_file", "create_directory", "move_file"}
+    assert set(server["expose"]) == read_tools | mutation_tools
+    assert set(server["instant"]) == read_tools
+    assert "read_file" not in server["expose"]  # deprecated alias of read_text_file
+    assert "delete" not in {t.lower() for t in server["expose"]}
+    for name in read_tools:
+        assert policy_for(server, defaults, name) == "instant"
+    for name in mutation_tools:
+        # Neither in instant: (checked above) nor caught by instant_prefixes
+        # (write_/edit_/create_/move_ are not among get_/list_/search_/
+        # query_/read_/check_) -- confirmed by omission, not by
+        # never_instant (none of write_file/edit_file/create_directory/
+        # move_file contain a never_instant substring either).
+        assert not any(
+            name.startswith(prefix) for prefix in defaults["instant_prefixes"]
+        )
+        assert policy_for(server, defaults, name) == "confirm"
+    assert set(server["describe"]) == mutation_tools
+    for description in server["describe"].values():
+        assert "confirm" in description.lower() or "yes" in description.lower()
+
+
 def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path):
     """Net prompt surface: kb (32, a commented constant -- kb tools require a
     live bridge connection this test does not make; see
     handoffs/2026-08-27-atlas-xwave.md) + google (38->14) +
-    chrome-devtools (27->7) + built-in host tools (constructed here via the
-    real builtin()/register_count_mail() registration path, not guessed)
-    = 72, down from 116 (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0).
+    chrome-devtools (27->7) + files (13, Track C2) + built-in host tools
+    (constructed here via the real builtin()/register_count_mail()
+    registration path, not guessed) = 85. This is OVER the 72 C0 set
+    (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0), itself already
+    2-3x the ~30-50 model-accuracy threshold the survey named -- the plan's
+    Track C2 row prioritizes the files domain for this wave over holding
+    72, and flags 85 for a per-turn tool-projection follow-up (config/
+    mcp.yaml's top-of-file comment carries the same note). This test locks
+    in the actual number so a future change to it is a deliberate, visible
+    diff rather than a silent drift.
     """
     from worker.localfiles import LocalFiles
     from worker.tools import ToolRegistry, builtin, register_count_mail
@@ -766,8 +818,10 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
     google_expose = config["servers"]["google"]["expose"]
     chrome_expose = config["servers"]["chrome-devtools"]["expose"]
+    files_expose = config["servers"]["files"]["expose"]
     assert len(google_expose) == 14
     assert len(chrome_expose) == 7
+    assert len(files_expose) == 13
 
     class _FakeJob:
         job_id = "job"
@@ -799,9 +853,14 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
 
     KB_COUNT = 32  # commented constant: see docstring above
 
-    total = KB_COUNT + len(google_expose) + len(chrome_expose) + builtin_count
-    assert total <= 72
-    assert total < 116  # net new prompt surface must be negative
+    total = (
+        KB_COUNT + len(google_expose) + len(chrome_expose)
+        + len(files_expose) + builtin_count
+    )
+    # Track C2 (files) pushes the curated total from 72 to 85 -- over the
+    # C0 budget, flagged rather than hidden; see this test's docstring.
+    assert total == 85
+    assert total < 116  # still net negative against the pre-C0 baseline
 
 
 def test_blocked_server_tools_are_never_registered_or_callable():
@@ -1561,6 +1620,205 @@ def test_command_config_is_dormant_by_default_and_resolves_a_minimal_environment
         "PATH": "minimal-path",
         "SystemRoot": "C:/Windows",
     }
+
+
+# --- files: {file_roots} spec-resolution (Track C2) ----------------------
+
+
+def _files_mcp_yaml() -> str:
+    return (
+        "servers:\n"
+        "  files:\n"
+        '    command: [npx, "-y", "pkg", "{file_roots}"]\n'
+        "    enabled_from: file_roots.enabled\n"
+    )
+
+
+def test_file_roots_argv_token_expands_to_existing_directories_and_skips_missing_ones(
+    tmp_path,
+):
+    """{file_roots} in a command: server's argv resolves through the exact
+    same code path worker/runtime.py uses to build the built-in LocalFiles
+    tools (worker/localfiles.py's resolve_file_roots), so a directory that
+    doesn't exist is silently dropped from BOTH surfaces identically, not
+    just from one of them -- one allowlist, not two that could drift."""
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    missing = tmp_path / "missing"
+
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path.write_text(
+        f"file_roots:\n  - {kept}\n  - {missing}\n",
+        encoding="utf-8",
+    )
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["command"] == "npx"
+    assert server["args"] == ["-y", "pkg", str(kept.resolve())]
+    assert server["enabled"] is True
+    assert server["exact_environment"] is True
+
+
+def test_file_roots_argv_token_calls_the_same_resolver_localfiles_tools_use(
+    tmp_path, monkeypatch,
+):
+    """Proves the wiring, not just the outcome: the token expansion goes
+    through worker.localfiles.resolve_file_roots (patched here to a spy),
+    the identical function worker/runtime.py uses for the built-in
+    find_file/open_file/read_file tools -- confirming there is one resolver
+    behind both surfaces rather than a second implementation that merely
+    happens to agree with it today.
+
+    The spy is called twice with identical args: once expanding the argv's
+    {file_roots} token, and once more for enabled_from's file_roots.enabled
+    reference (adversarial review F1 -- enabled now reflects the RESOLVED
+    root count, not just the raw config strings, so it independently
+    re-resolves rather than trusting the argv expansion's result)."""
+    import worker.localfiles as localfiles_module
+
+    calls = []
+
+    def spy(roots):
+        calls.append(tuple(roots))
+        return (tmp_path,)
+
+    monkeypatch.setattr(localfiles_module, "resolve_file_roots", spy)
+
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path.write_text("file_roots: [known:Desktop, C:/extra]\n", encoding="utf-8")
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert calls == [("known:Desktop", "C:/extra")] * 2
+    assert server["args"] == ["-y", "pkg", str(tmp_path)]
+    assert server["enabled"] is True
+
+
+def test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty(tmp_path):
+    """The files server's enabled_from mirrors worker/runtime.py's own
+    `files = LocalFiles(raw_roots) if raw_roots else None` gate: an empty
+    or absent file_roots disables the MCP server exactly like it disables
+    the built-in localfiles tools, rather than needing a second config
+    flag someone could forget to keep in sync."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+
+    empty_atlas = tmp_path / "empty.yaml"
+    empty_atlas.write_text("{}\n", encoding="utf-8")
+    disabled = load_mcp_config(mcp_path, atlas_path=empty_atlas)
+    assert disabled["servers"]["files"]["enabled"] is False
+
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    nonempty_atlas = tmp_path / "nonempty.yaml"
+    nonempty_atlas.write_text(f"file_roots: [{kept}]\n", encoding="utf-8")
+    enabled = load_mcp_config(mcp_path, atlas_path=nonempty_atlas)
+    assert enabled["servers"]["files"]["enabled"] is True
+
+
+def test_file_roots_reference_rejects_malformed_file_roots_config(tmp_path):
+    """Same validation, and the same error text, worker/runtime.py raises
+    for a malformed file_roots -- one failure mode for the one config key,
+    not two independently-worded ones."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text("file_roots: not-a-list\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid Atlas configuration: file_roots"):
+        load_mcp_config(mcp_path, atlas_path=atlas_path)
+
+
+def test_file_roots_that_resolve_to_zero_directories_stay_not_configured(tmp_path):
+    """Adversarial review F1: a typo'd or unmounted file_roots entry is a
+    non-empty RAW list that resolves to zero real directories. Before this
+    fix, enabled_from only checked the raw strings, so this connected as
+    "healthy" even though the argv ended up as just [npx, -y, pkg] -- no
+    root args at all -- and every call would then fail "Access denied".
+    Gating on the RESOLVED count (mirroring LocalFiles.__init__'s own
+    `if not roots: raise ValueError` guard) makes this surface as
+    not_configured / "config entry missing" up front, and -- the
+    structural half of the fix -- forces enabled False even if some future
+    config mistake pointed enabled_from at an unrelated flag that reads
+    True, so the server is never spawned with a rootless argv."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    missing = tmp_path / "does_not_exist"
+    atlas_path.write_text(f"file_roots:\n  - {missing}\n", encoding="utf-8")
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["enabled"] is False
+    assert server["disabled_reason"] == "config_entry_missing"
+    assert server["args"] == ["-y", "pkg"]  # zero roots in the argv
+
+    def factory(_name, _spec):
+        raise AssertionError("files server was spawned with zero resolved roots")
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+    assert status == [{
+        "name": "files",
+        "connected": False,
+        "tools": 0,
+        "error": None,
+        "state": "not_configured",
+        "detail": "config entry missing",
+    }]
+
+
+def test_file_roots_with_one_resolvable_root_spawns_with_exactly_that_root(tmp_path):
+    """Companion to the zero-resolved-roots case above: a mix of one real
+    directory and one missing one still enables and spawns, with argv
+    containing only the directory that actually resolved."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    missing = tmp_path / "does_not_exist"
+    atlas_path.write_text(
+        f"file_roots:\n  - {kept}\n  - {missing}\n", encoding="utf-8",
+    )
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+    assert server["enabled"] is True
+    assert "disabled_reason" not in server
+
+    spawned = []
+
+    @asynccontextmanager
+    async def factory(name, spec):
+        spawned.append((name, spec))
+        yield SimpleNamespace(list_tools=lambda: asyncio.sleep(
+            0, result=SimpleNamespace(tools=[]),
+        ))
+
+    async def scenario():
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(FakeRegistry())
+        await servers.close()
+
+    asyncio.run(scenario())
+    assert len(spawned) == 1
+    name, spec = spawned[0]
+    assert name == "files"
+    assert spec.args == ["-y", "pkg", str(kept.resolve())]
 
 
 def test_kb_session_is_notified_after_initialize_and_on_refresh_without_logging(caplog):
