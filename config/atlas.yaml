@@ -28,6 +28,30 @@ work_workspace_path: "%LOCALAPPDATA%/Atlas/jobs"
 state_port: 4360
 stt_keyterms: [Atlas]
 
+# Self-barge-in (Atlas's own TTS output re-entering its mic and getting
+# transcribed as a fragmentary user turn that cuts playout short) is
+# actually fixed by worker.app.SpeechEchoGuard/AtlasAgent.stt_node, which
+# drops STT transcripts that echo what Atlas is currently saying -- not by
+# these three knobs. They are kept as harmless defense-in-depth, and their
+# REAL, measured semantics (read from the installed livekit-agents 1.6.6
+# source, not assumed) are weaker than the names suggest -- see the full
+# comment at the AgentSession construction in worker/app.py:
+#   - min_interruption_words: the only one of the three actually enforced
+#     on the STT interim-transcript path Atlas uses. Still just a word
+#     count floor -- a 3+ word echo fragment ("two fifty five") clears it.
+#   - min_interruption_duration_s: NOT enforced on that STT path at all;
+#     only affects a VAD-driven interruption, which STT turn detection
+#     barely exercises.
+#   - aec_warmup_duration_s: a ONE-SHOT grace period for the session's
+#     FIRST utterance only (livekit-agents permanently zeroes it after the
+#     first "speaking" transition) -- every later response gets none of it.
+# Validated on load by worker.app._voice_config, which raises on load if a
+# value is out of range.
+voice:
+  min_interruption_words: 2
+  min_interruption_duration_s: 0.8
+  aec_warmup_duration_s: 4.0
+
 traces: {enabled: true, path: "%LOCALAPPDATA%/Atlas/traces.db", retention_days: 30}
 pricing:
   # Source: https://docs.anthropic.com/en/docs/about-claude/pricing

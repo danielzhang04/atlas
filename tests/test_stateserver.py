@@ -754,6 +754,9 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
         def interrupt(self):
             return None
 
+        def on(self, *_args, **_kwargs):
+            return None
+
     class FakeServer:
         port = 4321
 
@@ -931,6 +934,9 @@ def test_entrypoint_wires_blocking_tool_into_real_state_server(monkeypatch):
         def interrupt(self):
             return None
 
+        def on(self, *_args, **_kwargs):
+            return None
+
     class FakeContext:
         room = object()
 
@@ -1093,6 +1099,9 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
 
             def interrupt(self):
                 events.append("session-interrupted")
+
+            def on(self, *_args, **_kwargs):
+                return None
 
         class FakeServer:
             port = 4321

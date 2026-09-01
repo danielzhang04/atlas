@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS steps (
     turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE, seq INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('ROUTE','GENERATE','TOOL_CALL','RESPOND')), name TEXT,
     ms INTEGER NOT NULL, ok INTEGER NOT NULL, tokens_in INTEGER NOT NULL,
-    tokens_out INTEGER NOT NULL, PRIMARY KEY (turn_id, seq)
+    tokens_out INTEGER NOT NULL, interrupted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (turn_id, seq)
 );
 CREATE INDEX IF NOT EXISTS turns_started_at ON turns(started_at);
 """
@@ -48,6 +49,12 @@ class _Turn:
     wake_kind: str
     steps: list[dict] = field(default_factory=list)
     ended: bool = False
+    # Set by mark_speech_interrupted() (from a SpeechHandle done-callback
+    # registered at speech_created time; see the diagnosis comment at the
+    # AgentSession construction in worker/app.py) before respond() records
+    # the RESPOND step, so respond() can read it off the turn without
+    # app.py's response funnel having to pass it through explicitly.
+    speech_interrupted: bool = False
 @dataclass
 class _SummaryRequest:
     cutoff: float
@@ -69,6 +76,16 @@ def activate(recorder: "TraceRecorder", turn: _Turn) -> Token:
     return _ACTIVE.set((recorder, turn))
 def reset(token: Token) -> None:
     _ACTIVE.reset(token)
+def active_turn() -> tuple["TraceRecorder", _Turn] | None:
+    """Expose the active (recorder, turn) pair for out-of-band session-level
+    hooks (e.g. a SpeechHandle done-callback registered at speech_created
+    time) that need to attribute a signal to the in-flight turn without
+    going through record_current_respond/generate/tool_call."""
+    return _ACTIVE.get()
+def mark_speech_interrupted(turn: _Turn) -> None:
+    """Record that a speech handle created during `turn` was interrupted;
+    read by TraceRecorder.respond() when it records the RESPOND step."""
+    turn.speech_interrupted = True
 def _current(method: str, *args, **metrics) -> None:
     active = _ACTIVE.get()
     if active is not None:
@@ -133,7 +150,7 @@ class TraceRecorder:
     def tool_call(self, turn: _Turn, name: str, *, ms: int, ok: bool) -> None:
         self._step(turn, "TOOL_CALL", self._name(name, self._tool_names), ms=ms, ok=ok)
     def respond(self, turn: _Turn, *, ms: int, ok: bool) -> None:
-        self._step(turn, "RESPOND", None, ms=ms, ok=ok)
+        self._step(turn, "RESPOND", None, ms=ms, ok=ok, interrupted=turn.speech_interrupted)
     def end_turn(self, turn: _Turn, *, addressed: bool, wake_kind: str,
                  outcome: str, total_ms: int | None = None) -> None:
         if not self.enabled:
@@ -165,7 +182,7 @@ class TraceRecorder:
         thread.join(max(0.0, min(float(timeout_s), 2.0)))
     def _step(self, turn: _Turn, kind: str, name: str | None, *, ms: int, ok: bool,
               tokens_in: int = 0, tokens_out: int = 0, cache_read_tokens: int = 0,
-              cache_write_tokens: int = 0) -> None:
+              cache_write_tokens: int = 0, interrupted: bool = False) -> None:
         if not self.enabled or turn.ended or len(turn.steps) >= 64:
             return
         turn.steps.append({
@@ -173,6 +190,7 @@ class TraceRecorder:
             "tokens_in": self._count(tokens_in), "tokens_out": self._count(tokens_out),
             "cache_read": self._count(cache_read_tokens),
             "cache_write": self._count(cache_write_tokens),
+            "interrupted": int(interrupted is True),
         })
     def _enqueue(self, item, *, after_close: bool = False) -> bool:
         with self._lock:
@@ -216,6 +234,15 @@ class TraceRecorder:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.executescript(_SCHEMA)
+            # CREATE TABLE IF NOT EXISTS leaves a pre-existing steps table
+            # (from before the `interrupted` column existed) untouched; add
+            # it explicitly so an existing traces.db from an older build
+            # doesn't hit a column-count mismatch on the next INSERT.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(steps)")}
+            if "interrupted" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0",
+                )
             cutoff = self._clock() - self._retention_days * 86_400
             connection.execute("DELETE FROM turns WHERE started_at < ?", (cutoff,))
             connection.commit()
@@ -227,9 +254,9 @@ class TraceRecorder:
             with connection:
                 connection.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
                 connection.executemany(
-                    "INSERT INTO steps VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO steps VALUES (?,?,?,?,?,?,?,?,?)",
                     ((row[0], seq, step["kind"], step["name"], step["ms"], step["ok"],
-                      step["tokens_in"], step["tokens_out"])
+                      step["tokens_in"], step["tokens_out"], step.get("interrupted", 0))
                      for seq, step in enumerate(steps, 1)),
                 )
             cutoff = self._local_midnight()
