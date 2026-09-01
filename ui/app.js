@@ -1934,4 +1934,18 @@
   refreshState();
   refreshJobs();
   updatePolling();
+
+  // Host-to-page only: the native title bar owns the window-control buttons in both window states
+  // (WM_NCHITTEST returns HTMINBUTTON/HTMAXBUTTON/HTCLOSE there), so CSS :hover never fires and
+  // worker/desktop.py mirrors its nonclient hover here. The click handlers above stay as the
+  // fallback for when that hook is not installed. The argument is one of "minimize", "maximize",
+  // "close" or "" and only toggles a class.
+  const NC_HOVER_BUTTONS = {
+    minimize: refs.windowMinimize, maximize: refs.windowMaximize, close: refs.windowClose,
+  };
+  root.__atlasNcHover = (state) => {
+    Object.entries(NC_HOVER_BUTTONS).forEach(([name, button]) => {
+      button.classList.toggle("is-nc-hover", name === state);
+    });
+  };
 })(globalThis);

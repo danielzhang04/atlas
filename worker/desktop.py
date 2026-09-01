@@ -43,9 +43,34 @@ SM_CXICON, SM_CYICON, SM_CXSMICON, SM_CYSMICON = 11, 12, 49, 50
 WS_CAPTION, WS_THICKFRAME = 0x00C00000, 0x00040000
 WS_MINIMIZEBOX, WS_MAXIMIZEBOX = 0x00020000, 0x00010000
 WM_NCCALCSIZE, WM_NCHITTEST, WM_NCDESTROY = 0x0083, 0x0084, 0x0082
+WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN = 0x00A0, 0x00A1
+WM_NCLBUTTONUP, WM_NCLBUTTONDBLCLK = 0x00A2, 0x00A3
+WM_NCMOUSELEAVE = 0x02A2
+WM_SIZE, WM_ACTIVATE, WM_KILLFOCUS, WM_CANCELMODE = 0x0005, 0x0006, 0x0008, 0x001F
+# Anything that ends the press gesture without a release over the same button: the pointer leaving
+# the frame, the window losing activation or focus, a mode-cancel (a modal dialog, an Alt+Tab, a
+# system drag), or the window changing size or state underneath the press.
+NC_PRESS_CANCEL_MESSAGES = (WM_NCMOUSELEAVE, WM_SIZE, WM_ACTIVATE, WM_KILLFOCUS, WM_CANCELMODE)
+HTCAPTION, HTMINBUTTON, HTMAXBUTTON, HTCLOSE = 2, 8, 9, 20
 HTLEFT, HTRIGHT, HTTOP = 10, 11, 12
 HTTOPLEFT, HTTOPRIGHT, HTBOTTOM = 13, 14, 15
 HTBOTTOMLEFT, HTBOTTOMRIGHT = 16, 17
+WM_SYSCOMMAND = 0x0112
+SC_MINIMIZE, SC_MAXIMIZE, SC_CLOSE, SC_RESTORE = 0xF020, 0xF030, 0xF060, 0xF120
+TME_LEAVE, TME_NONCLIENT = 0x0002, 0x0010
+# The custom title bar's geometry, in CSS pixels, mirroring ui/styles.css. Every constant below is
+# pinned against that stylesheet by tests/test_desktop.py so the two can never drift apart.
+USER_DEFAULT_SCREEN_DPI = 96
+TITLEBAR_HEIGHT_CSS_PX = 40           # :root { --header: 40px } sizes the .shell title bar row
+TITLEBAR_BUTTON_WIDTH_CSS_PX = 44     # .window-control { width: 44px }, three of them, flush right
+TITLEBAR_PADDING_LEFT_CSS_PX = 13     # .topbar { padding-left: .8rem } at the 16px root, rounded up
+TITLEBAR_BRAND_WIDTH_CSS_PX = 160     # .brand { max-width: 160px } - a clickable button, never caption
+TITLEBAR_NAV_WIDTH_CSS_PX = 280       # .topbar nav { max-width: 280px }, centred in the padded row
+TITLEBAR_BUTTON_CODES = (HTCLOSE, HTMAXBUTTON, HTMINBUTTON)  # outermost first, right to left
+NC_HOVER_NAMES = {HTMINBUTTON: "minimize", HTMAXBUTTON: "maximize", HTCLOSE: "close"}
+NC_HOVER_STATES = frozenset({"", *NC_HOVER_NAMES.values()})
+NC_HOVER_SCRIPT = "window.__atlasNcHover && window.__atlasNcHover('%s')"
+NC_HOVER_QUEUE_LIMIT = 32
 MONITOR_DEFAULTTONEAREST = 2
 SWP_FRAMECHANGED, SWP_NOACTIVATE = 0x0020, 0x0010
 SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER = 0x0002, 0x0001, 0x0004
@@ -57,6 +82,9 @@ class _WindowRect(ctypes.Structure): _fields_ = [(name, ctypes.c_long) for name 
 class _NCCalcSizeParams(ctypes.Structure): _fields_ = [("rects", _WindowRect * 3), ("window_pos", ctypes.c_void_p)]
 class _MonitorInfo(ctypes.Structure): _fields_ = [("size", wintypes.DWORD), ("monitor", _WindowRect),
                                                   ("work", _WindowRect), ("flags", wintypes.DWORD)]
+class _TrackMouseEvent(ctypes.Structure): _fields_ = [("size", wintypes.DWORD), ("flags", wintypes.DWORD),
+                                                      ("track", wintypes.HWND), ("hover_time", wintypes.DWORD)]
+class _Point(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 def _frameless_window_style(style: int) -> int:
     return (style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX) & ~WS_CAPTION
 def _resize_hit_test(x: int, y: int, bounds, border: int = 8) -> int | None:
@@ -67,6 +95,68 @@ def _resize_hit_test(x: int, y: int, bounds, border: int = 8) -> int | None:
     corners = {(HTLEFT, HTTOP): HTTOPLEFT, (HTRIGHT, HTTOP): HTTOPRIGHT,
                (HTLEFT, HTBOTTOM): HTBOTTOMLEFT, (HTRIGHT, HTBOTTOM): HTBOTTOMRIGHT}
     return corners.get((horizontal, vertical)) or horizontal or vertical
+def _scaled_px(css_px: int, dpi: int) -> int:
+    """Convert a CSS pixel length from ui/styles.css into this window's physical pixels.
+
+    One factor covers the whole conversion because all three coordinate spaces agree, whatever DPI
+    awareness the process ends up with. `GetDpiForWindow` answers in whatever space that awareness
+    virtualises screen coordinates into - which is the space a WM_NCHITTEST LPARAM and
+    `GetWindowRect` both speak - and pywebview's own logical-to-physical scale
+    (`winforms.BrowserView._scale`) is that same DPI over 96, which is the device scale factor
+    WebView2 lays CSS pixels out at. Today pywebview calls `SetProcessDPIAware()`, so that is the
+    system DPI on every monitor and Windows stretches the window on a differently scaled display;
+    under per-monitor awareness the same three spaces still move together. Multiplying a CSS length
+    by dpi/96 therefore lands in the units of the hit-test point either way. Rounding is per length,
+    so a zone edge can sit up to one physical pixel off the browser's own rounding - far inside the
+    margin between the excluded zones and the content they cover.
+    """
+    return round(css_px * dpi / USER_DEFAULT_SCREEN_DPI)
+def _window_dpi(hwnd, user32) -> int:
+    """The window's DPI, falling back to 96 when Windows will not answer."""
+    getter = getattr(user32, "GetDpiForWindow", None)
+    if getter is None: return USER_DEFAULT_SCREEN_DPI
+    try: dpi = int(getter(hwnd))
+    except Exception: return USER_DEFAULT_SCREEN_DPI
+    return dpi if dpi > 0 else USER_DEFAULT_SCREEN_DPI
+def _titlebar_button_spans(width: int, dpi: int) -> list[tuple[int, int, int]]:
+    """(hit code, left, right) client-x spans of the three window controls, outermost first."""
+    button = _scaled_px(TITLEBAR_BUTTON_WIDTH_CSS_PX, dpi)
+    return [(code, width - button * (index + 1), width - button * index)
+            for index, code in enumerate(TITLEBAR_BUTTON_CODES)]
+def _client_bounds(hwnd, user32):
+    """The client area in screen coordinates - the exact box ui/styles.css lays out inside.
+
+    Asking Windows beats deriving it. While restored this equals the window rect, because the
+    WM_NCCALCSIZE handler returns the proposed rect untouched; while maximized the same handler
+    clamps the client to the monitor work area and the window rect spills past it. Reading the
+    client rect directly is right in both states and stays right if that clamp ever changes.
+    """
+    rect, origin = _WindowRect(), _Point()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)): return None
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)): return None
+    return origin.x, origin.y, origin.x + rect.right, origin.y + rect.bottom
+def _titlebar_hit_test(x: int, y: int, bounds, dpi: int, *, buttons_only: bool = False) -> int | None:
+    """Nonclient code for a point over the custom title bar, or None to leave it to the page.
+
+    `x`, `y` and `bounds` are screen coordinates, `bounds` being the client area. The brand button
+    and the centred nav stay page-owned: they fall through as HTCLIENT, where the existing pywebview
+    drag region and click handlers still run. `buttons_only` drops the caption strip and keeps just
+    the three control rects - what a maximized window answers, so the Snap Layouts flyout still
+    appears over its restore button while dragging stays on the page's own path.
+    """
+    left, top, right, bottom = bounds
+    if not (left <= x < right and top <= y < bottom): return None
+    offset_x, offset_y, width = x - left, y - top, right - left
+    if offset_y >= _scaled_px(TITLEBAR_HEIGHT_CSS_PX, dpi): return None
+    for code, start, end in _titlebar_button_spans(width, dpi):
+        if start <= offset_x < end: return code
+    if buttons_only: return None
+    if offset_x < _scaled_px(TITLEBAR_PADDING_LEFT_CSS_PX + TITLEBAR_BRAND_WIDTH_CSS_PX, dpi): return None
+    # The nav sits in the centre column of a `1fr auto 1fr` grid inside the padded row, so its
+    # centre is (padding + width) / 2; both sides are doubled to stay in exact integers.
+    nav_centre_doubled = _scaled_px(TITLEBAR_PADDING_LEFT_CSS_PX, dpi) + width
+    if abs(2 * offset_x - nav_centre_doubled) < _scaled_px(TITLEBAR_NAV_WIDTH_CSS_PX, dpi): return None
+    return HTCAPTION
 def _rect_tuple(rect): return rect.left, rect.top, rect.right, rect.bottom
 def _client_rect(proposed, work_area, maximized: bool):
     if not maximized: return proposed
@@ -84,12 +174,29 @@ def _user32_functions():
     user32.SetWindowLongW.argtypes, user32.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
     user32.SetWindowPos.argtypes, user32.SetWindowPos.restype = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.BOOL
     user32.GetWindowRect.argtypes, user32.GetWindowRect.restype = [wintypes.HWND, ctypes.POINTER(_WindowRect)], wintypes.BOOL
+    user32.GetClientRect.argtypes, user32.GetClientRect.restype = [wintypes.HWND, ctypes.POINTER(_WindowRect)], wintypes.BOOL
+    user32.ClientToScreen.argtypes, user32.ClientToScreen.restype = [wintypes.HWND, ctypes.POINTER(_Point)], wintypes.BOOL
     user32.MonitorFromWindow.argtypes, user32.MonitorFromWindow.restype = [wintypes.HWND, wintypes.DWORD], wintypes.HANDLE
     user32.GetMonitorInfoW.argtypes, user32.GetMonitorInfoW.restype = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)], wintypes.BOOL
     user32.GetSystemMetrics.argtypes, user32.GetSystemMetrics.restype = [ctypes.c_int], ctypes.c_int
     user32.LoadImageW.argtypes, user32.LoadImageW.restype = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT], wintypes.HANDLE
     user32.SendMessageW.argtypes, user32.SendMessageW.restype = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.LPARAM
+    user32.PostMessageW.argtypes, user32.PostMessageW.restype = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL
+    # Both are optional: the title bar degrades to page-owned hover, or to 96 DPI, without them,
+    # so a missing export must never take the icon and frameless setup down with it.
+    with suppress(AttributeError):
+        user32.TrackMouseEvent.argtypes, user32.TrackMouseEvent.restype = [ctypes.POINTER(_TrackMouseEvent)], wintypes.BOOL
+    with suppress(AttributeError):  # GetDpiForWindow needs Windows 10 1607 or newer
+        user32.GetDpiForWindow.argtypes, user32.GetDpiForWindow.restype = [wintypes.HWND], wintypes.UINT
     return user32
+def _track_nonclient_mouse_leave(hwnd, user32) -> bool:
+    """Ask for one WM_NCMOUSELEAVE so the page can drop a stale nonclient hover."""
+    tracker = getattr(user32, "TrackMouseEvent", None)
+    if tracker is None: return False
+    request = _TrackMouseEvent(size=ctypes.sizeof(_TrackMouseEvent),
+                               flags=TME_LEAVE | TME_NONCLIENT, track=hwnd)
+    try: return bool(tracker(ctypes.byref(request)))
+    except Exception: return False
 def _set_app_user_model_id(*, shell32=None) -> None:
     try:
         if (shell32 or ctypes.windll.shell32).SetCurrentProcessExplicitAppUserModelID(
@@ -119,10 +226,134 @@ def _set_window_icon(window, *, user32=None, get_last_error=None) -> None:
         logger.info("window icon set")
     except Exception as error:
         logger.warning("could not set the Atlas Windows window icon: %s", _exception_detail(error))
-def _native_window_hook(native, user32):
+def _disable_page_zoom(window) -> None:
+    """Pin the page at 100% zoom, because every hit-test region assumes it.
+
+    The title-bar regions are computed from CSS pixel constants scaled by the window DPI. Page zoom
+    is a second, independent multiplier on top of that: ctrl+scroll would move the real buttons
+    while the host kept hit-testing the unzoomed rectangles, so the controls would drift out from
+    under the cursor. pywebview turns zoom on unconditionally
+    (`webview.platforms.edgechromium.EdgeChrome.on_webview_ready` sets
+    `IsZoomControlEnabled = True`) and exposes no setting for it, so this reaches the same supported
+    WebView2 property afterwards and turns it back off. Atlas is an app shell, not a browser page.
+
+    `CoreWebView2` does not exist until initialisation finishes, which can be after the window is
+    shown, so an uninitialised control is handled by subscribing to the completion event instead.
+    pywebview subscribes first, so its handler - and its `True` - always runs before this one. Every
+    step is feature-detected: on any mismatch one bounded INFO line is logged, page zoom stays live,
+    and the only consequence is the drift above, which the live checklist covers.
+    """
+    def skip(reason: str) -> None:
+        logger.info("page zoom control left enabled: %s", reason)
+    try:
+        webview_control = getattr(getattr(window.native, "browser", None), "webview", None)
+        if webview_control is None:
+            return skip("control")
+        def pin(*_args) -> None:
+            try:
+                core = webview_control.CoreWebView2
+                core.Settings.IsZoomControlEnabled = False
+                webview_control.ZoomFactor = 1.0
+                logger.info("page zoom control disabled")
+            except Exception as error:
+                skip(_exception_detail(error))
+        if webview_control.CoreWebView2 is None:
+            webview_control.CoreWebView2InitializationCompleted += pin
+        else:
+            pin()
+    except Exception as error:
+        skip(_exception_detail(error))
+class _NcHoverNotifier:
+    """Mirror nonclient title-bar hover onto the page, off the UI thread.
+
+    Once the window controls answer WM_NCHITTEST with their own codes, WebView2 never sees a mouse
+    move over them and CSS `:hover` stops firing, so the host has to say so. This is host-to-page
+    only and carries one of four fixed words, so no `js_api` surface is added (rule 9).
+
+    The work cannot happen inline in WndProc: pywebview's `evaluate_js` blocks on a semaphore that
+    is released from the UI thread's synchronisation context, so calling it from WndProc - which is
+    the UI thread - would deadlock the message pump. One lazily started daemon thread does the call
+    instead, and only when the hovered region actually changes, so idle mouse movement is free.
+    """
+
+    def __init__(self, evaluate_js: Callable[[str], object], *, thread_factory=Thread) -> None:
+        self._evaluate_js = evaluate_js
+        self._thread_factory = thread_factory
+        self._queue: Queue[str | None] = Queue(maxsize=NC_HOVER_QUEUE_LIMIT)
+        self._lock = Lock()
+        self._thread = None
+        self._state = ""
+        self._warned = False
+
+    def notify(self, state: str | None) -> None:
+        """Queue a hover state, or None once the window is gone, to stop the thread.
+
+        The queue is bounded because `evaluate_js` has no timeout: if the WebView2 is torn down
+        while a call is in flight - a `load_html` for the stopped or reconnecting page - the pump
+        can wait forever, and an unbounded queue would then grow for the rest of the session.
+        Whether the drop comes from a full queue or a thread that will not start, `_state` is rolled
+        back so the next real change is still sent rather than swallowed as a repeat.
+        """
+        if state is not None and state not in NC_HOVER_STATES:
+            state = ""
+        with self._lock:
+            if state == self._state or (state is None and self._thread is None):
+                return
+            previous, self._state = self._state, state
+            try:
+                if self._thread is None:
+                    # Starting a thread can fail outright - a thread limit, or an interpreter
+                    # already shutting down - and this runs on the WndProc path, where an escaping
+                    # exception would cross back into the CLR. Hover is cosmetic, so a failure
+                    # rolls the state back and drops the update instead of propagating.
+                    worker = self._thread_factory(target=self._pump, daemon=True)
+                    worker.start()
+                    self._thread = worker
+                self._queue.put_nowait(state)
+            except Exception:
+                self._state = previous
+                if not self._warned:
+                    self._warned = True
+                    logger.warning("could not mirror Atlas title bar hover onto the page")
+
+    def _pump(self) -> None:
+        while True:
+            state = self._queue.get()
+            if state is None:
+                return
+            with suppress(Exception):
+                self._evaluate_js(NC_HOVER_SCRIPT % state)
+def _native_window_hook(native, user32, notify_hover=None):
     from System import IntPtr
     from System.Windows.Forms import FormWindowState, NativeWindow
     hwnd = int(native.Handle.ToInt64())
+    hover = notify_hover if callable(notify_hover) else lambda _state: None
+    mouse = {"pressed": None}
+    def run_title_bar_command(code: int) -> None:
+        """Post the button's system command so it runs after WndProc returns, never nested.
+
+        Acting inline would be re-entrant. Closing is the worst case: pywebview's `closing` event is
+        built with `should_lock=True`, so its handlers run on the calling thread, which would put
+        the job query's loopback HTTP request and a modal confirmation dialog inside this
+        WM_NCLBUTTONUP frame, and would then deliver WM_NCDESTROY - releasing this hook's handle -
+        underneath a live WndProc frame for the same instance. A state change is milder but still
+        re-enters this WndProc through WM_NCCALCSIZE. Posting hands each button to DefWindowProc's
+        own system command from a clean message loop, exactly as the standard frame buttons do,
+        which also keeps the close confirmation and the maximized work-area clamp on their normal
+        paths. `WindowApi` reaches the same commands from the page thread through `Invoke`.
+        """
+        if code == HTMINBUTTON:
+            command = SC_MINIMIZE
+        elif code == HTCLOSE:
+            command = SC_CLOSE
+        else:
+            command = (SC_RESTORE if native.WindowState == FormWindowState.Maximized
+                       else SC_MAXIMIZE)
+        try:
+            if not user32.PostMessageW(hwnd, WM_SYSCOMMAND, command, 0):
+                raise OSError("PostMessageW failed")
+        except Exception as error:
+            logger.warning("could not run an Atlas title bar window command: %s", _exception_detail(error))
     class AtlasNativeWindow(NativeWindow):
         def WndProc(self, message):
             if message.Msg == WM_NCCALCSIZE:
@@ -138,20 +369,67 @@ def _native_window_hook(native, user32):
                             _rect_tuple(rect), _rect_tuple(info.work), True)
                 message.Result = IntPtr.Zero
                 return
-            if message.Msg == WM_NCHITTEST and native.WindowState != FormWindowState.Maximized:
-                rect = _WindowRect()
-                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    packed = message.LParam.ToInt64()
-                    x, y = ctypes.c_short(packed & 0xffff).value, ctypes.c_short((packed >> 16) & 0xffff).value
-                    hit = _resize_hit_test(x, y, _rect_tuple(rect))
-                    if hit is not None:
-                        message.Result = IntPtr(hit)
-                        return
+            if message.Msg == WM_NCHITTEST:
+                maximized = native.WindowState == FormWindowState.Maximized
+                packed = message.LParam.ToInt64()
+                x, y = ctypes.c_short(packed & 0xffff).value, ctypes.c_short((packed >> 16) & 0xffff).value
+                hit = None
+                if not maximized:  # a maximized window has no resize border to offer
+                    rect = _WindowRect()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        hit = _resize_hit_test(x, y, _rect_tuple(rect))
+                if hit is None:
+                    bounds = _client_bounds(hwnd, user32)
+                    if bounds is not None:
+                        hit = _titlebar_hit_test(x, y, bounds, _window_dpi(hwnd, user32),
+                                                 buttons_only=maximized)
+                if hit is not None:
+                    message.Result = IntPtr(hit)
+                    return
+            if message.Msg == WM_NCMOUSEMOVE:
+                hover(NC_HOVER_NAMES.get(message.WParam.ToInt64(), ""))
+                # Re-armed on every move, not once per entry: anything that takes the mouse capture
+                # cancels leave tracking, and DefWindowProc's caption move loop - the whole point of
+                # this change - does exactly that. Requesting again is idempotent and cheap, whereas
+                # a cancelled session would latch the last hover on until the next nonclient move.
+                _track_nonclient_mouse_leave(hwnd, user32)
+            elif message.Msg in NC_PRESS_CANCEL_MESSAGES:
+                # The gesture can end without a release over the button, and a latched press would
+                # otherwise fire on some unrelated later release.
+                mouse["pressed"] = None
+                if message.Msg == WM_NCMOUSELEAVE:
+                    hover("")
+            elif message.Msg == WM_NCLBUTTONDOWN:
+                # DefWindowProc would track these against the standard frame buttons, which this
+                # window does not have (WS_CAPTION is cleared), so it drives no SC_ command at all.
+                # Swallow the press and act on the matching release instead, the way Windows does.
+                code = message.WParam.ToInt64()
+                if code in NC_HOVER_NAMES:
+                    mouse["pressed"] = code
+                    message.Result = IntPtr.Zero
+                    return
+            elif message.Msg == WM_NCLBUTTONDBLCLK:
+                # The second click of a double-click arrives as DOWN, UP, DBLCLK, UP. Swallowing the
+                # DBLCLK without latching makes the pair act once - two SC_CLOSE would otherwise
+                # queue a second close behind the confirmation dialog. A double-click on the caption
+                # is untouched and still reaches DefWindowProc's maximize toggle.
+                if message.WParam.ToInt64() in NC_HOVER_NAMES:
+                    message.Result = IntPtr.Zero
+                    return
+            elif message.Msg == WM_NCLBUTTONUP:
+                code = message.WParam.ToInt64()
+                pressed, mouse["pressed"] = mouse["pressed"], None
+                if code in NC_HOVER_NAMES and code == pressed:
+                    message.Result = IntPtr.Zero
+                    hover("")
+                    run_title_bar_command(code)
+                    return
             if message.Msg == WM_NCDESTROY:
                 try:
                     super().WndProc(message)
                 finally:
                     self.ReleaseHandle()
+                    hover(None)
                     if _native_window_hooks.get(hwnd) is self: _native_window_hooks.pop(hwnd)
                 return
             super().WndProc(message)
@@ -175,7 +453,9 @@ def _configure_native_window(window, *, user32=None, hook_factory=_native_window
         set_error, get_error = set_last_error or ctypes.set_last_error, get_last_error or ctypes.get_last_error
         style = _frameless_window_style(_window_long(user32.GetWindowLongW, (hwnd, GWL_STYLE), set_error, get_error))
         _window_long(user32.SetWindowLongW, (hwnd, GWL_STYLE, style), set_error, get_error)
-        hook = hook_factory(native, user32)
+        evaluate_js = getattr(window, "evaluate_js", None)
+        hook = hook_factory(native, user32,
+                            _NcHoverNotifier(evaluate_js).notify if callable(evaluate_js) else None)
         flags = SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
         if not user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags):
             raise OSError("SetWindowPos failed")
@@ -769,6 +1049,7 @@ def _on_window_shown(proc, window, closing, restart) -> None:
                 def configure():
                     _set_window_icon(window)
                     _configure_native_window(window)
+                    _disable_page_zoom(window)
                 window.native.Invoke(Action(configure))
             except Exception as error:
                 detail = _exception_detail(error)
