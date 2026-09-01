@@ -770,12 +770,44 @@ def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
     assert policy_for(server, defaults, "draft_gmail_message") == "confirm"
 
 
-def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation():
-    """Official @modelcontextprotocol/server-filesystem (Track C2): 8 reads
-    instant, the 4 mutations (write_file, edit_file, create_directory,
-    move_file) confirm by omission from instant: -- there is no delete tool
-    on this server at all, a structural guardrail rather than a policy
-    choice made here."""
+def test_checked_in_google_config_localizes_exactly_the_three_gmail_read_tools():
+    """F5(e): the transform map decides which tool output gets its Date:
+    lines rewritten into Daniel's local time -- and BASE_SYSTEM tells the
+    model those lines are already local and must not be converted. The two
+    must not drift apart in either direction: a tool silently dropped from
+    this map would have the model repeating a sender's foreign timezone as
+    Daniel's, and a calendar tool added to it would rewrite date formatting
+    this transformer was never verified against. Nothing pinned the map.
+    """
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["google"]
+
+    assert server["transform"] == {
+        "search_gmail_messages": "local_time",
+        "get_gmail_message_content": "local_time",
+        "get_gmail_thread_content": "local_time",
+    }
+    # Every transformed tool is exposed (a map entry for a tool nobody can
+    # call is dead config), and no other server transforms anything.
+    for name in server["transform"]:
+        assert name in server["expose"]
+    others = {
+        name: cfg for name, cfg in config["servers"].items() if name != "google"
+    }
+    assert all("transform" not in cfg for cfg in others.values())
+
+
+def test_checked_in_files_config_is_write_only_and_confirms_every_mutation():
+    """Official @modelcontextprotocol/server-filesystem (Track C2), write-only
+    since the 2026-09-01 final gate (F3): the 4 mutations (write_file,
+    edit_file, create_directory, move_file) confirm by omission from
+    instant:, list_allowed_directories is the only instant tool, and NO read
+    tool is exposed at all -- its reads took a raw path with none of
+    localfiles.resolve's credential shield on it, over exactly the writable
+    roots (Downloads included) where credential-shaped files land. find_file
+    and read_file cover reads over a wider scope, with the shield. There is
+    no delete tool on this server at all, a structural guardrail rather than
+    a policy choice made here."""
     config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
     server = config["servers"]["files"]
     defaults = config["defaults"]
@@ -788,22 +820,21 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
     # test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty
     # and test_file_roots_reference_rejects_malformed_file_roots_config.
     assert server["enabled"] is True
+    # Every read tool the server ships. None of them may be exposed: each one
+    # reads a raw path under the writable roots with no credential shield.
     read_tools = {
-        "read_text_file", "read_multiple_files",
+        "read_file", "read_text_file", "read_media_file", "read_multiple_files",
         "list_directory", "list_directory_with_sizes", "directory_tree",
-        "search_files", "get_file_info", "list_allowed_directories",
+        "search_files", "get_file_info",
     }
     mutation_tools = {"write_file", "edit_file", "create_directory", "move_file"}
-    assert set(server["expose"]) == read_tools | mutation_tools
-    assert set(server["instant"]) == read_tools
-    assert "read_file" not in server["expose"]  # deprecated alias of read_text_file
-    # BB-wave review, finding 11: read_media_file returns base64 image/audio
-    # through the same 4096-char _MAX_CONTENT bound as every other MCP
-    # result, so it can only ever deliver a truncated, unusable fragment.
-    assert "read_media_file" not in server["expose"]
+    assert set(server["expose"]) == mutation_tools | {"list_allowed_directories"}
+    assert set(server["instant"]) == {"list_allowed_directories"}
+    assert read_tools.isdisjoint(server["expose"])
     assert "delete" not in {t.lower() for t in server["expose"]}
-    for name in read_tools:
-        assert policy_for(server, defaults, name) == "instant"
+    # list_allowed_directories is not a read of Daniel's files: its entire
+    # response is the CLI allowlist this host passed the server itself.
+    assert policy_for(server, defaults, "list_allowed_directories") == "instant"
     for name in mutation_tools:
         # Neither in instant: (checked above) nor caught by instant_prefixes
         # (write_/edit_/create_/move_ are not among get_/list_/search_/
@@ -814,19 +845,12 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
             name.startswith(prefix) for prefix in defaults["instant_prefixes"]
         )
         assert policy_for(server, defaults, name) == "confirm"
-    # Every mutation's description states the confirm gate; the two read
-    # overrides (BB-wave review, finding 11) state the limits that make a
-    # naive call useless -- read_text_file's 4KB truncation, and that
-    # search_files' plain paths are not the handles open_file/open_folder
-    # need after a tainting read.
-    assert set(server["describe"]) == mutation_tools | {"read_text_file", "search_files"}
+    # Every mutation's description states the confirm gate. The two read
+    # overrides went with the read tools themselves (F3).
+    assert set(server["describe"]) == mutation_tools
     for name in mutation_tools:
         description = server["describe"][name].lower()
         assert "confirm" in description or "yes" in description
-    assert "4kb" in server["describe"]["read_text_file"].lower()
-    assert "launch_work" in server["describe"]["read_text_file"]
-    assert "find_file" in server["describe"]["search_files"]
-    assert "handle" in server["describe"]["search_files"].lower()
 
     # Blocker 2 (write scope): this server -- the only component with write
     # tools -- is started with file_write_roots, NOT file_roots, so the kb
@@ -844,10 +868,21 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
     )
     assert atlas["file_write_roots"] == ["known:Desktop", "known:Documents", "known:Downloads"]
     # The write list is a strict subset of the read list, and kb is in the
-    # difference -- the whole point of the split.
-    assert set(atlas["file_write_roots"]) < set(atlas["file_roots"])
+    # difference -- the whole point of the split. Read entries may be either a
+    # bare path string or the {path:, name:} naming form, so both are reduced
+    # to their path before comparing.
+    read_paths = {
+        root["path"] if isinstance(root, dict) else root
+        for root in atlas["file_roots"]
+    }
+    assert set(atlas["file_write_roots"]) < read_paths
     assert not any("kb" in root.casefold() for root in atlas["file_write_roots"])
-    assert any("kb" in root.casefold() for root in atlas["file_roots"])
+    assert any("kb" in root.casefold() for root in read_paths)
+    # Widening the READ scope to all of home must never widen the WRITE scope:
+    # the home root is a read entry only, and writes stay the three known
+    # folders the server is actually spawned with.
+    assert {"path": "C:/Users/danie", "name": "home"} in atlas["file_roots"]
+    assert not any("danie" == Path(root).name for root in atlas["file_write_roots"])
     # The resolved argv the server actually spawns with contains no kb path.
     assert not any("kb" in argument.casefold() for argument in server["args"])
 
@@ -856,10 +891,11 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     """Net prompt surface: kb (32, a commented constant -- kb tools require a
     live bridge connection this test does not make; see
     handoffs/2026-08-27-atlas-xwave.md) + google (38->14) +
-    chrome-devtools (27->7) + files (12, Track C2 minus read_media_file --
-    BB-wave review finding 11) + built-in host tools (constructed here via
-    the real builtin()/register_count_mail() registration path, not
-    guessed) = 84. This is OVER the 72 C0 set
+    chrome-devtools (27->7) + files (14->5: write-only after the 2026-09-01
+    final gate, F3 -- 4 mutations plus list_allowed_directories, every read
+    tool dropped as a credential-shield bypass) + built-in host tools
+    (constructed here via the real builtin()/register_count_mail()
+    registration path, not guessed) = 77. This is OVER the 72 C0 set
     (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0), itself already
     2-3x the ~30-50 model-accuracy threshold the survey named -- the plan's
     Track C2 row prioritizes the files domain for this wave over holding
@@ -877,7 +913,7 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     files_expose = config["servers"]["files"]["expose"]
     assert len(google_expose) == 14
     assert len(chrome_expose) == 7
-    assert len(files_expose) == 12
+    assert len(files_expose) == 5
 
     class _FakeJob:
         job_id = "job"
@@ -913,10 +949,11 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
         KB_COUNT + len(google_expose) + len(chrome_expose)
         + len(files_expose) + builtin_count
     )
-    # Track C2 (files) pushes the curated total from 72 to 84 -- over the
-    # C0 budget, flagged rather than hidden; see this test's docstring.
+    # Track C2 (files) pushed the curated total from 72 to 84; F3's
+    # write-only files server brings it back to 77 -- still over the C0
+    # budget, flagged rather than hidden; see this test's docstring.
     assert builtin_count == 19
-    assert total == 84
+    assert total == 77
     assert total < 116  # still net negative against the pre-C0 baseline
 
 
@@ -2887,6 +2924,174 @@ def test_describe_rejects_a_non_string_empty_or_malformed_map():
         mcp_client._tool_description({"describe": ["not", "a", "map"]}, "widget", "remote")
 
 
+# --- transform: -------------------------------------------------------
+
+def test_transform_absent_returns_none():
+    assert mcp_client._tool_transform({}, "widget") is None
+
+
+def test_transform_resolves_a_known_name_to_the_named_transformer():
+    assert (
+        mcp_client._tool_transform({"transform": {"widget": "local_time"}}, "widget")
+        is mcp_client._local_time_transform
+    )
+    # A tool not named in the map is untouched even when transform: is present.
+    assert mcp_client._tool_transform({"transform": {"other": "local_time"}}, "widget") is None
+
+
+def test_transform_rejects_an_unknown_transformer_name():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": {"widget": "not_a_real_transformer"}}, "widget")
+
+
+def test_transform_rejects_a_non_string_value():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": {"widget": 7}}, "widget")
+
+
+def test_transform_rejects_a_non_mapping_top_level_config():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": ["not", "a", "map"]}, "widget")
+
+
+def test_transform_is_applied_on_the_mirrored_run_before_bounded_text():
+    class FakeSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(
+                    type="text",
+                    text="Subject: hi\nDate: Mon, 31 Aug 2026 16:55:00 -0700\nFrom: a@b.test",
+                )],
+                isError=False,
+            )
+
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "google",
+        {"transform": {"widget": "local_time"}},
+        {},
+        FakeSession(),
+        SimpleNamespace(
+            name="widget", description="d",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+
+    result = asyncio.run(tool.run({}))
+
+    assert "-0700" not in result
+    assert "Date: Mon, 31 Aug 2026" in result
+    assert "Subject: hi" in result
+    assert "From: a@b.test" in result
+
+
+def _date_server() -> FastMCP:
+    server = FastMCP("test-date")
+
+    @server.tool(description="Search Gmail messages.")
+    def search_gmail_messages(query: str) -> str:
+        return f"Found 1 messages matching '{query}':\nDate: Mon, 31 Aug 2026 16:55:00 -0700"
+
+    return server
+
+
+def test_transform_applies_only_on_the_mirrored_path_call_raw_stays_untouched():
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "command": "unused",
+                        "instant": ["search_gmail_messages"],
+                        "transform": {"search_gmail_messages": "local_time"},
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_date_server()),
+        )
+        await servers.connect(registry)
+        tool = registry.tools[0]
+        mirrored = await tool.run({"query": "x"})
+        raw = await servers.call_raw("google", "search_gmail_messages", {"query": "x"})
+        await servers.close()
+        return mirrored, raw
+
+    mirrored, raw = asyncio.run(scenario())
+
+    assert raw == "Found 1 messages matching 'x':\nDate: Mon, 31 Aug 2026 16:55:00 -0700"
+    assert "-0700" not in mirrored
+    assert mirrored != raw
+
+
+def test_local_time_transform_rewrites_a_foreign_offset_date_line_to_local():
+    from email.utils import parsedate_to_datetime
+
+    raw_date = "Mon, 31 Aug 2026 16:55:00 -0700"
+    expected_local = parsedate_to_datetime(raw_date).astimezone().strftime("%a, %d %b %Y %I:%M %p")
+    text = f"Subject: hi\nDate: {raw_date}\nFrom: a@b.test\n"
+
+    result = mcp_client._local_time_transform(text)
+
+    assert f"Date: {expected_local} " in result
+    assert raw_date not in result
+    assert "Subject: hi" in result
+    assert "From: a@b.test" in result
+
+
+def test_local_time_transform_passes_unparseable_date_lines_through_byte_identical():
+    text = "Date: not a real date at all\nOther-Header: kept\n"
+    assert mcp_client._local_time_transform(text) == text
+
+
+def test_local_time_transform_leaves_a_date_with_no_offset_unchanged():
+    # No numeric/named offset to convert from -- ambiguous, so left as-is.
+    text = "Date: Mon, 31 Aug 2026 16:55:00\n"
+    assert mcp_client._local_time_transform(text) == text
+
+
+def test_local_time_transform_is_idempotent():
+    text = "Date: Mon, 31 Aug 2026 16:55:00 -0700\n"
+    once = mcp_client._local_time_transform(text)
+    twice = mcp_client._local_time_transform(once)
+    assert twice == once
+
+
+def test_local_time_transform_rewrites_every_date_line_in_a_multi_message_thread_dump():
+    # get_gmail_thread_content's real shape (gmail/gmail_tools.py:_format_
+    # thread_content) repeats "=== Message N ===\nFrom: ...\nDate: ..." once
+    # per message in the thread -- every Date: line must be rewritten, not
+    # just the first one a naive .sub(count=1) or non-global replace would
+    # catch.
+    from email.utils import parsedate_to_datetime
+
+    raw_dates = [
+        "Mon, 31 Aug 2026 16:55:00 -0700",
+        "Tue, 01 Sep 2026 09:10:00 +0900",
+        "Tue, 01 Sep 2026 03:00:00 +0000",
+    ]
+    expected = [
+        parsedate_to_datetime(raw).astimezone().strftime("%a, %d %b %Y %I:%M %p")
+        for raw in raw_dates
+    ]
+    text = "Thread ID: t1\nSubject: hi\nMessages: 3\n\n" + "\n\n".join(
+        f"=== Message {i} ===\nFrom: sender{i}@example.com\nDate: {raw}\nTo: daniel@example.com"
+        for i, raw in enumerate(raw_dates, 1)
+    )
+
+    result = mcp_client._local_time_transform(text)
+
+    for raw, exp in zip(raw_dates, expected):
+        assert raw not in result
+        assert f"Date: {exp} " in result
+    # Message count and structure around the Date: lines are untouched.
+    assert result.count("=== Message") == 3
+    assert "From: sender1@example.com" in result
+    assert "From: sender2@example.com" in result
+    assert "From: sender3@example.com" in result
+
+
 # --- domain: ---------------------------------------------------------------
 
 def test_domain_is_stored_on_mirrored_tools_when_configured():
@@ -3100,3 +3305,72 @@ def test_missing_exposed_tools_helper_is_bounded_and_names_only():
     assert mcp_client._missing_exposed_tools(
         frozenset({"kept", "gone", "also_gone"}), listed,
     ) == ("also_gone", "gone")
+
+
+# --- content_bearing: -------------------------------------------------------
+
+def _mirrored(server_cfg, name="widget"):
+    servers = McpServers({"servers": {}})
+    return servers._mirror_tool(
+        "demo", server_cfg, {}, SimpleNamespace(),
+        SimpleNamespace(
+            name=name, description="d",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+
+
+def test_content_bearing_defaults_true_for_every_unconfigured_mcp_tool():
+    # Fail closed: an unlisted remote tool is assumed to return text Atlas did
+    # not author, which is the premise the taint wall rests on.
+    assert mcp_client._tool_content_bearing({}, "widget") is True
+    assert mcp_client._tool_content_bearing({"content_bearing": {}}, "widget") is True
+    assert mcp_client._tool_content_bearing(
+        {"content_bearing": {"other": False}}, "widget",
+    ) is True
+    assert _mirrored({}).content_bearing is True
+
+
+def test_content_bearing_config_can_mark_one_tool_host_authored():
+    server_cfg = {"content_bearing": {"list_allowed_directories": False}}
+
+    assert mcp_client._tool_content_bearing(
+        server_cfg, "list_allowed_directories",
+    ) is False
+    # Marking one tool never leaks to its neighbours on the same server.
+    assert mcp_client._tool_content_bearing(server_cfg, "read_text_file") is True
+    assert _mirrored(server_cfg, "list_allowed_directories").content_bearing is False
+    assert _mirrored(server_cfg, "read_text_file").content_bearing is True
+
+
+@pytest.mark.parametrize(
+    "value", ["false", 0, 1, None, [], {}, "no"],
+)
+def test_content_bearing_rejects_anything_that_is_not_a_bool(value):
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": {"widget": value}}, "widget")
+
+
+def test_content_bearing_rejects_a_malformed_map():
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": ["not", "a", "map"]}, "widget")
+    with pytest.raises(ValueError, match="content_bearing"):
+        mcp_client._tool_content_bearing({"content_bearing": "false"}, "widget")
+
+
+def test_checked_in_files_config_untaints_only_list_allowed_directories():
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "mcp.yaml").read_text(encoding="utf-8"),
+    )["servers"]
+    files = raw["files"]
+
+    # Exactly one tool, on exactly one server, is declared host-authored --
+    # and it is the one whose whole response is this host's own CLI argv.
+    assert files["content_bearing"] == {"list_allowed_directories": False}
+    assert all("content_bearing" not in server for name, server in raw.items()
+               if name != "files")
+    # Every other exposed files tool keeps tainting (all mutations now: the
+    # read tools are gone entirely, F3).
+    for tool in files["expose"]:
+        expected = tool != "list_allowed_directories"
+        assert mcp_client._tool_content_bearing(files, tool) is expected

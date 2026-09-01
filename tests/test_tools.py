@@ -1369,12 +1369,76 @@ def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
     assert launched == [str(root.resolve()), str(allowed.resolve())]
 
 
-def test_count_mail_sums_pages_and_accepts_both_token_shapes():
+# count_mail counts DISTINCT Gmail thread ids (conversations), matching what
+# Daniel's Gmail UI shows -- not message lines. These fixtures mirror the
+# real search_gmail_messages text shape (workspace-mcp 1.25.2,
+# gmail/gmail_tools.py:_format_gmail_results_plain): a "📧 MESSAGES:" section
+# with one "  N. Message ID: ..." block per message, each carrying its own
+# "     Thread ID: <id>" line, plus a trailing pagination line.
+#
+# The pagination line matters: the REAL server (gmail_tools.py:1583-1587)
+# emits the token mid-sentence -- "...call search_gmail_messages again with
+# page_token='<token>'" -- not a line-anchored "page_token: <token>". An
+# earlier version of these fixtures used only the line-anchored shape, which
+# _NEXT_PAGE_TOKEN never actually saw from the real server: bounded_count
+# silently stopped after page 1 for every >500-message query and reported
+# exact:true (adversarial review, finding 2). token_style="real" (the
+# default) is what every multi-page test below now exercises; the two
+# line-anchored styles are kept only to prove the regex's legacy alternates
+# still work (see test_count_mail_sums_pages_and_accepts_both_token_shapes).
+def _gmail_search_page(
+    query: str,
+    thread_ids: list[str],
+    *,
+    next_token: str | None = None,
+    token_style: str = "real",
+) -> str:
+    lines = [f"Found {len(thread_ids)} messages matching '{query}':", "", "\U0001F4E7 MESSAGES:"]
+    for i, thread_id in enumerate(thread_ids, 1):
+        message_id = f"msg-{thread_id}-{i}"
+        lines.extend([
+            f"  {i}. Message ID: {message_id}",
+            "     Subject: Test subject",
+            "     From: sender@example.com",
+            "     Date: Mon, 31 Aug 2026 16:55:00 -0700",
+            f"     Web Link: https://mail.google.com/mail/u/0/#inbox/{message_id}",
+            f"     Thread ID: {thread_id}",
+            f"     Thread Link: https://mail.google.com/mail/u/0/#inbox/{thread_id}",
+            "",
+        ])
+    lines.extend([
+        "\U0001F4A1 USAGE:",
+        "  • Pass the Message IDs as a list to get_gmail_messages_content_batch()",
+    ])
+    if next_token:
+        lines.append("")
+        if token_style == "real":
+            lines.append(
+                "\U0001F4C4 PAGINATION: To get the next page, call search_gmail_messages "
+                f"again with page_token='{next_token}'"
+            )
+        else:
+            prefix = "Next page token" if token_style == "next_page_token" else "page_token"
+            lines.append(f"{prefix}: {next_token}")
+    return "\n".join(lines)
+
+
+def test_count_mail_sums_pages_and_accepts_the_real_and_legacy_token_shapes():
+    # Page 1 uses the real workspace-mcp 1.25.2 pagination line (mid-sentence
+    # page_token='...'); page 2 uses one of the line-anchored legacy shapes
+    # the regex keeps as an alternate. Both must be parsed for the walk to
+    # reach page 3.
     calls = []
     responses = [
-        "Found 500 messages matching 'label:archive':\n1. first\nNext page token: token-2",
-        "Found 500 messages matching 'label:archive':\n1. next\npage_token: token-3",
-        "Found 17 messages matching 'label:archive':\n1. last",
+        _gmail_search_page(
+            "label:archive", [f"p1-{i}" for i in range(500)],
+            next_token="token-2", token_style="real",
+        ),
+        _gmail_search_page(
+            "label:archive", [f"p2-{i}" for i in range(500)],
+            next_token="token-3", token_style="page_token",
+        ),
+        _gmail_search_page("label:archive", [f"p3-{i}" for i in range(17)]),
     ]
 
     async def search(arguments):
@@ -1386,7 +1450,9 @@ def test_count_mail_sums_pages_and_accepts_both_token_shapes():
 
     result = _call(registry, "count_mail", {"query": "label:archive"})
 
-    assert json.loads(result.content) == {"query": "label:archive", "count": 1017, "exact": True}
+    assert json.loads(result.content) == {
+        "query": "label:archive", "conversations": 1017, "exact": True,
+    }
     assert calls == [
         {
             "query": "label:archive",
@@ -1411,8 +1477,8 @@ def test_count_mail_sums_pages_and_accepts_both_token_shapes():
 def test_count_mail_reports_inbox_and_primary_with_two_bounded_searches():
     calls = []
     responses = [
-        "Found 61 messages matching 'in:inbox':\n1. first",
-        "Found 14 messages matching 'in:inbox category:primary':\n1. first",
+        _gmail_search_page("in:inbox", [f"inbox-{i}" for i in range(61)]),
+        _gmail_search_page("in:inbox category:primary", [f"primary-{i}" for i in range(14)]),
     ]
 
     async def search(arguments):
@@ -1424,7 +1490,7 @@ def test_count_mail_reports_inbox_and_primary_with_two_bounded_searches():
 
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
-    assert result == ToolResult("ok", "61 in your inbox, 14 in Primary")
+    assert result == ToolResult("ok", "61 conversations in your inbox, 14 in Primary")
     assert [call["query"] for call in calls] == [
         "in:inbox",
         "in:inbox category:primary",
@@ -1438,10 +1504,11 @@ def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
 
     async def search(arguments):
         calls.append(arguments)
-        token = len(calls) + 1
-        return (
-            f"Found 500 messages matching 'label:archive':\n"
-            f"Next page token: token-{token}"
+        page = len(calls)
+        return _gmail_search_page(
+            "label:archive",
+            [f"p{page}-{i}" for i in range(500)],
+            next_token=f"token-{page + 1}",
         )
 
     registry = ToolRegistry()
@@ -1449,7 +1516,9 @@ def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
 
     result = _call(registry, "count_mail", {"query": "label:archive"})
 
-    assert json.loads(result.content) == {"query": "label:archive", "count": 2000, "exact": False}
+    assert json.loads(result.content) == {
+        "query": "label:archive", "conversations": 2000, "exact": False,
+    }
     assert len(calls) == 4
 
 
@@ -1486,11 +1555,14 @@ def test_count_mail_reports_when_google_is_not_connected():
     )
 
 
-def test_count_mail_stops_inexactly_when_a_page_token_repeats():
-    responses = [
-        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
-        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
-    ]
+def test_count_mail_stops_inexactly_when_a_page_token_repeats_and_dedupes_the_repeated_page():
+    # A repeated page_token means the same page was handed back twice --
+    # since the same 500 thread ids appear on both "pages", the distinct
+    # count must not double-count them (500, not 1000).
+    page = _gmail_search_page(
+        "label:archive", [f"dup-{i}" for i in range(500)], next_token="repeated",
+    )
+    responses = [page, page]
 
     async def search(_arguments):
         return responses.pop(0)
@@ -1502,14 +1574,46 @@ def test_count_mail_stops_inexactly_when_a_page_token_repeats():
 
     assert json.loads(result.content) == {
         "query": "label:archive",
-        "count": 1000,
+        "conversations": 500,
         "exact": False,
+    }
+
+
+def test_count_mail_accumulates_distinct_threads_that_span_pages_without_double_counting():
+    # A conversation's messages can land on either side of a search page
+    # boundary; the same thread id showing up on page 1 and page 2 must
+    # still count as one conversation.
+    page1 = _gmail_search_page(
+        "label:archive",
+        ["shared"] + [f"p1-{i}" for i in range(499)],
+        next_token="token-2",
+    )
+    page2 = _gmail_search_page(
+        "label:archive", ["shared"] + [f"p2-{i}" for i in range(16)],
+    )
+    responses = [page1, page2]
+
+    async def search(_arguments):
+        return responses.pop(0)
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:archive"})
+
+    # 500 distinct on page 1 + 16 new on page 2 (the 17th, "shared", already counted).
+    assert json.loads(result.content) == {
+        "query": "label:archive",
+        "conversations": 516,
+        "exact": True,
     }
 
 
 def test_count_mail_rejects_a_next_token_after_a_partial_page():
     async def search(_arguments):
-        return "Found 17 messages matching 'in:inbox':\nNext page token: invalid"
+        return _gmail_search_page(
+            "in:inbox", [f"t{i}" for i in range(17)], next_token="invalid",
+        )
 
     registry = ToolRegistry()
     register_count_mail(registry, search)
@@ -1517,6 +1621,35 @@ def test_count_mail_rejects_a_next_token_after_a_partial_page():
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
     assert result == ToolResult("error", "unexpected mail search result")
+
+
+def test_count_mail_fails_closed_when_a_page_has_messages_but_no_thread_id_lines():
+    async def search(_arguments):
+        # Message count present, but the response has no "Thread ID:" line
+        # for any message -- not the shape count_mail is built against, so
+        # it must refuse rather than silently fall back to a message count.
+        return "Found 3 messages matching 'in:inbox':\n\n(malformed: no message details)"
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "in:inbox"})
+
+    assert result == ToolResult("error", "unexpected mail search result")
+
+
+def test_count_mail_does_not_fail_closed_on_a_genuinely_empty_result():
+    async def search(_arguments):
+        return "Found 0 messages matching 'label:nonexistent':"
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:nonexistent"})
+
+    assert json.loads(result.content) == {
+        "query": "label:nonexistent", "conversations": 0, "exact": True,
+    }
 
 
 # --- C1: per-turn file handles -------------------------------------------
@@ -1580,8 +1713,12 @@ def test_tainted_open_file_still_refuses_a_real_in_roots_path(tmp_path):
     )
 
     assert refused == _HANDLE_TAINT_REFUSAL
-    # A handle may not launder a path that rides alongside it.
-    assert both == _HANDLE_TAINT_REFUSAL
+    # A handle may not launder a path that rides alongside it. That refusal now
+    # comes from the exactly-one rule, which is settled BEFORE the taint gate
+    # so the gate's "root-only calls carry no model-authored target" reasoning
+    # is never asked to trust a shape nobody validated. Either way the path
+    # never executes, which is the property under test.
+    assert both == ToolResult("error", "provide either path or handle, not both")
     assert opened == []
 
 
@@ -1756,13 +1893,20 @@ def test_handle_tools_keep_path_calls_and_stay_api_compatible(tmp_path):
     assert _call(registry, "open_file", {}) == ToolResult("error", "invalid path")
     assert opened == [str(document.resolve())]
     schemas = {schema["name"]: schema for schema in registry.schemas()}
-    for name in ("open_file", "open_folder"):
+    # open_folder gained `root`; open_file deliberately did NOT -- a root is a
+    # directory, so naming one can only ever mean open_folder.
+    for name, expected in (
+        ("open_file", {"path", "handle"}),
+        ("open_folder", {"path", "handle", "root"}),
+    ):
         schema = schemas[name]["input_schema"]
-        assert set(schema["properties"]) == {"path", "handle"}
+        assert set(schema["properties"]) == expected
         assert schema["required"] == []
         assert schema["additionalProperties"] is False
         assert "handle" in schemas[name]["description"]
     assert "handle" in schemas["find_file"]["description"]
+    # find_file's root is optional scoping; query stays required.
+    assert schemas["find_file"]["input_schema"]["required"] == ["query"]
     assert api_incompatible_tool_names(registry.schemas()) == []
 
 
@@ -1884,3 +2028,332 @@ def test_find_file_marks_results_it_could_not_mint_a_handle_for(tmp_path):
     assert any("handle" in item for item in fifth)
     assert any(item.get("note") == "handle budget reached" for item in fifth)
     assert registry._resolve_handle(minted[-1]["handle"]) is not None
+
+
+# --- nameable roots (CC3) ---------------------------------------------------
+
+def _root_setup(tmp_path, *, extra_roots=(), desktop=None):
+    """A registry over named roots, with the Explorer launch captured."""
+    from worker.localfiles import LocalFiles
+
+    downloads = tmp_path / "Downloads"
+    kb = tmp_path / "kb"
+    downloads.mkdir(parents=True)
+    kb.mkdir(parents=True)
+    (downloads / "invoice-april.pdf").write_text("pdf", encoding="utf-8")
+    (kb / "invoice-april.pdf").write_text("pdf", encoding="utf-8")
+    launched: list[str] = []
+    opened: list[str] = []
+    files = LocalFiles(
+        [{"path": str(downloads), "name": "downloads"}, kb, *extra_roots],
+        opener=opened.append,
+        folder_opener=launched.append,
+    )
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=files, desktop=desktop)
+    return registry, downloads, kb, launched, opened
+
+
+def test_open_folder_by_root_works_clean_and_survives_taint(tmp_path):
+    registry, downloads, _kb, launched, _opened = _root_setup(tmp_path)
+
+    clean = _call(registry, "open_folder", {"root": "downloads"})
+    # The unit's whole point: "open my downloads" must still work after a tool
+    # returned outside content, with no earlier find_file and no handle.
+    tainted = _call(registry, "open_folder", {"root": "Downloads"}, tainted=True)
+
+    assert json.loads(clean.content) == {"opened": str(downloads.resolve())}
+    assert json.loads(tainted.content) == {"opened": str(downloads.resolve())}
+    assert launched == [str(downloads.resolve()), str(downloads.resolve())]
+
+
+def test_tainted_open_folder_still_refuses_a_path_even_beside_a_root(tmp_path):
+    registry, downloads, _kb, launched, _opened = _root_setup(tmp_path)
+
+    refused = _call(registry, "open_folder", {"path": str(downloads)}, tainted=True)
+    # A root may not launder a path riding alongside it, exactly as a handle
+    # may not (test_tainted_open_file_still_refuses_a_real_in_roots_path). The
+    # exactly-one rule settles this one before the taint gate is consulted, so
+    # the gate never has to reason about a call carrying two targets at once.
+    both = _call(
+        registry, "open_folder",
+        {"path": str(downloads), "root": "downloads"}, tainted=True,
+    )
+
+    assert refused == _HANDLE_TAINT_REFUSAL
+    assert both == ToolResult("error", "provide exactly one of path, handle, or root")
+    assert launched == []
+
+
+def test_an_invented_root_name_gives_a_clean_error_not_silence(tmp_path):
+    registry, _downloads, _kb, launched, _opened = _root_setup(tmp_path)
+
+    result = _call(registry, "open_folder", {"root": "documents"})
+
+    # Named, so the model can correct itself instead of concluding the folder
+    # does not exist -- the failure mode this whole unit exists to remove.
+    assert result == ToolResult(
+        "error", "unknown root; the configured roots are: downloads, kb",
+    )
+    assert launched == []
+
+
+def test_only_a_root_in_the_enum_survives_taint(tmp_path):
+    """The carve-out is membership, not the mere presence of a `root` key.
+
+    A root that is not in the host's vocabulary is free text wearing a root's
+    name, so under taint it is refused as free text -- the taint wall answers
+    first, and the unknown-root message never comes into it.
+    """
+    registry, downloads, _kb, launched, _opened = _root_setup(tmp_path)
+
+    for invented in ("documents", "", "  ", "C:/Windows", 7, True, None, ["kb"]):
+        assert _call(
+            registry, "open_folder", {"root": invented}, tainted=True,
+        ) == _HANDLE_TAINT_REFUSAL
+    # A root smuggled into open_file buys no passage either: only open_folder
+    # takes a root, so open_file falls back to needing a real handle.
+    assert _call(
+        registry, "open_file", {"root": "downloads"}, tainted=True,
+    ) == _HANDLE_TAINT_REFUSAL
+    # ...and the real vocabulary still goes through.
+    assert json.loads(_call(
+        registry, "open_folder", {"root": "kb"}, tainted=True,
+    ).content)["opened"]
+    assert launched == [str((tmp_path / "kb").resolve())]
+    assert downloads.is_dir()
+
+
+def test_root_is_refused_beside_a_handle_and_never_names_a_file(tmp_path):
+    registry, _downloads, _kb, launched, opened = _root_setup(tmp_path)
+    found = json.loads(_call(registry, "find_file", {"query": "invoice april"}).content)
+
+    with_handle = _call(
+        registry, "open_folder", {"root": "downloads", "handle": found[0]["handle"]},
+    )
+    as_file = _call(registry, "open_file", {"root": "downloads"})
+
+    assert with_handle == ToolResult(
+        "error", "provide exactly one of path, handle, or root",
+    )
+    # A root is a directory, so naming one can only ever mean open_folder --
+    # which is why open_file's schema has no root property at all.
+    assert as_file == ToolResult("error", "root names a folder; use open_folder")
+    assert launched == []
+    assert opened == []
+
+
+def test_the_root_enum_is_exactly_the_live_resolved_roots(tmp_path):
+    registry, _downloads, _kb, _launched, _opened = _root_setup(tmp_path)
+
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+    enum = schemas["open_folder"]["input_schema"]["properties"]["root"]["enum"]
+
+    assert enum == ["downloads", "kb"]
+    assert schemas["find_file"]["input_schema"]["properties"]["root"]["enum"] == enum
+    # Adding a root to the config is the only thing needed to add it to the
+    # vocabulary the model can choose from -- no second list to keep in sync.
+    home = tmp_path / "home"
+    home.mkdir()
+    widened, *_ = _root_setup(
+        tmp_path / "second", extra_roots=({"path": str(home), "name": "home"},),
+    )
+    widened_schemas = {schema["name"]: schema for schema in widened.schemas()}
+    assert widened_schemas["open_folder"]["input_schema"]["properties"]["root"][
+        "enum"
+    ] == ["downloads", "home", "kb"]
+
+
+def test_a_files_service_without_named_roots_simply_offers_no_root(tmp_path):
+    class RootlessFiles:
+        folders = {}
+
+        def find(self, _query):
+            return []
+
+        def open(self, path):
+            return {"opened": path}
+
+        def open_folder(self, path):
+            return {"opened": path}
+
+        def read_file(self, path):
+            return {"path": path}
+
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=RootlessFiles())
+
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+    # An empty enum is not a legal schema, so the property is dropped whole.
+    assert set(schemas["open_folder"]["input_schema"]["properties"]) == {
+        "path", "handle",
+    }
+    assert "Roots:" not in schemas["open_folder"]["description"]
+    assert api_incompatible_tool_names(registry.schemas()) == []
+
+
+def test_find_file_scopes_its_search_to_the_named_root(tmp_path):
+    registry, downloads, kb, _launched, _opened = _root_setup(tmp_path)
+
+    everywhere = json.loads(
+        _call(registry, "find_file", {"query": "invoice april"}).content,
+    )
+    scoped = json.loads(
+        _call(
+            registry, "find_file", {"query": "invoice april", "root": "kb"},
+        ).content,
+    )
+    unknown = _call(registry, "find_file", {"query": "invoice", "root": "desktop"})
+
+    assert {item["path"] for item in everywhere} == {
+        str((downloads / "invoice-april.pdf").resolve()),
+        str((kb / "invoice-april.pdf").resolve()),
+    }
+    assert [item["path"] for item in scoped] == [
+        str((kb / "invoice-april.pdf").resolve()),
+    ]
+    # Scoped results still mint handles, so scope-then-open keeps working.
+    assert scoped[0]["handle"]
+    assert unknown == ToolResult(
+        "error", "unknown root; the configured roots are: downloads, kb",
+    )
+
+
+def test_tool_descriptions_name_the_roots_out_loud(tmp_path):
+    registry, _downloads, _kb, _launched, _opened = _root_setup(tmp_path)
+
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+
+    # This sentence alone is what stops "you have no local kb folder": the
+    # roots are in the schema text, so the model never has to discover them.
+    for name in ("find_file", "open_folder"):
+        assert "Roots: downloads, kb." in schemas[name]["description"]
+    assert "Handles come from find_file" in schemas["open_file"]["description"]
+    assert "can be partial" in schemas["find_file"]["description"]
+
+
+def test_the_root_description_stays_bounded_for_a_large_root_roster(tmp_path):
+    long_name = "n" * 40
+    roots = []
+    for index in range(30):
+        directory = tmp_path / "big" / ("root-%02d-%s" % (index, long_name))
+        directory.mkdir(parents=True)
+        roots.append({
+            "path": str(directory), "name": "root %02d %s" % (index, long_name),
+        })
+    registry, *_ = _root_setup(tmp_path / "big", extra_roots=tuple(roots))
+
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+    description = schemas["open_folder"]["description"]
+
+    assert "..." in description.split("Roots:", 1)[1]
+    assert len(description) < 1_000
+    # Truncating the prose never truncates the enum: every root stays callable.
+    assert len(
+        schemas["open_folder"]["input_schema"]["properties"]["root"]["enum"],
+    ) == 32
+
+
+def test_host_tools_declare_whether_they_bear_outside_content(tmp_path):
+    registry, *_ = _root_setup(tmp_path, desktop=_FakeDesktopControl())
+
+    # read_file returns file contents. list_windows returns window TITLES,
+    # which are written by whatever page or document is open -- any web page in
+    # a tab can put text of its choosing into that result, so it bears outside
+    # content just as squarely as a file read does.
+    for name in ("read_file", "list_windows"):
+        assert registry.content_bearing(name) is True
+    for name in (
+        "find_file", "open_file", "open_folder", "open", "work_status",
+        "focus_window", "window_action", "media_key", "click", "type_text",
+        "press_keys", "press_delete",
+    ):
+        assert registry.content_bearing(name) is False
+    # Every host tool ANSWERS -- none is left undeclared to fall through to the
+    # name-shape fallback, which is the guess this unit replaced.
+    for name in registry.names():
+        assert registry.content_bearing(name) is not None, name
+    # Unregistered names get no answer, so the caller keeps its own fallback.
+    assert registry.content_bearing("google__search_gmail_messages") is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Explorer resolution is Windows-only")
+def test_open_folder_by_root_reaches_the_real_explorer_resolution(tmp_path, monkeypatch):
+    """The live path, faked only at the process spawn.
+
+    Same shape as test_open_folder_by_handle_reaches_the_real_explorer_
+    resolution: real LocalFiles, real _launch_folder, real _resolve_executable
+    and Authenticode publisher check -- only Popen is captured.
+    """
+    from pathlib import Path
+
+    from worker import desktopapps
+    from worker.localfiles import LocalFiles
+
+    spawned = []
+
+    class _Spawned:
+        pid = 4321
+
+    real_popen = desktopapps.subprocess.Popen
+
+    def fake_popen(command, **kwargs):
+        if Path(command[0]).name.casefold() != "explorer.exe":
+            return real_popen(command, **kwargs)
+        spawned.append((command, kwargs))
+        return _Spawned()
+
+    monkeypatch.setattr(desktopapps.subprocess, "Popen", fake_popen)
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=LocalFiles(
+        [{"path": str(downloads), "name": "downloads"}],
+    ))
+
+    result = _call(registry, "open_folder", {"root": "downloads"}, tainted=True)
+
+    assert json.loads(result.content) == {"opened": str(downloads.resolve())}
+    command, kwargs = spawned[0]
+    assert Path(command[0]).is_file()
+    assert Path(command[0]).name.casefold() == "explorer.exe"
+    assert command[1] == str(downloads.resolve())
+    assert kwargs["shell"] is False
+
+
+def test_exactly_one_target_is_settled_before_the_taint_gate(tmp_path):
+    """The invariant is enforced at the layer that leans on it.
+
+    The taint carve-out reasons "a root-only call carries no model-authored
+    target". That sentence is only true of a call that really is root-only, so
+    the shape is validated BEFORE admission is decided -- otherwise the gate
+    would be trusting a check that had not run yet, and a two-target call would
+    be admitted on its root and only fail later, deeper in.
+    """
+    registry, downloads, _kb, launched, opened = _root_setup(tmp_path)
+    found = json.loads(_call(registry, "find_file", {"query": "invoice april"}).content)
+    handle = found[0]["handle"]
+
+    conflicts = {
+        "root+handle": {"root": "downloads", "handle": handle},
+        "root+path": {"root": "downloads", "path": str(downloads)},
+        "path+handle": {"path": str(downloads), "handle": handle},
+        "all three": {"root": "downloads", "path": str(downloads), "handle": handle},
+    }
+    for label, arguments in conflicts.items():
+        for tainted in (False, True):
+            result = _call(registry, "open_folder", arguments, tainted=tainted)
+            # Refused for CONFLICTING, not for being tainted -- and the wording
+            # is identical either way, so the taint state of the turn is not
+            # signalled back through which error the model receives.
+            assert result.status == "error", (label, tainted)
+            assert result.content == (
+                "provide either path or handle, not both"
+                if set(arguments) == {"path", "handle"}
+                else "provide exactly one of path, handle, or root"
+            ), (label, tainted)
+    assert launched == []
+    assert opened == []
+    # A single target still works in both directions.
+    assert _call(registry, "open_folder", {"root": "downloads"}, tainted=True).status == "ok"
+    assert _call(registry, "open_folder", {"handle": handle}, tainted=True).status == "ok"

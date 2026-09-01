@@ -89,6 +89,16 @@ servers:
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
               search_drive_files, list_drive_items, get_drive_file_content]
+    # local_time rewrites Date: <rfc2822> header lines to Daniel's local
+    # wall-clock time (CC2 fixture verified) so the model never quotes a
+    # sender's foreign timezone back to him. Gmail read tools only -- the
+    # three tools whose text carries a Date: header. NOT calendar
+    # (get_events/query_freebusy): their date/time formatting is unverified
+    # against this transformer and stays untouched this wave.
+    transform:
+      search_gmail_messages: local_time
+      get_gmail_message_content: local_time
+      get_gmail_thread_content: local_time
   chrome-devtools:
     from_claude_config: chrome-devtools
     domain: browser
@@ -138,29 +148,51 @@ servers:
     command: [npx, -y, "@modelcontextprotocol/server-filesystem@2026.8.31", "{file_write_roots}"]
     enabled_from: file_write_roots.enabled
     domain: files
-    # The real server ships 14 tools; read_file is a deprecated alias of
-    # read_text_file from the same build and is left out of expose: to
-    # avoid registering a duplicate read tool. read_media_file is dropped
-    # too (BB-wave review, finding 11): it returns base64 image/audio data
-    # through the same 4KB _MAX_CONTENT bound every MCP result gets, so it
-    # can only ever deliver a truncated, unusable fragment -- launch_work
-    # is the path for real media. 8 reads + 4 mutations = 12 exposed. NO
-    # delete tool exists on this server at all -- that is a structural
+    # WRITE-ONLY (2026-09-01 final gate, F3). The real server ships 14
+    # tools. This host exposes 4 mutations plus list_allowed_directories =
+    # 5. Every read tool is dropped, and the reason is the credential
+    # shield: worker/localfiles.py refuses credential-shaped paths (the dot
+    # rule, the excluded segments/extensions) at LocalFiles.resolve, the one
+    # choke point every built-in read passes through. This server has no
+    # such choke point -- its read tools take a raw path and hand back file
+    # bytes -- so read_text_file/read_multiple_files/directory_tree/... were
+    # a shield bypass over exactly the writable roots, Downloads included,
+    # where a browser drops credential-shaped files (one is sitting there
+    # now). They were untainted by nothing and taint-blocked by nothing:
+    # a path Atlas may not read through find_file/read_file must not be
+    # readable by asking this server for it instead.
+    # Reads lose no reach: find_file and read_file cover config/atlas.yaml's
+    # file_roots, a WIDER scope than file_write_roots, and they carry the
+    # shield on every path. read_file is a deprecated alias of
+    # read_text_file and read_media_file returns base64 through the 4KB
+    # _MAX_CONTENT bound (BB-wave review, finding 11); both were already
+    # out, and now the whole read family is.
+    # NO delete tool exists on this server at all -- that is a structural
     # guardrail, not a policy choice made here.
-    expose: [read_text_file, read_multiple_files,
-             list_directory, list_directory_with_sizes, directory_tree,
-             search_files, get_file_info, list_allowed_directories,
-             write_file, edit_file, create_directory, move_file]
-    instant: [read_text_file, read_multiple_files,
-              list_directory, list_directory_with_sizes, directory_tree,
-              search_files, get_file_info, list_allowed_directories]
+    expose: [write_file, edit_file, create_directory, move_file,
+             list_allowed_directories]
+    instant: [list_allowed_directories]
     # write_/edit_/create_/move_ are not in instant_prefixes and are absent
     # from instant: above, so all four mutations default to confirm (see
     # policy_for) -- asserted directly in
     # test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation.
+    # Taint classification. Every MCP tool defaults to true (fail closed):
+    # its output is assumed to be text Atlas did not author, which taints the
+    # rest of the turn. list_allowed_directories is the one exception, and it
+    # rests on the tool's contract rather than on a judgement about its text:
+    # its entire response is the CLI allowlist this host passed the server on
+    # the command line (asserted against the real server in
+    # tests/test_mcp_filesystem_live.py). That trust extends exactly as far as
+    # the pinned package above -- the version is pinned but not
+    # integrity-checked, so npx resolving a different build of that version
+    # would move this tool's behavior out from under the claim.
+    # Classifying it as content-bearing
+    # meant that asking Atlas which folders it can reach silently disarmed
+    # every path-bearing tool for the rest of the turn. Add an entry here
+    # only for a tool whose output is demonstrably host-authored.
+    content_bearing:
+      list_allowed_directories: false
     describe:
-      read_text_file: "Read the text of a file under a writable folder (Desktop, Documents, Downloads). Only the first 4KB comes back; anything longer is truncated, so use launch_work for a whole large file. Daniel's other roots, including kb, are read with find_file and read_file instead."
-      search_files: "Find files by name pattern under a writable folder and return their paths as plain text. Prefer find_file for anything Daniel may want opened: it returns a handle open_file and open_folder accept, which this tool's plain paths are not."
       write_file: "Create a new file, or completely overwrite an existing one, with exact content under an allowed folder. The host will read back the exact path and content and wait for Daniel's yes before this runs."
       edit_file: "Apply exact line-based find/replace edits to an existing text file under an allowed folder. The host will read back the exact path and edits and wait for Daniel's yes before this runs."
       create_directory: "Create a new folder (and any missing parent folders) under an allowed folder. The host will read back the exact path and wait for Daniel's yes before this runs."

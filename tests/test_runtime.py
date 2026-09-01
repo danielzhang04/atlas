@@ -94,6 +94,29 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         built.store.close()
 
 
+def test_the_checked_in_response_cap_is_500_in_both_places_it_lives():
+    """F5(d): 500 was measured, not guessed -- 700-token rounds ran 8.9-14.9s
+    and 2 of 8 blew past turn_timeout_s, so a long reply must end at the CAP
+    (which says TRUNCATED_REPLY honestly) rather than at the timeout. Nothing
+    pinned it: atlas.yaml's value and the Brain default runtime.build falls
+    back to could each drift silently, in opposite directions. Both here.
+    """
+    import inspect
+
+    import yaml
+
+    cfg = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "atlas.yaml").read_text(
+            encoding="utf-8",
+        ),
+    )
+    assert cfg["max_tokens"] == 500
+    assert inspect.signature(Brain.__init__).parameters["max_tokens"].default == 500
+    # runtime.build's own fallback, for a config that omits the key entirely.
+    source = inspect.getsource(runtime.build)
+    assert 'cfg.get("max_tokens", 500)' in source
+
+
 def test_production_registry_has_no_api_incompatible_tool_schemas(monkeypatch, tmp_path):
     """Regression test for the tools.11.custom.input_schema 400.
 
@@ -150,11 +173,16 @@ def test_real_settle_path_preserves_google_hook_for_count_mail(monkeypatch, tmp_
 
         async def call_tool(self, _tool, *, arguments, read_timeout_seconds):
             del read_timeout_seconds
-            count = 61 if arguments["query"] == "in:inbox" else 14
+            is_inbox = arguments["query"] == "in:inbox"
+            count = 61 if is_inbox else 14
+            label = "inbox" if is_inbox else "primary"
+            thread_lines = "\n".join(
+                f"     Thread ID: {label}-{i}" for i in range(count)
+            )
             return SimpleNamespace(
                 content=[SimpleNamespace(
                     type="text",
-                    text=f"Found {count} messages matching query",
+                    text=f"Found {count} messages matching query\n{thread_lines}",
                 )],
                 isError=False,
             )
@@ -179,7 +207,7 @@ def test_real_settle_path_preserves_google_hook_for_count_mail(monkeypatch, tmp_
 
     try:
         result = asyncio.run(scenario())
-        assert result.content == "61 in your inbox, 14 in Primary"
+        assert result.content == "61 conversations in your inbox, 14 in Primary"
     finally:
         built.store.close()
 
@@ -371,9 +399,11 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
             self.on_state = kwargs["on_state"]
             self.account_values = kwargs["account_values"]
             self.calls = []
+            inbox_threads = "\n".join(f"     Thread ID: inbox-{i}" for i in range(61))
+            primary_threads = "\n".join(f"     Thread ID: primary-{i}" for i in range(14))
             self.responses = [
-                "Found 61 messages matching 'in:inbox':\n1. first",
-                "Found 14 messages matching 'in:inbox category:primary':\n1. first",
+                f"Found 61 messages matching 'in:inbox':\n1. first\n{inbox_threads}",
+                f"Found 14 messages matching 'in:inbox category:primary':\n1. first\n{primary_threads}",
             ]
 
         def status(self):
@@ -409,7 +439,7 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
         }])
         result = asyncio.run(built.registry.call("count_mail", {"query": "in:inbox"}))
 
-        assert result.content == "61 in your inbox, 14 in Primary"
+        assert result.content == "61 conversations in your inbox, 14 in Primary"
         assert built.mcp.calls == [
             (
                 "google",

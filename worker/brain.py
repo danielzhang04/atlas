@@ -39,6 +39,12 @@ CACHE_FLOOR_MAX_CHECKS = 3
 CACHE_FLOOR_PROBE_MESSAGE = {"role": "user", "content": "hi"}
 TIMEOUT_REPLY = "I lost that one to a timeout. Still here. "
 PROVIDER_REPLY = "I couldn't reach my model just now. Still here. "
+# A reply that stopped on the token cap ends mid-sentence. Nothing downstream
+# can tell that fragment from a finished answer, so the host says so itself.
+TRUNCATED_REPLY = "-- there's more; want me to continue? "
+# Last resort: a generate-lane turn that produced nothing must still speak.
+# Silence is indistinguishable from Atlas being broken or not listening.
+EMPTY_TURN_REPLY = "I did not manage that one - ask me again or rephrase? "
 
 _AFFIRM = frozenset({
     "confirm",
@@ -109,7 +115,10 @@ Use find_file and read_file for quick questions about a file. Use launch_work fo
 analysis that needs code or produces artifacts.
 If read_file reports truncated, do not analyse the preview -- call launch_work with the exact path.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
-in:inbox for all; never count from a search page.
+in:inbox for all; it reports conversations, matching what Daniel's Gmail shows, not raw messages;
+never count from a search page.
+Date lines from Gmail tools are already in Daniel's local time; never convert or rename their
+timezones. Calendar events state their own timezone -- read it as written.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
 that close will close every window of that app.
 A tool result of needs_confirmation means to read every summary field back in one sentence and ask
@@ -131,6 +140,15 @@ class _Registry(Protocol):
         ...
 
     def begin_turn(self) -> None:
+        ...
+
+    def content_bearing(self, name: str) -> bool | None:
+        """Declared taint classification, or None when undeclared.
+
+        Declared here so a registry implementation that silently drops it --
+        which would degrade every tool back to the name-shape fallback -- is a
+        type error rather than a quiet loss of the config-driven answer.
+        """
         ...
 
     async def call(
@@ -208,6 +226,74 @@ def _substitution_last(verdicts: list[str | None], rebuttal: str) -> list[str]:
     return ordered
 
 
+def _host_tail(previous: str, line: str) -> str:
+    """Re-establish the word boundary before an appended host line."""
+    return line if not previous or previous[-1:].isspace() else " " + line
+
+
+def _with_truncation_offer(
+    flushed: list[str], spoken: list[str], verdicts: list[str | None],
+) -> list[str]:
+    """Append the continuation offer to a flush that stopped at the token cap.
+
+    Shared by the main loop and the confirmation-narration flush so the two
+    seams cannot drift. Skipped in two cases: after a substitution, because the
+    rebuttal owns the last word and offering to continue a claim the host just
+    retracted would undo it; and when the turn yielded nothing at all, which
+    EMPTY_TURN_REPLY covers with a more honest line than "there's more".
+    """
+    if not (spoken or flushed):
+        return flushed
+    if any(verdict is UNBACKED_ACTION_REPLY for verdict in verdicts):
+        return flushed
+    flushed.append(_host_tail((flushed or spoken)[-1], TRUNCATED_REPLY))
+    return flushed
+
+
+def _abort_flush(
+    guarded_chunks: list[str],
+    guard: ClaimGuard,
+    tool_results: list[tuple[str, bool]],
+    host_line: str | None,
+    reason: str,
+) -> tuple[list[str], list[str | None]]:
+    """Salvage held sentences on an aborted turn instead of discarding them.
+
+    The timeout and provider-error paths used to drop `guarded_chunks` wholesale,
+    so a turn that died on its way to the flush lost every sentence it had
+    already generated and Daniel heard only the host's apology. `evaluate` is
+    pure and synchronous -- no model call, no await -- so the same verdicts can
+    be taken here, with the same substitution-last ordering as the normal flush.
+
+    Scope: this salvages an abort that lands while the generator is running --
+    a timeout or a provider failure. It does NOT cover a cancel that lands in
+    the consumer between yields (barge-in): the generator is closed, the
+    un-yielded remainder is dropped, and an unspoken rebuttal goes with it.
+    Truthfulness still holds there -- a held claim is never voiced without its
+    rebuttal, only dropped together with it -- and that is the pre-existing
+    shape of barge-in, not something this flush changes.
+
+    Returns the ordered chunks together with their verdicts, so the caller can
+    apply the same substitution-suppression rule the token-cap flush uses
+    before appending a host line of its own.
+    """
+    if not guarded_chunks:
+        return [], []
+    logger.warning(
+        "held reply chunks flushed on %s (held=%d)", reason, len(guarded_chunks),
+    )
+    verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
+    guarded_chunks.clear()
+    # Mirrors the confirmation flush: when the host really did attempt the
+    # action and it failed, offering to do it is the wrong rebuttal.
+    rebuttal = (
+        FAILED_ATTEMPT_REPLY
+        if host_line is not None and any(not ok for _name, ok in tool_results)
+        else UNBACKED_ACTION_REPLY
+    )
+    return _substitution_last(verdicts, rebuttal), verdicts
+
+
 def _field(block: Any, name: str) -> Any:
     return block.get(name) if isinstance(block, Mapping) else getattr(block, name, None)
 
@@ -261,7 +347,15 @@ class Brain:
         *,
         model: str,
         persona: str,
-        max_tokens: int = 400,
+        # Per model response, NOT per turn: every tool round spends its own
+        # budget, and a round's budget is consumed by the tool-call JSON before
+        # any spoken text. Raising the cap only makes a round that stops
+        # INSIDE the tool_use block -- zero text, total silence -- less likely.
+        # It buys no guarantee: a measured run spent all 700 tokens on tool
+        # JSON and yielded nothing. EMPTY_TURN_REPLY is what makes that safe.
+        # 500 is the timeout-headroom choice; see config/atlas.yaml for the
+        # measurements behind it.
+        max_tokens: int = 500,
         turn_timeout_s: float = 12.0,
         turn_ceiling_s: float = 30.0,
         history_exchanges: int = 8,
@@ -536,6 +630,7 @@ class Brain:
         tool_results: list[tuple[str, bool]] = []
         guard = ClaimGuard(prompt, tools)
         tool_rounds = 0
+        truncated = False
         tainted = bool(context)
         host_line: str | None = None
         try:
@@ -624,6 +719,16 @@ class Brain:
                             generation_usage,
                             ok=final is not None,
                         )
+                    # The narration lane spends the same per-response cap as the
+                    # main loop and was the one flush that never read
+                    # stop_reason: a narration cut at the cap was voiced as a
+                    # mid-sentence fragment, unflagged and unlogged.
+                    if getattr(final, "stop_reason", None) == "max_tokens":
+                        truncated = True
+                        logger.warning(
+                            "confirmation narration hit the token cap "
+                            "(stop_reason=max_tokens)",
+                        )
                     if buffer:
                         guard.observe(buffer)
                         if guarded_chunks or guard.delayed(buffer):
@@ -634,6 +739,7 @@ class Brain:
                     if not spoken and not guarded_chunks:
                         guarded_chunks.append(host_line)
                     verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
+                    guarded_chunks.clear()
                     # The narration flush substituted IN PLACE, so a rebuttal
                     # landed mid-reply and the reassurance after it was spoken
                     # last ("I did not actually do that - ... Want me to? It
@@ -641,10 +747,15 @@ class Brain:
                     # when the host really did attempt the action and it
                     # failed, the offer variant is wrong -- it was tried.
                     attempted_and_failed = any(not ok for _name, ok in tool_results)
-                    for chunk in _substitution_last(
+                    narration_chunks = _substitution_last(
                         verdicts,
                         FAILED_ATTEMPT_REPLY if attempted_and_failed else UNBACKED_ACTION_REPLY,
-                    ):
+                    )
+                    if truncated:
+                        narration_chunks = _with_truncation_offer(
+                            narration_chunks, spoken, verdicts,
+                        )
+                    for chunk in narration_chunks:
                         yield chunk
                     return
                 while True:
@@ -685,7 +796,20 @@ class Brain:
                             ok=final is not None,
                         )
 
-                    if getattr(final, "stop_reason", None) != "tool_use":
+                    stop_reason = getattr(final, "stop_reason", None)
+                    if stop_reason == "max_tokens":
+                        # Nothing used to check this: only != "tool_use" was
+                        # tested, so a reply cut at the cap was voiced as a
+                        # mid-sentence fragment -- or, when the cap landed
+                        # inside the tool_use block, as total silence.
+                        truncated = True
+                        logger.warning(
+                            "conversation reply hit the token cap "
+                            "(stop_reason=%s, round=%d)",
+                            stop_reason,
+                            tool_rounds,
+                        )
+                    if stop_reason != "tool_use":
                         break
                     if tool_rounds >= MAX_TOOL_ROUNDS:
                         break
@@ -721,7 +845,7 @@ class Brain:
                         })
                         if self.on_tool is not None:
                             self.on_tool(name, result)
-                        if _content_bearing_tool(name):
+                        if _content_bearing_tool(self.registry, name):
                             tainted = True
                     messages.extend((
                         {"role": "assistant", "content": [_block_dict(block) for block in content]},
@@ -749,6 +873,18 @@ class Brain:
                         yield buffer
                 verdicts = [guard.evaluate(chunk, tool_results) for chunk in guarded_chunks]
                 final_chunks = _substitution_last(verdicts, UNBACKED_ACTION_REPLY)
+                # Emptied so an abort DURING the flush below cannot speak these
+                # sentences a second time from _abort_flush.
+                guarded_chunks.clear()
+                if truncated:
+                    final_chunks = _with_truncation_offer(
+                        final_chunks, spoken, verdicts,
+                    )
+                if not spoken and not final_chunks:
+                    # Mirrors the confirmation branch's guard: a turn that
+                    # yielded nothing -- capped inside a tool_use block, or held
+                    # sentences that all evaluated away -- must not end silent.
+                    final_chunks.append(EMPTY_TURN_REPLY)
                 try:
                     for chunk in final_chunks:
                         spoken.append(chunk)
@@ -759,7 +895,32 @@ class Brain:
                     # the spoken prefix, not sentences Daniel never heard.
                     self._remember(prompt, "".join(spoken))
         except TimeoutError:
-            yield host_line or TIMEOUT_REPLY
+            flushed, verdicts = _abort_flush(
+                guarded_chunks, guard, tool_results, host_line, "timeout",
+            )
+            # A turn that already delivered sentences did not lose them -- it
+            # ran out of clock mid-reply. TIMEOUT_REPLY ("I lost that one")
+            # is false there, and the abort path never remembered the prefix,
+            # so "continue" had nothing to resume. Offer the continuation
+            # through the shared helper instead (same substitution
+            # suppression as the token-cap flush) and remember what was said.
+            # With nothing spoken the turn really was lost: TIMEOUT_REPLY
+            # stands, and an empty prefix is not worth a history entry. Held
+            # chunks salvaged by the flush are not a delivered prefix -- they
+            # reach Daniel only now, with the turn already over.
+            delivered = bool(spoken)
+            if host_line is None and delivered:
+                tail = _with_truncation_offer(flushed, spoken, verdicts)
+            else:
+                flushed.append(_host_tail(
+                    (flushed or spoken or [""])[-1], host_line or TIMEOUT_REPLY,
+                ))
+                tail = flushed
+            for chunk in tail:
+                spoken.append(chunk)
+                yield chunk
+            if host_line is None and delivered:
+                self._remember(prompt, "".join(spoken))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             has_status_code = isinstance(status, int) and not isinstance(status, bool)
@@ -777,11 +938,25 @@ class Brain:
                 status if isinstance(status, (int, float)) else "unknown",
                 detail,
             )
-            yield host_line or PROVIDER_REPLY
+            flushed, _verdicts = _abort_flush(
+                guarded_chunks, guard, tool_results, host_line, "provider error",
+            )
+            # The model genuinely errored, so PROVIDER_REPLY's wording stands;
+            # only the amnesia is wrong. Sentences Daniel already heard stay
+            # in history so the next turn follows on from them.
+            delivered = bool(spoken)
+            flushed.append(_host_tail(
+                (flushed or spoken or [""])[-1], host_line or PROVIDER_REPLY,
+            ))
+            for chunk in flushed:
+                spoken.append(chunk)
+                yield chunk
+            if host_line is None and delivered:
+                self._remember(prompt, "".join(spoken))
 
     def _now_system_text(self) -> str:
         now = self._clock().astimezone()
-        return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
+        return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}), Daniel's local time."
 
 
 def _capability_system_text(
@@ -835,7 +1010,26 @@ def _capability_system_text(
     return "\n".join(lines)
 
 
-def _content_bearing_tool(name: str) -> bool:
+def _content_bearing_tool(registry: Any, name: str) -> bool:
+    """Does this tool's result taint the rest of the turn?
+
+    The registry is the authority: every tool declares it, host tools from
+    _HOST_CONTENT_BEARING and MCP tools from config/mcp.yaml's per-server
+    `content_bearing:` map (default true, fail closed).
+
+    This used to be decided by the tool's NAME alone -- "__" in name -- which
+    is a fine default but a bad rule. It tainted files__list_allowed_directories,
+    whose response is nothing but the CLI allowlist this host handed the
+    server, so merely asking "which folders can you reach?" made every
+    path-bearing tool refuse for the rest of the turn: one orientation call
+    and Atlas went silent instead of opening the folder. The name shape stays
+    as the fallback for a name the registry does not know, so an unregistered
+    or dynamically-renamed tool is still assumed to bear content.
+    """
+    lookup = getattr(registry, "content_bearing", None)
+    declared = lookup(name) if callable(lookup) else None
+    if declared is not None:
+        return declared
     return "__" in name or name == "read_file"
 
 

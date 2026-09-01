@@ -11,7 +11,7 @@ from typing import Any, Callable
 from .brain import Brain
 from .claude_launcher import ClaudeLauncher
 from .jobstore import JobStore
-from .localfiles import LocalFiles
+from .localfiles import LocalFiles, valid_file_root
 from .mcp_client import McpServers, load_mcp_config
 from .tools import ToolRegistry, builtin, load_apps, register_count_mail
 from .work import WorkManager
@@ -98,7 +98,7 @@ def build(
     model = _required_text(cfg, "fast_model")
     store_path = _required_text(cfg, "job_store_path")
     workspace_path = _required_text(cfg, "work_workspace_path")
-    max_tokens = cfg.get("max_tokens", 400)
+    max_tokens = cfg.get("max_tokens", 500)
     timeout_s = cfg.get("turn_timeout_s", 12.0)
     ceiling_s = cfg.get("turn_ceiling_s", 30.0)
     pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
@@ -112,7 +112,7 @@ def build(
         raise ValueError("invalid Atlas configuration: turn_ceiling_s")
     raw_roots = cfg.get("file_roots", ())
     if (isinstance(raw_roots, (str, bytes)) or not isinstance(raw_roots, (list, tuple))
-            or not all(isinstance(root, str) and root.strip() for root in raw_roots)):
+            or not all(valid_file_root(root) for root in raw_roots)):
         raise ValueError("invalid Atlas configuration: file_roots")
 
     store = JobStore(store_path if store_path == ":memory:" else Path(

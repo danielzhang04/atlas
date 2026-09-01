@@ -154,7 +154,24 @@
     const BAR_COUNT = 96;
     const UNIQUE_BANDS = 48;
     const INPUT_BANDS = 24;
-    const PARTICLE_COUNT = 42;
+    // ---- CC6 comet-trail tuning ----
+    // Daniel's explicit pick: "fewer, larger, glowing particles with soft
+    // motion trails -- Siri-orb fluidity" (replacing CC4-era 42 small
+    // pinpricks with no trail). Every knob for that redesign lives here so a
+    // Daniel-driven tweak is a one-line edit; nothing else needs to move.
+    // The integrated-angle motion itself (particleOrbitAngle/wrapAngle, see
+    // the CONVENTION note above draw()) is untouched by this block.
+    const PARTICLE_COUNT = 16; // was 42 pre-CC6
+    const PARTICLE_SIZE_BASE = 4.4; // px @ index%3===0, was 2.2
+    const PARTICLE_SIZE_STEP = 2.6; // px added per size tier, was 1.35
+    const PARTICLE_GLOW_RADIUS_PX = 48; // particleSprite backing size, was 32
+    const TRAIL_FADE_ALPHA = .12; // destination-out fade per 60fps frame, .08-.15 (dt-scaled at use)
+    // Trail canvas backing-store resolution multiplier against CSS-px
+    // width/height. 1 = CSS-px (NOT pixelRatio-scaled like tickRingSprite/
+    // segmentRingSprite -- see the resize()/drawParticles() notes on
+    // trailCanvas for why that's a deliberate perf choice here, not an
+    // oversight).
+    const TRAIL_RESOLUTION_SCALE = 1;
     const TAU = Math.PI * 2;
     const palettes = {
       ASLEEP: {
@@ -192,6 +209,12 @@
     const particleRadius = new Float32Array(PARTICLE_COUNT);
     const particleSpeed = new Float32Array(PARTICLE_COUNT);
     const particlePhase = new Float32Array(PARTICLE_COUNT);
+    // Persistent orbit accumulator, one per particle: the *additional*
+    // rotation beyond each particle's initial phase (particleAngle[i]),
+    // integrated every frame as rate * dt instead of read back out of
+    // absolute uptime. See the CONVENTION note above draw() for why this
+    // must stay a fixed-size Float32Array rather than a per-frame value.
+    const particleOrbitAngle = new Float32Array(PARTICLE_COUNT);
     // Waveform per-bar scratch geometry, reused every frame (no per-frame
     // allocation) so the bar-stroke pass and tip-fill pass can read the same
     // computed coordinates without rebuilding a Path2D for each.
@@ -219,15 +242,35 @@
     // 120 segments every frame; the frame path only rotates + drawImages them.
     const tickRingSprite = document.createElement("canvas");
     const segmentRingSprite = document.createElement("canvas");
+    // CC6: persistent comet-trail layer. Unlike the ring sprites above (bake
+    // once, reused unchanged for many frames), this canvas is faded and
+    // re-stamped every frame, so its context is cached once here instead of
+    // re-fetched from a render function -- same reasoning as caching `context`
+    // itself for the main canvas above. Left at the default alpha:true (unlike
+    // the main canvas's alpha:false) since a transparent backing is what lets
+    // destination-out fading and the final drawImage composite correctly over
+    // whatever the main canvas already has painted -- see drawParticles().
+    const trailCanvas = document.createElement("canvas");
+    const trailContext = trailCanvas.getContext("2d");
     const FRAME_BUCKET_MS = [17, 25, 33, 50];
     const metrics = {
       samples: 0, lastMs: 0, averageMs: 0, maxMs: 0, running: false,
       frameHistogram: new Uint32Array(5), drops: 0, totalFrames: 0,
+      maxAngleStepDeg: 0,
     };
     let realState = "OFFLINE";
     let visualState = "OFFLINE";
     let energy = 0;
     let frameEnergy = 0;
+    // Integrated rotation accumulators for the tick ring, segment ring,
+    // scanner sweep, and core dashed ring (the 4 non-particle rotating
+    // elements). Each is advanced every frame by its own rate(t) * dt and
+    // wrapped into [0, TAU) — see wrapAngle below and each drawX() site —
+    // instead of being read straight out of absolute uptime.
+    let tickRingAngle = 0;
+    let segmentRingAngle = 0;
+    let scannerAngle = 0;
+    let coreDashAngle = 0;
     let width = 0;
     let height = 0;
     let scale = 1;
@@ -300,19 +343,37 @@
     glowContext.fillStyle = glow;
     glowContext.fillRect(0, 0, 256, 256);
 
-    particleSprite.width = 32;
-    particleSprite.height = 32;
+    // CC6: reuses this exact radial-gradient-sprite technique (same as
+    // glowSprite above), just bigger and hotter -- PARTICLE_GLOW_RADIUS_PX
+    // was 32, and the stops below are stronger than the pre-CC6 sprite
+    // (0.95/0.5/0.1/0 @ 0/.16/.52/1) so fewer, larger particles read as
+    // glowing comets rather than pinpricks.
+    particleSprite.width = PARTICLE_GLOW_RADIUS_PX;
+    particleSprite.height = PARTICLE_GLOW_RADIUS_PX;
     const particleContext = particleSprite.getContext("2d");
-    const particleGlow = particleContext.createRadialGradient(16, 16, 0, 16, 16, 16);
-    particleGlow.addColorStop(0, "rgb(255 255 255 / 0.95)");
-    particleGlow.addColorStop(.16, "rgb(255 255 255 / 0.5)");
-    particleGlow.addColorStop(.52, "rgb(255 255 255 / 0.1)");
+    const particleCenter = PARTICLE_GLOW_RADIUS_PX / 2;
+    const particleGlow = particleContext.createRadialGradient(
+      particleCenter, particleCenter, 0, particleCenter, particleCenter, particleCenter,
+    );
+    particleGlow.addColorStop(0, "rgb(255 255 255 / 1)");
+    particleGlow.addColorStop(.18, "rgb(255 255 255 / 0.62)");
+    particleGlow.addColorStop(.55, "rgb(255 255 255 / 0.16)");
     particleGlow.addColorStop(1, "rgb(255 255 255 / 0)");
     particleContext.fillStyle = particleGlow;
-    particleContext.fillRect(0, 0, 32, 32);
+    particleContext.fillRect(0, 0, PARTICLE_GLOW_RADIUS_PX, PARTICLE_GLOW_RADIUS_PX);
 
     function copyValues(target, source) {
       for (let index = 0; index < target.length; index += 1) target[index] = source[index];
+    }
+
+    // Keeps every integrated rotation accumulator (particleOrbitAngle[i],
+    // tickRingAngle, segmentRingAngle, scannerAngle, coreDashAngle) inside
+    // [0, TAU) forever instead of growing without bound over days of uptime
+    // (float precision loss, not a visual bug at any single frame — but the
+    // whole point of integrating is to stay exact for the life of the app).
+    function wrapAngle(angle) {
+      const wrapped = angle % TAU;
+      return wrapped < 0 ? wrapped + TAU : wrapped;
     }
 
     function mixColors(now) {
@@ -354,6 +415,22 @@
       canvas.height = Math.round(height * pixelRatio);
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       context.imageSmoothingEnabled = true;
+
+      // CC6: trail canvas is deliberately sized at TRAIL_RESOLUTION_SCALE
+      // (1 = CSS-px), NOT `* pixelRatio` like the main canvas above or the
+      // tickRingSprite/segmentRingSprite pattern below -- unlike those, this
+      // canvas is fully re-painted (fade + re-stamp) every single frame, not
+      // just on resize or a color change, so its pixel count is a real
+      // per-frame cost: at pixelRatio 2 that's 4x the fill area of the
+      // destination-out fade for no visible gain, since a comet trail is a
+      // soft blur by design and drawParticles()'s final drawImage already
+      // upscales it into the pixelRatio-scaled main canvas -- the softening
+      // from that upscale is a feature here, not the blur regression the
+      // ring sprites had to fix. Setting width/height also clears any
+      // existing trail content, which is fine: a resize already interrupts
+      // the visual continuity a trail exists to preserve.
+      trailCanvas.width = Math.round(width * TRAIL_RESOLUTION_SCALE);
+      trailCanvas.height = Math.round(height * TRAIL_RESOLUTION_SCALE);
 
       majorTickPath = new Path2D();
       minorTickPath = new Path2D();
@@ -454,8 +531,21 @@
       expandBands();
     }
 
-    function prepareFrameSignal(now, previewState) {
-      frameEnergy = energy;
+    function prepareFrameSignal(now, previewState, dt) {
+      // Frame-rate-independent exponential smoothing, the exact idiom
+      // drawWaveform uses (growFactor/shrinkFactor below): factor =
+      // 1 - (1-k)^(dt/16.67). k = .3 => tau ~= 47ms, ~90% settle in
+      // ~108ms, ~95% in ~140ms at 60fps -- inside the ~100-150ms target and
+      // still visibly live. Ambient mic noise updates `energy` on every
+      // audio tick with no smoothing of its own; reading it straight into
+      // frameEnergy (the old direct assignment) let a single noisy tick
+      // re-scramble every rotation rate and pulse this value drives
+      // (drawParticles' drift/size/alpha, drawCore's speakingPulse/glow) —
+      // this is the second half of the fix alongside integrating rotation
+      // (see the CONVENTION note above draw()): the rate itself can still
+      // legitimately move with audio, it just can no longer jump instantly.
+      const smoothing = 1 - Math.pow(1 - .3, dt / 16.67);
+      frameEnergy += (energy - frameEnergy) * smoothing;
       if (!previewState) {
         expandBands();
         return;
@@ -637,7 +727,7 @@
     // transition live-strokes into the frame context exactly like the
     // pre-sprite code did, and the sprite is re-rendered ONCE, on the first
     // frame after the color settles (its cached color no longer matches).
-    function drawTickRing(now) {
+    function drawTickRing(now, dt) {
       const minorColor = tickRingMinorColorNow();
       const majorColor = tickRingMajorColorNow();
       const transitioning = now - transitionAt <= 420;
@@ -647,9 +737,15 @@
           || minorColor !== tickRingMinorColor
           || majorColor !== tickRingMajorColor)
       ) renderTickRingSprite(minorColor, majorColor);
+      // Integrated in place of the old `now * rate` read: rate * dt keeps
+      // the rotation continuous even while `motion[0]` (and so the rate
+      // itself) changes between frames, instead of re-deriving the whole
+      // angle from absolute uptime every frame (see the CONVENTION note
+      // above draw() and the matching accumulators for the other 3 rings).
+      tickRingAngle = wrapAngle(tickRingAngle + .000018 * (1 + motion[0]) * dt);
       context.save();
       context.translate(centerX, centerY);
-      context.rotate(now * .000018 * (1 + motion[0]));
+      context.rotate(tickRingAngle);
       if (transitioning) {
         strokeTickRing(context, minorColor, majorColor);
       } else {
@@ -662,7 +758,7 @@
       context.restore();
     }
 
-    function drawSegmentRings(now) {
+    function drawSegmentRings(now, dt) {
       const color = segmentRingColorNow();
       const transitioning = now - transitionAt <= 420;
       if (
@@ -670,9 +766,10 @@
         && (segmentRingSpriteSize === 0 || color !== segmentRingColor)
       ) renderSegmentRingSprite(color);
       const speed = .000035 + motion[0] * .00016;
+      segmentRingAngle = wrapAngle(segmentRingAngle + speed * 1.32 * dt);
       context.save();
       context.translate(centerX, centerY);
-      context.rotate(-now * speed * 1.32);
+      context.rotate(-segmentRingAngle);
       if (transitioning) {
         strokeSegmentRing(context, color);
       } else {
@@ -685,9 +782,14 @@
       context.restore();
     }
 
-    function drawScanner(now) {
+    function drawScanner(now, dt) {
+      // Advanced unconditionally, even on the frames the guard below skips
+      // rendering (motion[4] < .04), so the sweep resumes from wherever it
+      // actually stopped instead of jumping to re-derive its angle from
+      // absolute uptime once it becomes visible again.
+      scannerAngle = wrapAngle(scannerAngle + (.00018 + motion[4] * .00034) * dt);
       if (motion[4] < .04) return;
-      const rotation = now * (.00018 + motion[4] * .00034);
+      const rotation = scannerAngle;
       const radius = .44 * scale;
       // Gradient stop coordinates are evaluated against the CTM active at
       // fill()-time, not at createLinearGradient()-time (confirmed: gradients
@@ -739,20 +841,68 @@
       context.restore();
     }
 
-    function drawParticles(now) {
-      if (layerPresence <= 0) return;
+    function drawParticles(now, dt) {
       const seconds = now / 1000;
       const drift = .025 + motion[2] * .14 + frameEnergy * .2;
-      const particleEnergy = .25 + motion[2] * .45 + frameEnergy * .45;
-      context.save();
-      context.globalCompositeOperation = "screen";
+      // Integrated in place of the old `particleAngle[i] + seconds *
+      // particleSpeed[i] * drift` absolute-uptime read: `drift` changes
+      // every frame with motion[2]/frameEnergy, so reading it back against
+      // absolute `seconds` re-scrambled the whole orbit history any time
+      // drift changed (the actual choppiness bug — see the CONVENTION note
+      // above draw()). Advanced unconditionally (even on frames the
+      // layerPresence guard below skips rendering) so re-entry resumes
+      // in place instead of snapping to a wall-clock-derived angle.
+      const deltaSeconds = dt / 1000;
+      let maxStepThisFrame = 0;
       for (let index = 0; index < PARTICLE_COUNT; index += 1) {
-        const orbit = particleAngle[index] + seconds * particleSpeed[index] * drift;
+        const step = particleSpeed[index] * drift * deltaSeconds;
+        if (step > maxStepThisFrame) maxStepThisFrame = step;
+        particleOrbitAngle[index] = wrapAngle(particleOrbitAngle[index] + step);
+      }
+      // Acceptance instrumentation (see window.__atlasEngineMetrics below):
+      // rolling max per-frame particle angle delta in degrees, reset
+      // alongside frameHistogram in start(). Makes the ~1.5 deg/frame bound
+      // measurable live instead of only by offline simulation.
+      const maxStepDeg = maxStepThisFrame * (180 / Math.PI);
+      if (maxStepDeg > metrics.maxAngleStepDeg) metrics.maxAngleStepDeg = maxStepDeg;
+      // Paused/idle frames never reach here (isIdleNow() stops the rAF loop
+      // entirely), so the trail simply stops being written to and freezes on
+      // its last frame -- see pauseLoop()/start() for why that (rather than
+      // clearing here) is the right call, and why start() clears it instead.
+      if (layerPresence <= 0) return;
+      const particleEnergy = .25 + motion[2] * .45 + frameEnergy * .45;
+
+      // CC6: comet trail. Fade the persistent trail canvas via
+      // destination-out, which multiplies existing pixel ALPHA toward zero
+      // (RGB untouched) regardless of what color those pixels are -- this is
+      // what makes it composite correctly under any backdrop, unlike
+      // painting a translucent rect over it (source-over), which would only
+      // look seamless if that rect's color exactly matched the backdrop's
+      // actual composited appearance (the #070a10 fill + backdropSprite
+      // texture + the CSS radial-gradient behind the canvas element) and
+      // would silently drift out of sync the moment any of those change.
+      trailContext.globalCompositeOperation = "destination-out";
+      // Frame-rate-independent, same idiom as drawWaveform/prepareFrameSignal:
+      // a flat per-frame alpha made the trail length a function of frame rate
+      // (a long comet at 30fps, a short one at 120), which is the one thing
+      // this canvas is for.
+      trailContext.globalAlpha = 1 - Math.pow(1 - TRAIL_FADE_ALPHA, dt / 16.67);
+      trailContext.fillStyle = "#000";
+      trailContext.fillRect(0, 0, trailCanvas.width, trailCanvas.height);
+
+      // Stamp each particle onto the trail (not the main canvas): "screen"
+      // still brightens overlapping stamps within the trail itself (same
+      // glow-accumulation effect the pre-CC6 code got by screen-compositing
+      // straight onto the main canvas), and the composited trail is blitted
+      // onto the main canvas below with a normal (source-over) drawImage.
+      trailContext.globalCompositeOperation = "screen";
+      for (let index = 0; index < PARTICLE_COUNT; index += 1) {
+        const orbit = particleAngle[index] + particleOrbitAngle[index];
         const tremor = Math.sin(seconds * (1 + particleSpeed[index]) + particlePhase[index]) * (.003 + frameEnergy * .006);
         const radius = (particleRadius[index] + tremor) * scale;
-        const size = (2.2 + index % 3 * 1.35) * (1 + frameEnergy * .4);
-        context.globalAlpha = layerPresence * particleEnergy * (.18 + .22 * Math.sin(particlePhase[index] + seconds * .7) ** 2);
-        context.drawImage(
+        const size = (PARTICLE_SIZE_BASE + index % 3 * PARTICLE_SIZE_STEP) * (1 + frameEnergy * .4);
+        trailContext.globalAlpha = layerPresence * particleEnergy * (.18 + .22 * Math.sin(particlePhase[index] + seconds * .7) ** 2);
+        trailContext.drawImage(
           particleSprite,
           centerX + Math.cos(orbit) * radius - size,
           centerY + Math.sin(orbit) * radius - size,
@@ -760,7 +910,16 @@
           size * 2,
         );
       }
-      context.restore();
+
+      // Blit the (deliberately low-res, see TRAIL_RESOLUTION_SCALE above)
+      // trail canvas into the main, pixelRatio-scaled context at CSS-px
+      // width/height -- context.imageSmoothingEnabled (set in resize())
+      // makes this upscale a soft blur, which a comet trail wants anyway.
+      // Normal source-over compositing: the trail's own pixels already
+      // carry the right RGBA (including their screen-blended overlaps), so
+      // this is a plain alpha-composite onto whatever drawBackdrop() just
+      // painted, not another blend-mode layer.
+      context.drawImage(trailCanvas, 0, 0, width, height);
     }
 
     function drawWaveform(now, dt) {
@@ -824,7 +983,7 @@
       context.restore();
     }
 
-    function drawCore(now) {
+    function drawCore(now, dt) {
       const breathing = .5 + .5 * Math.sin(now * .00115);
       const speakingPulse = frameEnergy * motion[5] * (.055 + .035 * Math.sin(now * .019));
       const coreRadius = (.142 + breathing * .006 + speakingPulse) * scale;
@@ -897,9 +1056,14 @@
       context.strokeStyle = colorString(coreColor, .18 + motion[3] * .24);
       context.stroke();
 
+      // Same integration as the other 3 rings (see drawTickRing): this
+      // dashed-ring rotation used the identical `now * rate` pattern, just
+      // masked by the ring's own dash symmetry rather than being visibly
+      // choppy.
+      coreDashAngle = wrapAngle(coreDashAngle + (.000025 + motion[0] * .00014) * dt);
       context.save();
       context.translate(centerX, centerY);
-      context.rotate(-now * (.000025 + motion[0] * .00014));
+      context.rotate(-coreDashAngle);
       context.setLineDash(coreDashPattern);
       context.beginPath();
       context.arc(0, 0, .19 * scale, 0, TAU);
@@ -927,32 +1091,65 @@
     // is the colorString() key each cache is compared against: short-lived
     // young-generation strings, deliberately paid to make staleness
     // impossible (see the cache-key note above tickRingMinorColor).
+    //
+    // Same convention applies to angle state: particleOrbitAngle[i],
+    // tickRingAngle, segmentRingAngle, scannerAngle, and coreDashAngle are
+    // persistent accumulators (Float32Array or a plain `let`, never a
+    // per-frame local), each advanced in place every frame as
+    // `angle = wrapAngle(angle + rate(t) * dt)` and wrapped into [0, TAU)
+    // by wrapAngle() (defined above, near copyValues/mixColors) instead of
+    // being re-derived from absolute `now` each frame. That is the fix for
+    // this engine's rotation bug, not just an allocation detail: reading
+    // `now * rate` retroactively rescaled the *entire* elapsed-time history
+    // any time `rate` changed (drift, motion[], frameEnergy all vary frame
+    // to frame), which is what made the rotation look choppy instead of
+    // continuous. Integrating means only the current frame's small `dt` is
+    // ever affected by a rate change.
     function draw(now) {
       // boss-authorized preview override for headless review; visuals only
       const previewState = ENGINE_STATES.has(window.__atlasEnginePreview)
         ? window.__atlasEnginePreview
         : null;
       setVisualState(previewState || realState);
-      prepareFrameSignal(now, previewState);
-      mixColors(now);
+      // Computed here (moved ahead of its former spot below mixColors) so it
+      // can be threaded into prepareFrameSignal and every rotation-bearing
+      // draw* call below instead of each one re-deriving its own angle from
+      // absolute `now` (see the CONVENTION note above and the accumulators
+      // it feeds: particleOrbitAngle, tickRingAngle, segmentRingAngle,
+      // scannerAngle, coreDashAngle).
       const dt = lastFrameNow ? Math.min(100, Math.max(0, now - lastFrameNow)) : 16.67;
       lastFrameNow = now;
+      prepareFrameSignal(now, previewState, dt);
+      mixColors(now);
       context.fillStyle = "#070a10";
       context.fillRect(0, 0, width, height);
       drawBackdrop();
-      drawTickRing(now);
-      drawSegmentRings(now);
-      drawScanner(now);
-      drawParticles(now);
+      // CC6: trail layer moved here (was after drawScanner) so the comet
+      // trail sits above the backdrop but below every HUD element -- rings,
+      // scanner, waveform, core -- instead of painting over them.
+      drawParticles(now, dt);
+      drawTickRing(now, dt);
+      drawSegmentRings(now, dt);
+      drawScanner(now, dt);
       drawWaveform(now, dt);
-      drawCore(now);
+      drawCore(now, dt);
       return dt;
     }
 
     // Idle (ASLEEP/OFFLINE) pauses the rAF loop entirely; a live preview override
     // (headless review) keeps it running so any state can still be inspected.
+    //
+    // ...but not while the palette is still moving. A state change starts a
+    // 420ms color transition (the same window drawTickRing/drawSegmentRings
+    // key off), and going idle used to pause the loop on its first frame:
+    // the ASLEEP palette never finished arriving, so what froze on screen was
+    // a half-decayed smear of the previous state's colors, held until the
+    // next wake. Letting those ~25 frames run costs nothing measurable and
+    // renders the transition to completion; the first frame after the window
+    // closes pauses exactly as before.
     function isIdleNow() {
       return (realState === "ASLEEP" || realState === "OFFLINE")
+        && performance.now() - transitionAt > 420
         && !ENGINE_STATES.has(window.__atlasEnginePreview);
     }
 
@@ -965,6 +1162,36 @@
       // record a >=50ms "drop" that never happened, plus a full-strength
       // waveform decay step. 0 makes the next draw() use the 16.67ms
       // first-frame default, exactly as at startup.
+      //
+      // Behavior change from the pre-CC4 `now * rate` rotation (an
+      // improvement, not a regression): every rotation accumulator now
+      // simply stops advancing across a pause instead of being read back
+      // out of absolute `now`, so waking no longer makes the rings/particles
+      // snap forward to "catch up" for time spent invisible -- they resume
+      // exactly where they visually stopped.
+      //
+      // CC6: the same freeze applies to the comet trail (drawParticles()
+      // simply doesn't run while paused), so trailCanvas just holds its last
+      // painted frame rather than being explicitly cleared here. Freeze, not
+      // clear-on-pause, is the deliberate choice: going idle already changes
+      // the card's look -- `.is-idle` REMOVES the holoIdle breathing
+      // animation, which styles.css runs on `.engine-card:not(.is-idle)`
+      // (it does not add an idle animation; the earlier note here had that
+      // backwards) -- so an abrupt "trail vanishes the instant the engine
+      // goes idle" would be a second, jarring change on top of the card
+      // going still. Freezing lets it read as "paused", and
+      // start() below clears it so a *resumed* session never shows a stale,
+      // already-faded trail ghost left over from before the pause. (Neither
+      // this freeze/clear nor anything else in the canvas engine currently
+      // reads prefers-reduced-motion -- confirmed by checking: none of
+      // drawTickRing/drawSegmentRings/drawScanner/drawParticles/drawWaveform/
+      // drawCore ever did, before or after CC6. Only the DOM-level holoIdle
+      // breathing animation in styles.css -- the one `.is-idle` turns OFF --
+      // is reduced-motion-gated. The trail
+      // inherits the same idle-based pause every other animated element in
+      // this engine already has; it does not add or remove reduced-motion
+      // support, which would be a broader, separate pass across the whole
+      // engine, not something specific to this redesign.)
       lastFrameNow = 0;
       canvas.dataset.animation = "paused";
       if (animationFrame) cancelAnimationFrame(animationFrame);
@@ -1012,6 +1239,11 @@
       metrics.frameHistogram.fill(0);
       metrics.drops = 0;
       metrics.totalFrames = 0;
+      metrics.maxAngleStepDeg = 0;
+      // CC6: clear-on-start, pairing with the freeze-on-pause in pauseLoop()
+      // above -- a fresh/resumed session should never show an already-faded
+      // trail ghost left over from before the pause.
+      trailContext.clearRect(0, 0, trailCanvas.width, trailCanvas.height);
       canvas.dataset.animation = "running";
       animationFrame = requestAnimationFrame(frame);
     }

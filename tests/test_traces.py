@@ -190,6 +190,96 @@ def test_disabled_recorder_is_a_no_op(tmp_path: Path):
     assert not (tmp_path / "traces.db").exists()
 
 
+def test_respond_step_persists_the_interrupted_flag(tmp_path: Path):
+    from worker import traces
+
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    traces.mark_speech_interrupted(turn)
+    recorder.respond(turn, ms=5, ok=True)
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded", total_ms=5)
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        row = connection.execute(
+            "SELECT interrupted FROM steps WHERE kind='RESPOND'"
+        ).fetchone()
+    assert row == (1,)
+
+
+def test_respond_step_defaults_interrupted_to_false(tmp_path: Path):
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.respond(turn, ms=5, ok=True)
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded", total_ms=5)
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        row = connection.execute(
+            "SELECT interrupted FROM steps WHERE kind='RESPOND'"
+        ).fetchone()
+    assert row == (0,)
+
+
+def test_pre_existing_database_without_interrupted_column_is_migrated(tmp_path: Path):
+    db_path = tmp_path / "traces.db"
+    # Recreate the schema as it looked before this unit added the column.
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            CREATE TABLE turns (
+                turn_id TEXT PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL NOT NULL,
+                total_ms INTEGER NOT NULL, addressed INTEGER NOT NULL, wake_kind TEXT,
+                outcome TEXT, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL, model TEXT
+            );
+            CREATE TABLE steps (
+                turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('ROUTE','GENERATE','TOOL_CALL','RESPOND')),
+                name TEXT, ms INTEGER NOT NULL, ok INTEGER NOT NULL,
+                tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL,
+                PRIMARY KEY (turn_id, seq)
+            );
+        """)
+
+    recorder = _recorder(db_path)
+    turn = _record_turn(recorder)
+    recorder.close()
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(steps)")}
+        interrupted = connection.execute(
+            "SELECT interrupted FROM steps WHERE turn_id=?", (turn.turn_id,)
+        ).fetchall()
+    assert "interrupted" in columns
+    assert interrupted and all(value == 0 for (value,) in interrupted)
+
+
+def test_active_turn_and_mark_speech_interrupted_round_trip(tmp_path: Path):
+    from worker import traces
+
+    assert traces.active_turn() is None
+
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    token = traces.activate(recorder, turn)
+    try:
+        active = traces.active_turn()
+        assert active is not None
+        active_recorder, active_turn = active
+        assert active_recorder is recorder
+        assert active_turn is turn
+        assert active_turn.speech_interrupted is False
+        traces.mark_speech_interrupted(active_turn)
+        assert turn.speech_interrupted is True
+    finally:
+        traces.reset(token)
+
+    assert traces.active_turn() is None
+    recorder.close()
+
+
 def test_configured_fast_model_has_a_pricing_row():
     # F8: traces.py prices a turn with self._pricing.get(model, {}) and
     # _price() treats a missing rate as 0.0, so switching fast_model to a lane

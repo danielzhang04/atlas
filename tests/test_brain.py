@@ -11,7 +11,15 @@ from typing import Any
 import pytest
 
 from worker import brain as brain_mod
-from worker.brain import BASE_SYSTEM, PROVIDER_REPLY, TIMEOUT_REPLY, Brain, split_spoken
+from worker.brain import (
+    BASE_SYSTEM,
+    EMPTY_TURN_REPLY,
+    PROVIDER_REPLY,
+    TIMEOUT_REPLY,
+    TRUNCATED_REPLY,
+    Brain,
+    split_spoken,
+)
 from worker.claims import FAILED_ATTEMPT_REPLY, UNBACKED_ACTION_REPLY, ClaimGuard
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
@@ -252,7 +260,7 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     assert "Look something up." not in call["system"][0]["text"]
     assert call["system"][1] == {
         "type": "text",
-        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
+        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}), Daniel's local time.",
     }
     assert "cache_control" not in call["system"][1]
     assert call["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -976,6 +984,7 @@ def test_host_speech_constants_end_in_whitespace():
     # trailing word boundary.
     for constant in (
         TIMEOUT_REPLY, PROVIDER_REPLY, UNBACKED_ACTION_REPLY, FAILED_ATTEMPT_REPLY,
+        TRUNCATED_REPLY, EMPTY_TURN_REPLY,
     ):
         assert constant[-1].isspace(), constant
 
@@ -2103,6 +2112,18 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
     assert (
+        "it reports conversations, matching what Daniel's Gmail shows, not raw messages"
+    ) in BASE_SYSTEM
+    # F6: scoped to what the local_time transform actually rewrites -- the
+    # column-0 "Date:" lines. A header that does not parse as RFC 2822 passes
+    # through raw, and times written in a message BODY are never touched, so
+    # "mail times" claimed more than the host delivers.
+    assert (
+        "Date lines from Gmail tools are already in Daniel's local time; never convert or rename their\n"
+        "timezones. Calendar events state their own timezone -- read it as written."
+    ) in BASE_SYSTEM
+    assert "Mail times from Gmail tools" not in BASE_SYSTEM
+    assert (
         "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
@@ -2146,3 +2167,359 @@ def test_split_spoken_uses_sentence_newline_and_length_boundaries():
     assert len(chunks[0]) <= 160
     assert chunks[0].endswith(" ")
     assert remainder
+
+
+# --- Unit CC1: Atlas must never be silent and never truncate unnoticed. -------
+
+
+def test_reply_cut_at_the_token_cap_offers_to_continue_and_warns(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    fragment = "I checked and the calendar shows that the "
+    client = FakeClient(FakeStream(
+        [fragment], content=[text_block(fragment)], stop_reason="max_tokens",
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "what is on today")) == [
+        fragment, TRUNCATED_REPLY,
+    ]
+    assert "conversation reply hit the token cap" in caplog.text
+    assert "stop_reason=max_tokens" in caplog.text
+    assert "round=0" in caplog.text
+
+
+def test_a_reply_that_finished_normally_is_never_given_the_continuation_offer(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    client = FakeClient(FakeStream(
+        ["All set. "], content=[text_block("All set. ")], stop_reason="end_turn",
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == ["All set. "]
+    assert TRUNCATED_REPLY not in "".join(caplog.messages)
+    assert "token cap" not in caplog.text
+
+
+def test_token_cap_inside_a_tool_call_speaks_a_host_line_instead_of_nothing(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    registry = FakeRegistry()
+    # The cap landed inside the tool_use block: no text was streamed and the
+    # tool call is unusable, so the whole turn used to end in total silence.
+    client = FakeClient(FakeStream(
+        [], content=[tool_block()], stop_reason="max_tokens",
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "look that up")) == [EMPTY_TURN_REPLY]
+    assert registry.calls == []
+    assert "conversation reply hit the token cap" in caplog.text
+
+
+def test_generate_turn_that_yields_no_text_at_all_still_speaks(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    client = FakeClient(FakeStream([], content=[], stop_reason="end_turn"))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == [EMPTY_TURN_REPLY]
+    # The fallback is not the truncation path: no cap warning belongs here.
+    assert "token cap" not in caplog.text
+
+
+def test_timeout_flushes_backed_held_sentences_before_the_host_line(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    held = "I opened the folder. "
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        DelayedFinalStream(
+            [held], content=[text_block(held)], final_delay=0.5,
+        ),
+    )
+    brain = Brain(
+        client, registry, model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # The backed sentence survives the abort; the host line stays last.
+    assert asyncio.run(collect(brain, "open my downloads")) == [held, TIMEOUT_REPLY]
+    assert "held reply chunks flushed on timeout (held=1)" in caplog.text
+
+
+def test_timeout_still_rebuts_an_unbacked_held_sentence_it_flushes():
+    held = "I opened the folder. "
+    client = FakeClient(DelayedFinalStream(
+        [held], content=[text_block(held)], final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # Salvaging the tail must not smuggle an unbacked claim past the guard.
+    assert asyncio.run(collect(brain, "open my downloads")) == [
+        UNBACKED_ACTION_REPLY, TIMEOUT_REPLY,
+    ]
+
+
+def test_timeout_after_spoken_sentences_offers_to_continue_and_keeps_the_prefix():
+    # F1: the long reply ran out of clock mid-stream after Daniel already
+    # heard most of it. "I lost that one to a timeout" was false, and the
+    # abort path never remembered the prefix, so "continue" had nothing to
+    # resume.
+    sentences = [
+        "The calendar is clear until eleven. ",
+        "After that there are two blocks back to back. ",
+        "The second one runs long. ",
+    ]
+    client = FakeClient(DelayedFinalStream(
+        sentences,
+        content=[text_block("".join(sentences))],
+        final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    spoken = asyncio.run(collect(brain, "what does my day look like"))
+
+    assert spoken == [*sentences, TRUNCATED_REPLY]
+    assert TIMEOUT_REPLY not in "".join(spoken)
+    assert brain._history == [
+        {"role": "user", "content": "what does my day look like"},
+        {"role": "assistant", "content": "".join(sentences) + TRUNCATED_REPLY},
+    ]
+
+
+def test_timeout_before_any_sentence_still_says_it_lost_the_turn():
+    client = FakeClient(DelayedFinalStream(
+        [], content=[], final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # Nothing was delivered, so the honest line is the timeout one -- and an
+    # empty prefix is not worth a history entry.
+    assert asyncio.run(collect(brain, "what does my day look like")) == [TIMEOUT_REPLY]
+    assert brain._history == []
+
+
+def test_provider_failure_after_spoken_sentences_keeps_the_prefix_in_history():
+    class ProviderFailure(RuntimeError):
+        status_code = 500
+
+    spoken = "The calendar is clear until eleven. "
+    client = FakeClient(
+        FakeStream([spoken], content=[tool_block(name="lookup")], stop_reason="tool_use"),
+        ProviderFailure("boom"),
+    )
+    brain = Brain(client, FakeRegistry(ToolResult("ok", "looked up")), model="fast", persona="")
+
+    # The model genuinely errored, so PROVIDER_REPLY's wording stands; only
+    # the amnesia was wrong.
+    assert asyncio.run(collect(brain, "what does my day look like")) == [
+        spoken, PROVIDER_REPLY,
+    ]
+    assert brain._history == [
+        {"role": "user", "content": "what does my day look like"},
+        {"role": "assistant", "content": spoken + PROVIDER_REPLY},
+    ]
+
+
+def test_provider_failure_flushes_backed_held_sentences_before_the_host_line(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+
+    class ProviderFailure(RuntimeError):
+        status_code = 500
+
+    held = "I opened the folder. "
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        # The held sentence is generated and backed, then the NEXT round's
+        # request dies at the provider -- the tail used to die with it.
+        FakeStream([held], content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        ProviderFailure("private token must not escape"),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "open my downloads")) == [held, PROVIDER_REPLY]
+    assert "held reply chunks flushed on provider error (held=1)" in caplog.text
+    assert "private token" not in caplog.text
+
+
+def test_confirmation_narration_cut_at_the_token_cap_offers_to_continue(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "Send the draft?", confirm_id="cid-1"),
+        ToolResult("ok", "sent"),
+    )
+    fragment = "Okay, and the part you asked about is that the "
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Send the draft?"], content=[text_block("Send the draft?")]),
+        FakeStream([fragment], content=[text_block(fragment)], stop_reason="max_tokens"),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        first = await collect(brain, "Send the draft")
+        second = await collect(brain, "yes")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == ["Send the draft?"]
+    # The narration lane spends the same cap and was the one flush that never
+    # read stop_reason.
+    assert second == [fragment, TRUNCATED_REPLY]
+    assert "confirmation narration hit the token cap" in caplog.text
+
+
+def test_truncated_narration_drops_the_offer_when_a_claim_is_rebutted():
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "Send the draft?", confirm_id="cid-1"),
+        ToolResult("ok", "sent"),
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Send the draft?"], content=[text_block("Send the draft?")]),
+        FakeStream(
+            ["I sent the draft. "],
+            content=[text_block("I sent the draft. ")],
+            stop_reason="max_tokens",
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        await collect(brain, "Send the draft")
+        return await collect(brain, "yes")
+
+    # The rebuttal keeps the last word: offering to continue a claim the host
+    # just retracted would undo the retraction.
+    assert asyncio.run(scenario()) == [UNBACKED_ACTION_REPLY]
+
+
+# --- taint classified from config, not from the tool's name (CC3) -----------
+
+def _files_brain(tmp_path, first_tool, *, content_bearing):
+    """A real registry over one named root, plus one MCP-shaped tool.
+
+    The model reads that tool, then tries to open the root BOTH ways: by name
+    and by path. What each attempt does is the whole question this unit turns
+    from an accident of the tool's name into a declared fact.
+    """
+    from worker.localfiles import LocalFiles
+
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    launched: list[str] = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name=first_tool,
+        description="Test tool.",
+        input_schema={"type": "object", "properties": {}},
+        run=lambda _arguments: return_value("C:/Users/danie/Downloads"),
+        content_bearing=content_bearing,
+    ))
+    builtin(registry, {}, BrainWork(), files=LocalFiles(
+        [{"path": str(downloads), "name": "downloads"}],
+        folder_opener=launched.append,
+    ))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name=first_tool)], stop_reason="tool_use"),
+        FakeStream(
+            content=[
+                tool_block(
+                    call_id="by_root", name="open_folder", arguments={"root": "downloads"},
+                ),
+                tool_block(
+                    call_id="by_path", name="open_folder",
+                    arguments={"path": str(downloads)},
+                ),
+            ],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Opened."], content=[text_block("Opened.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Which folders can you reach? Open downloads")) == [
+        "Opened.",
+    ]
+    by_root, by_path = client.messages.calls[2]["messages"][-1]["content"]
+    return by_root, by_path, launched, downloads
+
+
+def test_a_host_authored_mcp_result_does_not_taint_the_turn(tmp_path):
+    """The regression this unit exists for.
+
+    files__list_allowed_directories returns nothing but the CLI allowlist this
+    host handed the server. Under the old name-shape rule the "__" made it
+    content-bearing, so merely asking Atlas which folders it could reach
+    refused every later path -- the misstep that turned into silence.
+    """
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "files__list_allowed_directories", content_bearing=False,
+    )
+
+    assert by_root["is_error"] is False
+    # Nothing tainted the turn, so a plain path works again too.
+    assert by_path["is_error"] is False
+    assert json.loads(by_path["content"]) == {"opened": str(downloads.resolve())}
+    assert launched == [str(downloads.resolve()), str(downloads.resolve())]
+
+
+def test_a_genuinely_content_bearing_result_still_refuses_paths_but_not_roots(tmp_path):
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "google__search_gmail_messages", content_bearing=True,
+    )
+
+    # The wall still stands where it matters: a model-authored path dies.
+    assert by_path["is_error"] is True
+    assert by_path["content"] == (
+        "refused after external content; use a handle from an earlier find_file "
+        "result in this turn, or ask Daniel again next turn"
+    )
+    # A root is one of N host-authored constants, so it survives -- which is
+    # what keeps "open my downloads" answerable after reading mail.
+    assert by_root["is_error"] is False
+    assert json.loads(by_root["content"]) == {"opened": str(downloads.resolve())}
+    assert launched == [str(downloads.resolve())]
+
+
+def test_an_undeclared_mcp_tool_still_taints_by_name_shape(tmp_path):
+    """The fallback stays fail-closed.
+
+    A tool that declares nothing -- an unconfigured server, a Tool built
+    outside the mirror -- must not be assumed harmless just because the
+    registry has no answer for it.
+    """
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "notion__query_database", content_bearing=None,
+    )
+
+    assert by_path["is_error"] is True
+    assert by_root["is_error"] is False
+    assert launched == [str(downloads.resolve())]
+
+
+def test_content_bearing_lookup_prefers_the_registry_over_the_name_shape():
+    class Declaring:
+        def content_bearing(self, name):
+            return {"quiet__tool": False, "loud_tool": True}.get(name)
+
+    registry = Declaring()
+
+    # Declared values win in both directions...
+    assert brain_mod._content_bearing_tool(registry, "quiet__tool") is False
+    assert brain_mod._content_bearing_tool(registry, "loud_tool") is True
+    # ...and anything undeclared falls back to the old, fail-closed shape.
+    assert brain_mod._content_bearing_tool(registry, "google__read") is True
+    assert brain_mod._content_bearing_tool(registry, "read_file") is True
+    assert brain_mod._content_bearing_tool(registry, "find_file") is False
+    # A registry that cannot answer at all (an older double) is not a crash.
+    assert brain_mod._content_bearing_tool(object(), "google__read") is True
+    assert brain_mod._content_bearing_tool(None, "find_file") is False

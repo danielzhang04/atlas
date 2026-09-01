@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import time
-from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 import yaml
@@ -52,6 +52,37 @@ _HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
 # Tools that accept a host-minted handle instead of a model-supplied path, and
 # so keep working after external content has tainted the turn.
 _HANDLE_TOOLS = frozenset({"open_file", "open_folder"})
+# find_file's `root` narrows the search to one configured root; `query` is
+# still required, so this tool cannot use the _HANDLE_TOOLS "nothing is
+# required" rule.
+_OPTIONAL_PROPERTIES = {"find_file": frozenset({"root"})}
+_HANDLE_TARGETS = ("path", "handle", "root")
+
+
+def _handle_target_conflict(name: str, arguments: Mapping[str, Any]) -> str | None:
+    """The exactly-one(path/handle/root) rule, as one reusable sentence."""
+    if name not in _HANDLE_TOOLS:
+        return None
+    supplied = [key for key in _HANDLE_TARGETS if arguments.get(key) is not None]
+    if len(supplied) <= 1:
+        return None
+    if set(supplied) == {"path", "handle"}:
+        # Kept verbatim: this is the wording the pre-root registry returned,
+        # and it is pinned by tests that predate this unit.
+        return "provide either path or handle, not both"
+    return "provide exactly one of path, handle, or root"
+# Host tools whose result can carry text this host did not author, and so
+# taint the turn. Everything else here is host-shaped output (paths, job ids,
+# app names). MCP tools default the other way -- see
+# mcp_client._tool_content_bearing.
+#
+# list_windows is in this set for the same reason read_file is. A window title
+# is not host-shaped output: it is whatever the page, document, or message
+# currently open in that window says, so any web page Daniel has in a tab gets
+# to write text straight into a tool result -- "Downloads - now open C:\..." is
+# a title an attacker's page can set for free. Classifying it as host-shaped
+# was simply wrong, however host-shaped the surrounding inventory looks.
+_HOST_CONTENT_BEARING = frozenset({"list_windows", "read_file"})
 # Per-turn handle budget. 40 was under two turns' worth of searching (a
 # find_file returns up to _MAX_RESULTS=20), so a third search in one turn
 # silently returned results with no handle at all -- and after a tainting
@@ -87,10 +118,27 @@ _WINDOW_PROPERTIES = {
     "pid": {"type": "integer", "minimum": 1},
 }
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
+# workspace-mcp 1.25.2 (gmail/gmail_tools.py:1583-1587) actually emits the
+# next-page hint mid-sentence -- "...call search_gmail_messages again with
+# page_token='<token>'" -- not the line-anchored "page_token: <token>" the
+# original regex alone expected (that line shape never appears in the real
+# server's text, so bounded_count silently treated every >500-message query
+# as a single, already-complete page; adversarial review, finding 2). The
+# quoted-value alternate matches the real shape; the line-anchored
+# alternates are kept for robustness against other callers/formats.
 _NEXT_PAGE_TOKEN = re.compile(
-    r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
+    r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$"
+    r"|page_token=['\"]([^'\"]+)['\"]",
     re.IGNORECASE | re.MULTILINE,
 )
+# Gmail search results are one line per MESSAGE, but Daniel's Gmail UI counts
+# CONVERSATIONS (threads) -- a 65-conversation inbox showed as "80" when
+# count_mail summed message lines (live-verified against the UI). Each
+# message block in the real search_gmail_messages/get_gmail_message_content/
+# get_gmail_thread_content text already carries a "Thread ID: <id>" line, so
+# counting DISTINCT thread ids across pages gets the UI-matching number
+# without a second API surface.
+_THREAD_ID = re.compile(r"^[ \t]*Thread ID[ \t]*:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 
 logger = logging.getLogger("atlas.tools")
 
@@ -112,6 +160,20 @@ class Tool:
     prepare: Callable[[dict], dict | _PreparedAction] | None = None
     execute_prepared: Callable[[dict, Any], Awaitable[Any]] | None = None
     domain: str | None = None
+    # Whether this tool's result can carry content from outside Atlas, and so
+    # taints the rest of the turn. Declared per tool instead of guessed from
+    # the tool's NAME: the old name-shape rule ("__" in name) taints on every
+    # MCP tool, including files__list_allowed_directories, whose entire output
+    # is the host's own CLI argv. That misclassification turned a harmless
+    # orientation call into turn-wide silence.
+    #
+    # None means UNDECLARED, and is the default on purpose. A `bool` default
+    # would be fail-open: any Tool built outside builtin()/_mirror_tool --
+    # including a `google__read` stood up ad hoc -- would silently declare
+    # itself harmless and disarm the taint wall. Undeclared instead falls back
+    # to the name shape (see brain._content_bearing_tool), which still taints
+    # anything that looks like an MCP tool.
+    content_bearing: bool | None = None
     # Consulted only when policy == "instant" (see ToolRegistry.call); this is
     # what makes "escalate can only move instant -> confirm" structurally true
     # rather than a convention callers must remember.
@@ -230,6 +292,7 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         self._pending: PendingAction | None = None
         self._open_aliases: frozenset[str] = frozenset()
+        self._root_names: frozenset[str] = frozenset()
         self._executions: dict[object, dict[str, str]] = {}
         self._execution_observer: Callable[[dict[str, str] | None], None] | None = None
         self._handles = _HandleTable()
@@ -287,6 +350,16 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def content_bearing(self, name: str) -> bool | None:
+        """Whether a registered tool's output taints the turn.
+
+        None means "no answer here" -- either the name is not registered, or
+        the tool it names never declared one. Both leave the caller on its own
+        fail-closed fallback.
+        """
+        tool = self._tools.get(name)
+        return None if tool is None else tool.content_bearing
+
     def schemas(self) -> list[dict]:
         return [
             {
@@ -318,6 +391,17 @@ class ToolRegistry:
                     "a previous action is still awaiting Daniel's yes or no",
                 )
             copied = deepcopy(dict(arguments))
+            # Exactly-one(path/handle/root) is settled BEFORE the taint gate,
+            # because the taint gate's own reasoning depends on it: "a root-only
+            # call carries no model-authored target" is only true of a call that
+            # really is root-only. Deciding admission first and validating the
+            # shape afterwards would have the layer that makes the claim trust a
+            # check that has not run yet. It still runs again in file_target --
+            # the schema cannot express the constraint (no top-level oneOf), so
+            # both the gate and the executor enforce it independently.
+            conflict = _handle_target_conflict(name, copied)
+            if conflict is not None:
+                return ToolResult("error", conflict)
             if tainted and self._refused_after_external_content(name, copied):
                 return ToolResult(
                     "error",
@@ -411,6 +495,10 @@ class ToolRegistry:
     def _configure_open_aliases(self, aliases: Mapping[str, Any]) -> None:
         self._open_aliases = frozenset(aliases)
 
+    def _configure_root_names(self, names: Any) -> None:
+        """Host-only: the closed root vocabulary the taint carve-out rests on."""
+        self._root_names = frozenset(names)
+
     def _refused_after_external_content(
         self,
         name: str,
@@ -420,7 +508,7 @@ class ToolRegistry:
             # The only thing that survives taint here is a handle this host
             # minted earlier in THIS turn; a model-supplied path -- and an
             # unminted or expired handle -- is still refused.
-            return not self._handle_only_call(arguments)
+            return not self._handle_only_call(name, arguments)
         if name in {
             "close",
             "focus",
@@ -444,9 +532,40 @@ class ToolRegistry:
             return False
         return _direct_https(target.strip())
 
-    def _handle_only_call(self, arguments: Mapping[str, Any]) -> bool:
+    def _handle_only_call(self, name: str, arguments: Mapping[str, Any]) -> bool:
+        """True when the target came from the host, not from the model.
+
+        Two shapes qualify. A handle this host minted earlier in THIS turn,
+        and -- boss-approved for the CC3 unit -- a bare `root`.
+
+        `root` survives taint because it is not a target the model authored:
+        the schema offers a closed enum generated from the LIVE resolved
+        file_roots, so the widest thing planted content can achieve is to
+        pick a different one of the N directories Daniel already configured
+        as readable. It cannot name a new directory, cannot traverse, and
+        cannot reach anything outside the roots -- LocalFiles.resolve still
+        runs on the host's own Path afterwards. That is the same carve-out
+        shape as configured open aliases in _refused_after_external_content
+        below: a closed, host-authored vocabulary survives taint; free text
+        does not. `path` is free text, so a call carrying one is still
+        refused even when a root is also present.
+
+        The membership test is HERE rather than left to LocalFiles further
+        downstream, so the sentence above is enforced by the same line that
+        relies on it: an out-of-enum root is free text wearing a root's name,
+        and is refused as free text. Only open_folder accepts a root at all
+        (a root is a directory), so a root smuggled into open_file does not
+        buy passage either.
+        """
         if arguments.get("path") is not None:
             return False
+        root = arguments.get("root")
+        if root is not None:
+            return (
+                name == "open_folder"
+                and isinstance(root, str)
+                and root.strip().casefold() in self._root_names
+            )
         return self._handles.resolve(arguments.get("handle")) is not None
 
     async def confirm(self, confirm_id: str) -> ToolResult:
@@ -659,10 +778,43 @@ def builtin(
         # tools. Note ambient turns arrive tainted from entry (brain.respond
         # sets tainted=bool(context)), so the whole chain can run tainted --
         # which is exactly why minting must not require an untainted turn.
+        #
+        # THE BLAST RADIUS OF THAT ACCEPTANCE GREW, and this is the honest
+        # statement of it. Two things changed under this comment:
+        #   1. file_roots now includes the whole home directory, so a tainted
+        #      read_file reaches every readable file under ~ -- not the four
+        #      narrow folders this paragraph was written about. Credential
+        #      shapes are refused in worker/localfiles.py, but ordinary
+        #      documents (tax returns, medical letters, private notes) are
+        #      exactly what remains readable, and that is the point of a
+        #      home root.
+        #   2. The same turn also offers instant tools that take a free-text
+        #      query and send it OUTWARD: count_mail, google__search_*, and
+        #      kb_repo_search. So planted content can steer a read AND then
+        #      steer a query carrying what was read. Nothing here refuses
+        #      that chain: the taint wall governs ACTION targets (which file
+        #      gets opened), not the CONTENT of a later tool's arguments.
+        # This is a real exfiltration path, it is accepted for now rather than
+        # unnoticed, and closing it is argument-level egress guarding -- a
+        # separate unit, deliberately NOT attempted here, because doing it
+        # badly (a keyword filter on query strings) would read as protection
+        # while providing none.
+        # What that chain CAN read is now bounded on every path (2026-09-01
+        # final gate, F3): the files MCP server is write-only, so reads run
+        # only through find_file/read_file here, behind localfiles.resolve's
+        # credential shield. The steerable material is Daniel's ordinary
+        # documents, never a credential-shaped file.
         query = _text_argument(arguments, "query", maximum=512)
+        root = arguments.get("root")
+        if root is not None:
+            root = _text_argument(arguments, "root", maximum=128)
+            # Validated on the loop thread so an unknown name comes back as a
+            # clean, immediate error instead of costing a worker thread and a
+            # whole scan budget first.
+            files.resolve_root(root)
         # Kinds are stat'ed on the same worker thread as the scan; minting then
         # happens back on the loop thread so the registry stays single-threaded.
-        found = await asyncio.to_thread(_matches_with_kind, files, query)
+        found = await asyncio.to_thread(_matches_with_kind, files, query, root)
         results = []
         for item, kind in found:
             handle = registry._mint_handle(item["path"], kind)
@@ -680,6 +832,21 @@ def builtin(
 
     def file_target(arguments: dict, expected: Literal["file", "folder"]) -> str:
         handle = arguments.get("handle")
+        root = arguments.get("root")
+        if root is not None:
+            # Exactly one of path/handle/root, enforced here rather than in the
+            # schema: a top-level oneOf is rejected by the Messages API
+            # (api_incompatible_tool_names), so the schema marks nothing
+            # required and the host does the choosing -- the C1 precedent.
+            if handle is not None or arguments.get("path") is not None:
+                raise ValueError("provide exactly one of path, handle, or root")
+            if expected != "folder":
+                raise ValueError("root names a folder; use open_folder")
+            # The model chose a NAME; the host substitutes the Path it already
+            # resolved at startup. LocalFiles.resolve still runs downstream, so
+            # a root that has since been removed or replaced by a link is
+            # refused exactly like any other target.
+            return str(files.resolve_root(root))
         if handle is None:
             return _text_argument(arguments, "path", maximum=2048)
         if arguments.get("path") is not None:
@@ -811,43 +978,72 @@ def builtin(
         }, close),
     )
     if files is not None:
+        # getattr, not attribute access: `files` is a duck type here (the
+        # confined-service seam), and a stand-in without named roots should
+        # lose the `root` argument, not fail to register the file tools.
+        root_names = sorted(getattr(files, "root_names", {}))
+        # The registry needs the same closed vocabulary the schema enum
+        # publishes, so the taint carve-out can check membership itself.
+        registry._configure_root_names(root_names)
+        listed = _root_list(root_names)
+        # An empty enum is not a valid schema, so a LocalFiles whose roots all
+        # failed to resolve simply offers no `root` property -- path/handle
+        # still work, and the descriptions omit the roots sentence.
+        root_property = (
+            {"root": {"type": "string", "enum": root_names}} if root_names else {}
+        )
         definitions += (
             ("find_file", (
                 "Find files and folders under configured roots. Every match carries a "
                 "handle you can pass to open_file or open_folder for the rest of this turn."
+                f"{_roots_sentence(listed)}"
+                + (
+                    " Pass root to search just that one. Searches are time-bounded, so a "
+                    "search across a large root can be partial."
+                    if root_names else ""
+                )
             ), {
-                "query": {"type": "string"},
+                "query": {"type": "string"}, **root_property,
             }, find_file),
             ("open_file", (
-                "Open an inert document or media file under configured roots. Pass handle "
-                "whenever this turn's find_file returned one; pass path only without a "
-                "handle -- never both. After any tool that returns outside content, only a "
-                "handle works."
+                "Open an inert document or media file under configured roots. Handles come "
+                "from find_file: pass handle whenever this turn's find_file returned one; "
+                "pass path only without a handle -- never both. After any tool that returns "
+                "outside content, only a handle works."
             ), {
                 "path": {"type": "string"}, "handle": {"type": "string"},
             }, open_file),
             ("open_folder", (
-                "Open a directory under configured roots in Explorer. Pass handle whenever "
-                "this turn's find_file returned one -- a file's handle opens the folder "
-                "containing it; pass path only without a handle, never both. After any tool "
-                "that returns outside content, only a handle works."
+                "Open a directory under configured roots in Explorer. To open a root itself, "
+                "pass root -- that is the way to answer \"open my downloads\", and it keeps "
+                "working after a tool has returned outside content."
+                f"{_roots_sentence(listed)} Otherwise pass handle, which find_file returns "
+                "for every match -- a file's handle opens the folder containing it. Pass "
+                "path only without a handle or root, never more than one of the three."
             ), {
-                "path": {"type": "string"}, "handle": {"type": "string"},
+                "path": {"type": "string"}, "handle": {"type": "string"}, **root_property,
             }, open_folder),
             ("read_file", "Read small text or route previewed large-file analysis to launch_work.", {
                 "path": {"type": "string"},
             }, read_file),
         )
     for name, description, properties, run in definitions:
-        # Handle tools take exactly one of path/handle, so neither is required
-        # by the schema; the host enforces the choice (a top-level oneOf is not
-        # accepted by the Messages API -- api_incompatible_tool_names).
+        # Handle tools take exactly one of path/handle/root, so none of them is
+        # required by the schema; the host enforces the choice (a top-level
+        # oneOf is not accepted by the Messages API --
+        # api_incompatible_tool_names).
+        optional = _OPTIONAL_PROPERTIES.get(name, frozenset())
         schema = {
             "type": "object", "properties": properties,
-            "required": [] if name in _HANDLE_TOOLS else list(properties),
+            "required": [] if name in _HANDLE_TOOLS else [
+                key for key in properties if key not in optional
+            ],
             "additionalProperties": False,
         }
-        registry.register(Tool(name, description, schema, run))
+        registry.register(Tool(
+            name, description, schema, run,
+            content_bearing=name in _HOST_CONTENT_BEARING,
+        ))
 
     desktop_definitions = (
         (
@@ -910,7 +1106,10 @@ def builtin(
         ),
     )
     for name, description, schema, run in desktop_definitions:
-        registry.register(Tool(name, description, schema, run))
+        registry.register(Tool(
+            name, description, schema, run,
+            content_bearing=name in _HOST_CONTENT_BEARING,
+        ))
 
     delete_schema = {
         "type": "object",
@@ -928,6 +1127,7 @@ def builtin(
         policy="confirm",
         prepare=prepare_delete,
         execute_prepared=execute_desktop_press_delete,
+        content_bearing="press_delete" in _HOST_CONTENT_BEARING,
     ))
 
 
@@ -941,7 +1141,7 @@ def register_count_mail(
         query = _text_argument(arguments, "query", maximum=1024)
 
         async def bounded_count(target_query: str) -> tuple[int, bool] | ToolResult:
-            total = 0
+            threads: set[str] = set()
             page_token = None
             seen_tokens: set[str] = set()
             for _page in range(4):
@@ -964,17 +1164,28 @@ def register_count_mail(
                 page_count = int(found.group(1))
                 if page_count > 500:
                     return ToolResult("error", "unexpected mail search result")
-                total += page_count
+                page_threads = _THREAD_ID.findall(content)
+                # Fail closed: a page that reports messages but carries no
+                # Thread ID lines is not the shape count_mail was built
+                # against (see the module-level _THREAD_ID comment) -- silently
+                # falling back to the message count would reintroduce the
+                # UI mismatch this rewrite exists to fix.
+                if page_count > 0 and not page_threads:
+                    return ToolResult("error", "unexpected mail search result")
+                threads.update(page_threads)
                 token_match = _NEXT_PAGE_TOKEN.search(content)
-                page_token = token_match.group(1) if token_match is not None else None
+                page_token = (
+                    (token_match.group(1) or token_match.group(2))
+                    if token_match is not None else None
+                )
                 if page_token is None:
-                    return total, True
+                    return len(threads), True
                 if page_count < 500:
                     return ToolResult("error", "unexpected mail search result")
                 if page_token in seen_tokens:
-                    return total, False
+                    return len(threads), False
                 seen_tokens.add(page_token)
-            return total, page_token is None
+            return len(threads), page_token is None
 
         inbox_count = await bounded_count(query)
         if isinstance(inbox_count, ToolResult):
@@ -992,17 +1203,19 @@ def register_count_mail(
             primary_text = str(primary_total) if primary_exact else f"at least {primary_total}"
             return ToolResult(
                 "ok",
-                f"{inbox_text} in your inbox, {primary_text} in Primary",
+                f"{inbox_text} conversations in your inbox, {primary_text} in Primary",
             )
         total, exact = inbox_count
-        return {"query": query, "count": total, "exact": exact}
+        return {"query": query, "conversations": total, "exact": exact}
 
     schema = {
         "type": "object", "properties": {"query": {"type": "string"}},
         "required": ["query"], "additionalProperties": False,
     }
     registry.register(Tool(
-        "count_mail", "Count Gmail messages exactly across bounded search pages.",
+        "count_mail",
+        "Count Gmail conversations exactly across bounded search pages, matching "
+        "the count Daniel's Gmail UI shows (not a raw message count).",
         schema, count_mail,
     ))
 
@@ -1041,10 +1254,44 @@ def _open_description(aliases: Mapping[str, tuple[str, AppEntry]]) -> str:
     )
 
 
-def _matches_with_kind(files: LocalFiles, query: str) -> list[tuple[dict, str]]:
+_ROOT_DESCRIPTION_NAME_LIMIT = 12
+# Root names are host-configured but unbounded in LENGTH, so the count cap
+# alone does not bound the schema text -- same reasoning, and same
+# whole-name truncation, as _open_description above.
+_ROOT_DESCRIPTION_CHARACTER_LIMIT = 200
+
+
+def _root_list(names: Sequence[str]) -> str:
+    kept = list(names[:_ROOT_DESCRIPTION_NAME_LIMIT])
+    while kept and len(", ".join(kept)) > _ROOT_DESCRIPTION_CHARACTER_LIMIT:
+        kept.pop()
+    listed = ", ".join(kept)
+    if len(names) > len(kept):
+        listed += ", ..." if listed else "..."
+    return listed
+
+
+def _roots_sentence(listed: str) -> str:
+    """Name the roots in the schema text.
+
+    Without this the model has no way to learn the roots exist short of
+    calling a tool to discover them, which is how "I have no local kb folder"
+    got said about a configured root.
+    """
+    return f" Roots: {listed}." if listed else ""
+
+
+def _matches_with_kind(
+    files: LocalFiles,
+    query: str,
+    root: str | None = None,
+) -> list[tuple[dict, str]]:
     """Pair each host-produced match with the kind the host stats itself."""
     matches: list[tuple[dict, str]] = []
-    for item in files.find(query):
+    # Unscoped searches keep the one-argument call: `files` is a duck type,
+    # and only a scoped search needs the newer signature.
+    found = files.find(query) if root is None else files.find(query, root=root)
+    for item in found:
         if not isinstance(item, Mapping):
             continue
         path = item.get("path")
