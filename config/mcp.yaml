@@ -99,6 +99,45 @@ servers:
       search_gmail_messages: local_time
       get_gmail_message_content: local_time
       get_gmail_thread_content: local_time
+    # Link handles (DD-2/F1). A Drive document's only address is a URL, and
+    # that URL only ever appears inside a google result -- which taints the
+    # turn, after which `open` refuses every non-alias URL. So "open my
+    # skincare guide" could not be answered at all: the model could see the
+    # link and had no legal way to act on it. link_pattern names a host-side
+    # extractor (mcp_client._LINK_PATTERNS, never a regex from config) that
+    # tags each matching link with a one-turn handle; `open` then takes the
+    # handle, never the URL.
+    #
+    # link_hosts is the closed destination vocabulary, boss-approved. Every
+    # extracted URL is checked against it TWICE -- once when the handle is
+    # minted, once when open spends it -- so a hostile link can never reach a
+    # NEW ORIGIN. Adding a host here is Daniel's explicit decision.
+    #
+    # "Never a new origin" is the whole guarantee, and it is narrower than it
+    # sounds. Forged Link: lines ARE reachable: workspace-mcp interpolates
+    # Drive file names into its result text unescaped and without stripping
+    # newlines, so a file an attacker shares into Daniel's Drive can put a
+    # whole "Link: https://..." line of the attacker's choosing into a
+    # search_drive_files result. Anchoring the pattern at end-of-line does
+    # not stop that; only this allowlist does. What an attacker can therefore
+    # aim `open` at, on these hosts:
+    #   - drive.google.com/uc?export=download&id=... -- a one-click download
+    #     of an arbitrary attacker-supplied file into Daniel's Downloads
+    #     folder. It lands as a file, unopened and unexecuted, but it lands.
+    #     OPEN DECISION for Daniel, not settled here.
+    #   - mail.google.com/mail/?view=cm&to=...&su=...&body=... -- a compose
+    #     window pre-filled with the attacker's recipient, subject and body.
+    #     It still takes Daniel pressing send.
+    #   - docs.google.com/... -- any document the attacker shared, which is a
+    #     credible phishing page ("sign in to view") wearing a Google origin
+    #     and a Google TLS certificate, which is exactly what makes it worth
+    #     something to an attacker.
+    # None of these is a code-execution path and none reaches a non-Google
+    # origin; all of them are a step up from "the link just sits there as
+    # text". The carve-out is accepted with that understood.
+    link_pattern: trailing_link
+    link_hosts: [docs.google.com, drive.google.com, sheets.google.com,
+                 slides.google.com, mail.google.com, calendar.google.com]
   chrome-devtools:
     from_claude_config: chrome-devtools
     domain: browser

@@ -46,6 +46,7 @@ except ModuleNotFoundError:
     sys.modules["worker.tools"] = tools_module
 
 import worker.mcp_client as mcp_client
+import worker.tools as tools
 from worker.mcp_client import McpServers, load_mcp_config, policy_for
 from worker.tools import McpToolError
 from worker.tools import ToolRegistry
@@ -951,9 +952,12 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     )
     # Track C2 (files) pushed the curated total from 72 to 84; F3's
     # write-only files server brings it back to 77 -- still over the C0
-    # budget, flagged rather than hidden; see this test's docstring.
-    assert builtin_count == 19
-    assert total == 77
+    # budget, flagged rather than hidden; see this test's docstring. DD-2
+    # adds one: focus_last_opened, which is a zero-argument tool whose whole
+    # job is to REPLACE a two-call list_windows/focus_window sequence, so it
+    # costs one schema and saves a turn.
+    assert builtin_count == 20
+    assert total == 78
     assert total < 116  # still net negative against the pre-C0 baseline
 
 
@@ -2922,6 +2926,322 @@ def test_describe_rejects_a_non_string_empty_or_malformed_map():
         mcp_client._tool_description({"describe": {"widget": 7}}, "widget", "remote")
     with pytest.raises(ValueError, match="describe"):
         mcp_client._tool_description({"describe": ["not", "a", "map"]}, "widget", "remote")
+
+
+# --- link_pattern: / link_hosts: --------------------------------------
+
+# Real shape, copied from the pinned workspace-mcp 1.25.2
+# (gdrive/drive_tools.py:318): one result line per file, the webViewLink
+# last, after the parenthesised metadata.
+_DRIVE_RESULT = (
+    'Found 2 files:\n'
+    '- Name: "Skincare guide" (ID: 1a2b, Type: application/pdf, Size: 12 KB,'
+    ' Modified: 2026-08-30) Link: https://drive.google.com/file/d/1a2b/view\n'
+    '- Name: "Q3 plan" (ID: 3c4d, Type: application/vnd.google-apps.document,'
+    ' Modified: 2026-08-31) Link: https://docs.google.com/document/d/3c4d/edit\n'
+)
+_GOOGLE_LINK_CFG = {
+    "link_pattern": "trailing_link",
+    "link_hosts": ["drive.google.com", "docs.google.com"],
+}
+
+
+class _LinkRegistry:
+    """Just the two host hooks the mirror is allowed to touch."""
+
+    def __init__(self, budget=None):
+        self.minted = []
+        self.hosts = frozenset()
+        self._budget = budget
+
+    def _mint_handle(self, value, kind):
+        assert kind == "link"
+        if self._budget is not None and len(self.minted) >= self._budget:
+            return None
+        self.minted.append(value)
+        return f"u{len(self.minted)}"
+
+    def _configure_link_hosts(self, hosts):
+        self.hosts |= frozenset(hosts)
+
+
+def _link_tool(registry, text, server_cfg=None):
+    class FakeSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text=text)], isError=False,
+            )
+
+    servers = McpServers({"servers": {}})
+    return servers._mirror_tool(
+        "google",
+        _GOOGLE_LINK_CFG if server_cfg is None else server_cfg,
+        {},
+        FakeSession(),
+        SimpleNamespace(
+            name="search_drive_files", description="d",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        registry,
+    )
+
+
+def test_a_real_shaped_drive_result_mints_one_handle_per_allowlisted_link():
+    registry = _LinkRegistry()
+
+    result = asyncio.run(_link_tool(registry, _DRIVE_RESULT).run({}))
+
+    assert registry.minted == [
+        "https://drive.google.com/file/d/1a2b/view",
+        "https://docs.google.com/document/d/3c4d/edit",
+    ]
+    assert "Link: https://drive.google.com/file/d/1a2b/view [handle: u1]" in result
+    assert "Link: https://docs.google.com/document/d/3c4d/edit [handle: u2]" in result
+    # The host allowlist reached the registry, so the open-time re-check has
+    # the same vocabulary the mint-time check used.
+    assert registry.hosts == frozenset({"drive.google.com", "docs.google.com"})
+
+
+def test_a_poisoned_netloc_does_not_destroy_the_whole_result():
+    """DD-2/F1. One plantable URL must not take out every Google tool.
+
+    CPython's urlsplit RAISES ValueError when a netloc holds a character that
+    NFKC-normalizes into one of `/?#@:` -- fullwidth number sign is the
+    reproducer. That exception escaped the mint closure, escaped
+    pattern.sub, escaped the mirrored tool's run(), and ToolRegistry.call's
+    catch-all turned the ENTIRE result into ToolResult("error", "ValueError").
+    A single file an attacker shared into Daniel's Drive therefore made
+    search_drive_files, list_drive_items and get_drive_file_content fail
+    permanently, for every query, until the file went away.
+
+    The poisoned candidate must simply not mint, and everything around it in
+    the same result must survive untouched.
+    """
+    registry = _LinkRegistry()
+    poisoned = (
+        "Found 2 files:\n"
+        '- Name: "trap" (ID: 0) '
+        "Link: https://docs.google.com＃evil.com/x\n"
+        '- Name: "Q3 plan" (ID: 3c4d) '
+        "Link: https://docs.google.com/document/d/3c4d/edit\n"
+    )
+
+    result = asyncio.run(_link_tool(registry, poisoned).run({}))
+
+    # The real link still minted -- the result was not destroyed.
+    assert registry.minted == ["https://docs.google.com/document/d/3c4d/edit"]
+    assert "Link: https://docs.google.com/document/d/3c4d/edit [handle: u1]" in result
+    # The poisoned line is still readable text, it just carries no id.
+    assert "https://docs.google.com＃evil.com/x" in result
+    assert "＃evil.com/x [handle" not in result
+    # And the predicate itself answers rather than raising, at both ends.
+    assert tools._direct_https("https://docs.google.com＃evil.com/x") is False
+
+
+def test_an_allowlisted_host_on_a_nonstandard_port_is_not_openable():
+    """DD-2/F7. The allowlist vouches for a host, not for host:anyport.
+
+    A URL is only ever opened by handing it to the browser, and
+    docs.google.com:8443 is a different service from the one Daniel approved.
+    """
+    registry = _LinkRegistry()
+    ported = (
+        '- Name: "trap" (ID: 0) Link: https://docs.google.com:8443/document/d/x\n'
+        '- Name: "ok" (ID: 1) Link: https://docs.google.com:443/document/d/y\n'
+    )
+
+    result = asyncio.run(_link_tool(registry, ported).run({}))
+
+    # Only the explicit default port minted.
+    assert registry.minted == ["https://docs.google.com:443/document/d/y"]
+    assert "https://docs.google.com:8443/document/d/x [handle" not in result
+    assert tools._direct_https("https://docs.google.com:8443/x") is False
+    assert tools._direct_https("https://docs.google.com:443/x") is True
+    assert tools._direct_https("https://docs.google.com/x") is True
+    # A port that is not even a number is answered, not raised.
+    assert tools._direct_https("https://docs.google.com:notaport/x") is False
+
+
+def test_a_link_wrapped_in_punctuation_still_mints_the_url_without_it():
+    """DD-2/F8. `\\S+` cannot tell a URL from the punctuation around it.
+
+    The trimmed URL is what gets validated AND what gets minted, so the id
+    always spends exactly the URL the check passed.
+    """
+    registry = _LinkRegistry()
+    punctuated = (
+        "Link: https://docs.google.com/document/d/1/edit.\n"
+        'Link: https://docs.google.com/document/d/2/edit)\n'
+        'Link: "https://docs.google.com/document/d/3/edit"\n'
+    )
+
+    result = asyncio.run(_link_tool(registry, punctuated).run({}))
+
+    assert registry.minted == [
+        "https://docs.google.com/document/d/1/edit",
+        "https://docs.google.com/document/d/2/edit",
+    ]
+    # The note goes AFTER the punctuation, so the line still reads correctly.
+    assert "Link: https://docs.google.com/document/d/1/edit. [handle: u1]" in result
+    assert "Link: https://docs.google.com/document/d/2/edit) [handle: u2]" in result
+    # A leading quote is not part of the `https://` capture at all, so line
+    # three never matched -- unchanged, and no id.
+    assert '"https://docs.google.com/document/d/3/edit"\n' in result
+    # Trimming is right-hand only, so it can never rewrite the HOST into an
+    # allowlisted one.
+    assert mcp_client._trimmed_link("https://evil.com/x)") == "https://evil.com/x"
+
+
+def test_crlf_results_mint_exactly_what_lf_results_mint():
+    """DD-2/F9. `$` under MULTILINE only ever matches before a bare "\\n".
+
+    On a CRLF result `\\S+` stopped at the "\\r" and the anchor then failed one
+    character early, so the whole feature silently minted nothing -- with no
+    error anywhere to say so.
+    """
+    lf_registry = _LinkRegistry()
+    crlf_registry = _LinkRegistry()
+
+    lf = asyncio.run(_link_tool(lf_registry, _DRIVE_RESULT).run({}))
+    crlf = asyncio.run(
+        _link_tool(crlf_registry, _DRIVE_RESULT.replace("\n", "\r\n")).run({}),
+    )
+
+    assert crlf_registry.minted == lf_registry.minted
+    assert len(crlf_registry.minted) == 2
+    # _bounded_text drops the CRs afterwards, so the two results are then
+    # identical -- which is the point: line endings must not change what the
+    # model gets to act on.
+    assert crlf == lf
+
+    # Minting happens BEFORE that strip, so pin the annotation placement on
+    # the still-CRLF text: the note goes before the carriage return, not
+    # after it, so it can never be pushed onto the following line.
+    pattern, hosts = mcp_client._link_extraction(_GOOGLE_LINK_CFG)
+    minted = mcp_client._mint_link_handles(
+        "Link: https://docs.google.com/document/d/9/edit\r\n",
+        pattern, hosts, _LinkRegistry(),
+    )
+    assert minted == (
+        "Link: https://docs.google.com/document/d/9/edit [handle: u1]\r\n"
+    )
+
+
+def test_a_drive_file_named_like_a_url_does_not_mint_a_handle_for_that_name():
+    """Pattern anchoring: only the line-final Link: URL is a link.
+
+    A file NAMED "https://evil.test/x" -- or even one named to look like it
+    carries its own Link: -- lands mid-line, before the real Link: still to
+    come, so it can never satisfy \\S+$. Only the host's own trailing link
+    mints, and the attacker-chosen name mints nothing.
+    """
+    registry = _LinkRegistry()
+    hostile = (
+        '- Name: "https://evil.test/x" (ID: 9, Type: application/pdf)'
+        ' Link: https://drive.google.com/file/d/9/view\n'
+        '- Name: "Link: https://evil.test/y" (ID: 8, Type: application/pdf)'
+        ' Link: https://drive.google.com/file/d/8/view\n'
+    )
+
+    result = asyncio.run(_link_tool(registry, hostile).run({}))
+
+    assert registry.minted == [
+        "https://drive.google.com/file/d/9/view",
+        "https://drive.google.com/file/d/8/view",
+    ]
+    assert "evil.test/x [handle" not in result
+    assert "evil.test/y [handle" not in result
+
+
+def test_a_link_on_a_host_outside_the_allowlist_is_left_untouched():
+    """The allowlist -- not the anchor -- is what bounds a forged link line.
+
+    A file name containing a newline really can forge a whole "Link: ..."
+    line, which is why this case matters: the forged host is not configured,
+    so no handle exists for it and `open` has nothing to spend.
+    """
+    registry = _LinkRegistry()
+    forged = (
+        '- Name: "innocent" (ID: 7, Type: application/pdf)'
+        ' Link: https://drive.google.com/file/d/7/view\n'
+        'Link: https://evil.test/steal\n'
+        'Link: http://drive.google.com/insecure\n'
+        'Link: https://user:pw@drive.google.com/userinfo\n'
+    )
+
+    result = asyncio.run(_link_tool(registry, forged).run({}))
+
+    assert registry.minted == ["https://drive.google.com/file/d/7/view"]
+    assert "https://evil.test/steal\n" in result
+    assert "[handle" not in result.split("d/7/view [handle: u1]")[1]
+
+
+def test_link_minting_shares_the_handle_budget_and_says_so_when_it_runs_out():
+    registry = _LinkRegistry(budget=1)
+
+    result = asyncio.run(_link_tool(registry, _DRIVE_RESULT).run({}))
+
+    assert registry.minted == ["https://drive.google.com/file/d/1a2b/view"]
+    assert "[handle: u1]" in result
+    # The second link is a real, allowlisted link that simply has no id left.
+    # Saying so is what keeps the shortfall from looking like a rejection.
+    assert "https://docs.google.com/document/d/3c4d/edit [handle budget reached]" in result
+
+
+def test_links_are_not_extracted_for_a_server_that_configures_none():
+    registry = _LinkRegistry()
+
+    result = asyncio.run(_link_tool(registry, _DRIVE_RESULT, server_cfg={}).run({}))
+
+    assert registry.minted == []
+    assert result == _DRIVE_RESULT
+
+
+def test_links_are_not_extracted_when_no_registry_is_available():
+    """call_raw and any registry-less mirror keep the untouched remote text."""
+    result = asyncio.run(_link_tool(None, _DRIVE_RESULT).run({}))
+
+    assert "[handle" not in result
+
+
+def test_link_config_absent_returns_none_and_half_configured_is_rejected():
+    assert mcp_client._link_extraction({}) is None
+    with pytest.raises(ValueError, match="link pattern"):
+        mcp_client._link_extraction({"link_hosts": ["drive.google.com"]})
+    with pytest.raises(ValueError, match="link pattern"):
+        mcp_client._link_extraction(
+            {"link_pattern": "not_a_real_pattern", "link_hosts": ["a.test"]},
+        )
+    with pytest.raises(ValueError, match="link host"):
+        mcp_client._link_extraction({"link_pattern": "trailing_link"})
+    with pytest.raises(ValueError, match="link host"):
+        mcp_client._link_extraction(
+            {"link_pattern": "trailing_link", "link_hosts": "drive.google.com"},
+        )
+    with pytest.raises(ValueError, match="link host"):
+        mcp_client._link_extraction(
+            {"link_pattern": "trailing_link", "link_hosts": []},
+        )
+    with pytest.raises(ValueError, match="link host"):
+        mcp_client._link_extraction(
+            {"link_pattern": "trailing_link", "link_hosts": ["ok.test", 7]},
+        )
+
+
+def test_the_checked_in_google_server_configures_drive_link_handles():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    pattern, hosts = mcp_client._link_extraction(config["servers"]["google"])
+
+    assert pattern is mcp_client._LINK_PATTERNS["trailing_link"]
+    assert hosts == frozenset({
+        "docs.google.com", "drive.google.com", "sheets.google.com",
+        "slides.google.com", "mail.google.com", "calendar.google.com",
+    })
+    # No other checked-in server mints links.
+    assert [
+        name for name, cfg in config["servers"].items()
+        if mcp_client._link_extraction(cfg) is not None
+    ] == ["google"]
 
 
 # --- transform: -------------------------------------------------------

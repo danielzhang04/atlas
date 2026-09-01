@@ -238,6 +238,55 @@ def test_selected_window_identity_is_focused_without_resolving_ambiguous_pid():
     assert ("foreground", 10) in user32.calls
 
 
+def test_a_stored_window_is_revalidated_before_it_is_focused():
+    """DD-2/F4. An HWND is not a durable name -- Windows recycles them.
+
+    A stored record can be ten minutes old (tools._LAST_OPENED_TTL_S). A dead
+    handle already failed safe, because focusing it just failed. A RECYCLED
+    one did not: the number now belonged to a different process, and focusing
+    it put a stranger's window in front while reporting the stored record's
+    own stale title for it.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+
+    # Handle 10 is alive, but it now belongs to pid 101 -- not the pid 909
+    # this record was stored with. Recycled, so it is refused.
+    with pytest.raises(desktopcontrol.DesktopControlError, match="no longer available"):
+        desktopcontrol.focus_resolved_window(
+            {"_handle": 10, "title": "notes.txt - Notepad", "pid": 909},
+            user32=user32, kernel32=kernel32,
+        )
+    # A handle that is simply gone is refused the same way, and neither
+    # refusal touched the foreground.
+    with pytest.raises(desktopcontrol.DesktopControlError, match="no longer available"):
+        desktopcontrol.focus_resolved_window(
+            {"_handle": 9999, "title": "notes.txt - Notepad", "pid": 101},
+            user32=user32, kernel32=kernel32,
+        )
+    assert user32.calls == []
+
+
+def test_a_revalidated_window_reports_its_live_title_not_the_stored_one():
+    """What Atlas speaks back is the window's identity NOW.
+
+    The stored title is a snapshot from up to ten minutes ago. A document
+    renamed, or saved under another name, makes it stale -- and reporting a
+    stale title as though it were current is the same class of untruth as
+    focusing the wrong window.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    user32.windows[10]["title"] = "Report FINAL - Notepad"
+
+    result = desktopcontrol.focus_resolved_window(
+        {"_handle": 10, "title": "Report - Notepad", "pid": 101},
+        user32=user32, kernel32=kernel32,
+    )
+
+    assert result == {"focused": "Report FINAL - Notepad", "pid": 101}
+
+
 def test_window_actions_use_named_work_area_zones_resize_and_wm_close():
     user32 = FakeUser32()
     kernel32 = FakeKernel32()
@@ -349,3 +398,193 @@ def test_focused_identity_and_process_path_lookup_remain_host_side():
     assert desktopcontrol.MEDIA_KEYS == frozenset({
         "play_pause", "next", "previous", "volume_up", "volume_down", "mute",
     })
+
+
+def test_process_path_lookup_can_skip_windows_that_were_already_open():
+    """The explorer case: one process, many windows, only one of them new."""
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    user32.windows[40] = dict(user32.windows[20], title="Playlists")
+    kernel32.paths[202] = "C:/Apps/Spotify.exe"
+
+    first = desktopcontrol.find_window_by_process_path(
+        "C:/Apps/Spotify.exe", user32=user32, kernel32=kernel32,
+    )
+    fresh = desktopcontrol.find_window_by_process_path(
+        "C:/Apps/Spotify.exe", exclude_handles={20},
+        user32=user32, kernel32=kernel32,
+    )
+
+    assert first["_handle"] == 20
+    assert fresh == {"title": "Playlists", "pid": 202, "_handle": 40}
+    assert desktopcontrol.find_window_by_process_path(
+        "C:/Apps/Spotify.exe", exclude_handles={20, 40},
+        user32=user32, kernel32=kernel32,
+    ) is None
+    with pytest.raises(desktopcontrol.DesktopControlError, match="handle set"):
+        desktopcontrol.find_window_by_process_path(
+            "C:/Apps/Spotify.exe", exclude_handles={"20"},
+            user32=user32, kernel32=kernel32,
+        )
+
+
+def test_visible_window_handles_snapshots_only_visible_top_level_windows():
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+
+    assert desktopcontrol.visible_window_handles(
+        user32=user32, kernel32=kernel32,
+    ) == frozenset({10, 20})  # 30 is hidden
+
+
+def test_focus_new_window_focuses_the_one_window_that_appeared():
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    slept = []
+
+    def sleep(seconds):
+        # The window only shows up on the second poll, which is the real
+        # shape: startfile returns long before anything is on screen.
+        slept.append(seconds)
+        user32.windows[50] = dict(user32.windows[10], title="notes.txt", pid=101)
+
+    focused = desktopcontrol.focus_new_window(
+        before, 2.5, expected_process_paths=["C:/Windows/notepad.exe"],
+        interval_s=0.15, user32=user32, kernel32=kernel32,
+        clock=lambda: 0.0, sleep=sleep,
+    )
+
+    assert focused == {"title": "notes.txt", "pid": 101, "_handle": 50}
+    assert slept == [0.15]
+    assert ("foreground", 50) in user32.calls
+
+
+def test_focus_new_window_ignores_a_foreign_window_that_appeared_meanwhile():
+    """DD-2/F2. A toast from another process is not what the open produced.
+
+    New-since-the-snapshot was never evidence of causation. During the 2.5s
+    poll a Teams call toast, a reminder or an updater balloon is entirely
+    ordinary -- and with only the freshness diff, that toast got focused,
+    `open` reported focused: true about it, and the opened-record observer
+    filed the TOAST's title and pid under the opened file's label.
+
+    Here the foreign window is the ONLY new one, so there is nothing else to
+    mistake it for: it must simply not be focused, and nothing may be
+    returned for the host to record.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    # Teams pops a call toast a moment after os.startfile returned.
+    user32.windows[70] = dict(user32.windows[10], title="Incoming call", pid=707)
+    kernel32.paths[707] = "C:/Apps/Teams.exe"
+
+    # timeout 0: one enumeration lap, then the honest give-up. The toast is
+    # already on screen, so nothing here depends on polling.
+    assert desktopcontrol.focus_new_window(
+        before, 0, expected_process_paths=["C:/Windows/notepad.exe"],
+        user32=user32, kernel32=kernel32,
+        clock=lambda: 0.0, sleep=lambda _s: None,
+    ) is None
+    assert user32.calls == []
+
+
+def test_focus_new_window_still_finds_the_document_behind_a_foreign_toast():
+    """A stranger's window must not be able to block the real open either.
+
+    Exactly-one is applied to the IDENTIFIED candidates, not to every new
+    HWND on the desktop -- otherwise any background app that pops a toast
+    during the poll would silently cost Daniel the focus he asked for.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    user32.windows[70] = dict(user32.windows[10], title="Incoming call", pid=707)
+    kernel32.paths[707] = "C:/Apps/Teams.exe"
+    user32.windows[50] = dict(user32.windows[10], title="notes.txt", pid=101)
+
+    assert desktopcontrol.focus_new_window(
+        before, 2.5, expected_process_paths=["C:/Windows/notepad.exe"],
+        user32=user32, kernel32=kernel32,
+        clock=lambda: 0.0, sleep=lambda _s: None,
+    ) == {"title": "notes.txt", "pid": 101, "_handle": 50}
+    assert ("foreground", 50) in user32.calls
+    assert ("foreground", 70) not in user32.calls
+
+
+def test_focus_new_window_does_nothing_when_identity_cannot_be_established():
+    """No expected process means no attribution, so no focus and no record.
+
+    An `os.startfile` open whose file type has no resolvable handler lands
+    here. The file still opens; Atlas just declines to claim it put a window
+    in front when it cannot tell which window that would be.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    user32.windows[50] = dict(user32.windows[10], title="notes.txt", pid=101)
+
+    for unknown in (None, [], ()):
+        assert desktopcontrol.focus_new_window(
+            before, 2.5, expected_process_paths=unknown,
+            user32=user32, kernel32=kernel32,
+            clock=lambda: 0.0, sleep=lambda _s: None,
+        ) is None
+    assert user32.calls == []
+    # And the expected-path set is host-shaped, like every handle set: an
+    # executable the model could have named never reaches this.
+    with pytest.raises(desktopcontrol.DesktopControlError, match="process path"):
+        desktopcontrol.focus_new_window(
+            before, 2.5, expected_process_paths="C:/Windows/notepad.exe",
+            user32=user32, kernel32=kernel32,
+        )
+    with pytest.raises(desktopcontrol.DesktopControlError, match="process path"):
+        desktopcontrol.focus_new_window(
+            before, 2.5, expected_process_paths=["notepad.exe"],
+            user32=user32, kernel32=kernel32,
+        )
+
+
+def test_focus_new_window_does_nothing_when_two_new_windows_appeared():
+    """Ambiguity never guesses: two candidates means the host cannot tell.
+
+    Guessing here would steal the foreground to an arbitrary window -- a
+    splash screen, or something Daniel opened himself a moment earlier.
+    """
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    user32.windows[50] = dict(user32.windows[10], title="notes.txt", pid=101)
+    user32.windows[60] = dict(user32.windows[10], title="Splash", pid=101)
+
+    assert desktopcontrol.focus_new_window(
+        before, 2.5, expected_process_paths=["C:/Windows/notepad.exe"],
+        user32=user32, kernel32=kernel32,
+        clock=lambda: 0.0, sleep=lambda _s: None,
+    ) is None
+    assert user32.calls == []
+
+
+def test_focus_new_window_gives_up_at_the_deadline_without_focusing_anything():
+    user32 = FakeUser32()
+    kernel32 = FakeKernel32()
+    before = desktopcontrol.visible_window_handles(user32=user32, kernel32=kernel32)
+    ticks = iter([0.0, 0.1, 0.2, 2.6, 2.6, 2.6])
+
+    assert desktopcontrol.focus_new_window(
+        before, 2.5, expected_process_paths=["C:/Windows/notepad.exe"],
+        user32=user32, kernel32=kernel32,
+        clock=lambda: next(ticks), sleep=lambda _s: None,
+    ) is None
+    assert user32.calls == []
+    with pytest.raises(desktopcontrol.DesktopControlError, match="focus timeout"):
+        desktopcontrol.focus_new_window(
+            before, -1, expected_process_paths=["C:/Windows/notepad.exe"],
+            user32=user32, kernel32=kernel32,
+        )
+    with pytest.raises(desktopcontrol.DesktopControlError, match="handle set"):
+        desktopcontrol.focus_new_window(
+            "10", 2.5, expected_process_paths=["C:/Windows/notepad.exe"],
+            user32=user32, kernel32=kernel32,
+        )

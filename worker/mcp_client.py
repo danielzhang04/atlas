@@ -15,12 +15,18 @@ import subprocess
 import time
 from typing import Any, AsyncContextManager, TYPE_CHECKING
 import unicodedata
+from urllib.parse import urlsplit
 import weakref
 
 import yaml
 
 from .jobobject import kill_process_tree
 from .statusdetail import STATUS_DETAIL_RENDERERS, render_status_detail, status_detail_allowed
+# Same-package privates, deliberately: the link-handle regime is defined in
+# tools.py (budget note, https predicate) and this module is its only other
+# half. Re-stating either here would let the mint site and the open site
+# disagree about what a handle costs or what a URL is.
+from .tools import _HANDLE_BUDGET_NOTE, _direct_https
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -624,6 +630,129 @@ def _tool_transform(server_cfg: Mapping, remote_tool_name: str) -> Callable[[str
     return _TRANSFORMERS[name]
 
 
+# Named, host-side link patterns only -- config picks one by name, it never
+# supplies a regex (rule 3, the same rule transform: follows).
+#
+# trailing_link matches the shape the pinned workspace-mcp 1.25.2 emits: one
+# " Link: <url>" per result line in search_drive_files/list_drive_items
+# (gdrive/drive_tools.py:318, :766) and a "Link: <url>" header line in
+# get_drive_file_content (:431). The `$` anchor is load-bearing: it is why a
+# Drive file NAMED "https://evil.com/x" does not mint. That name lands
+# mid-line inside `- Name: "..."` with the real Link: still to come, and a
+# mid-line URL can never satisfy \S+$.
+#
+# Anchoring is defense in depth, not the defense. A file name containing a
+# newline can still forge a whole "Link: https://..." line, so the HOST
+# ALLOWLIST is what actually bounds this: the forged URL must also name a
+# configured host. What an attacker who can share a file into Daniel's Drive
+# can therefore achieve is at most an allowlisted Google page opening -- the
+# same reachability the honest Drive results already have -- never a novel
+# origin.
+#
+# The line end is matched as a LOOKAHEAD over an optional CR, not as a bare
+# `$`. `$` under MULTILINE only ever matches before a bare "\n", so on a CRLF
+# result `\S+` stopped at the "\r" (whitespace) and `$` then failed one
+# character early: the whole feature silently minted nothing. A lookahead
+# also keeps the CR out of group(0), so the appended handle note cannot land
+# after the carriage return and split the line.
+_LINK_PATTERNS: dict[str, re.Pattern[str]] = {
+    "trailing_link": re.compile(r"\bLink: (https://\S+)(?=\r?$)", re.MULTILINE),
+}
+
+# Punctuation a URL at the end of a sentence or inside a quote/bracket picks
+# up from the text around it. `\S+` cannot tell it apart from the URL, so a
+# perfectly good Drive link written as `(Link: https://docs.google.com/d/x)`
+# validated as ".../x)" and minted nothing. Trimmed before validating AND
+# before minting, so the id spends the same URL the check passed.
+_LINK_TRAILING_PUNCTUATION = ")]}>\"'.,;:!?"
+
+
+def _link_extraction(server_cfg: Mapping) -> tuple[re.Pattern[str], frozenset[str]] | None:
+    """The (pattern, allowed hosts) pair for a server, or None if unconfigured.
+
+    Both keys are required together: a pattern with no hosts would mint
+    nothing, and hosts with no pattern would never be reached, so either one
+    alone is a config mistake worth failing on rather than silently ignoring.
+    """
+    pattern_name = server_cfg.get("link_pattern")
+    hosts = server_cfg.get("link_hosts")
+    if pattern_name is None and hosts is None:
+        return None
+    if not isinstance(pattern_name, str) or pattern_name not in _LINK_PATTERNS:
+        raise ValueError("invalid MCP link pattern")
+    if (
+        isinstance(hosts, (str, bytes))
+        or not isinstance(hosts, (list, tuple))
+        or not hosts
+        or not all(isinstance(host, str) and host.strip() for host in hosts)
+    ):
+        raise ValueError("invalid MCP link host list")
+    return _LINK_PATTERNS[pattern_name], frozenset(
+        host.strip().casefold() for host in hosts
+    )
+
+
+def _mint_link_handles(
+    text: str,
+    pattern: re.Pattern[str],
+    hosts: frozenset[str],
+    registry: "ToolRegistry",
+) -> str:
+    """Rewrite each allowlisted link in remote text to carry a host handle.
+
+    This is the only place a link handle is ever minted. The model reads the
+    id, not the URL, and `open` spends the id -- so the URL never has to
+    survive a round trip through model-authored text, which is exactly what
+    the taint wall refuses to let it do.
+    """
+
+    def rewrite(match: re.Match) -> str:
+        # NOTHING in here may raise. This closure runs inside pattern.sub,
+        # inside a mirrored tool's run(), under ToolRegistry.call's catch-all
+        # -- so one exception here does not spoil one link, it turns the
+        # entire remote result into ToolResult("error", ...). A single Drive
+        # file an attacker shared into Daniel's account could therefore
+        # permanently break search_drive_files, list_drive_items and
+        # get_drive_file_content. Every check below is fail-soft: a candidate
+        # that cannot be validated simply does not mint.
+        url = _trimmed_link(match.group(1))
+        if not url or not _openable_link(url, hosts):
+            # Not an allowlisted destination: left exactly as it was. It
+            # still reads fine to the model, it just has no id to spend.
+            return match.group(0)
+        handle = registry._mint_handle(url, "link")
+        note = _HANDLE_BUDGET_NOTE if handle is None else f"handle: {handle}"
+        return f"{match.group(0)} [{note}]"
+
+    return pattern.sub(rewrite, text)
+
+
+def _trimmed_link(candidate: str) -> str:
+    """Drop sentence/bracket punctuation the `\\S+` capture swallowed.
+
+    Right-hand only, so it can never change the HOST -- everything before the
+    first "/" is untouched -- which is what keeps this from being a way to
+    walk a non-allowlisted URL into an allowlisted one.
+    """
+    return candidate.rstrip(_LINK_TRAILING_PUNCTUATION)
+
+
+def _openable_link(url: str, hosts: frozenset[str]) -> bool:
+    # _direct_https is the SAME scheme/userinfo/port predicate `open` applies
+    # to a typed URL, reused rather than restated so mint time and open time
+    # can never drift apart on what counts as a direct https URL. It is also
+    # where the ValueError urlsplit raises on an NFKC-hostile netloc is
+    # absorbed, so the .hostname read below is reached only for a netloc that
+    # already parsed cleanly.
+    if not _direct_https(url):
+        return False
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:  # pragma: no cover -- _direct_https already parsed it
+        return False
+    return hostname is not None and hostname.casefold() in hosts
+
+
 def _tool_content_bearing(server_cfg: Mapping, remote_tool_name: str) -> bool:
     """Whether this remote tool's output can taint the turn.
 
@@ -906,7 +1035,9 @@ class McpServers:
                                 ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
                             )
                         mirrored = [
-                            self._mirror_tool(name, server_cfg, defaults, session, tool)
+                            self._mirror_tool(
+                                name, server_cfg, defaults, session, tool, registry,
+                            )
                             for tool in listed.tools
                             if tool.name not in blocked and (exposed is None or tool.name in exposed)
                         ]
@@ -1261,7 +1392,9 @@ class McpServers:
             params={"token": token, "expiresAt": expires_at},
         ))
 
-    def _mirror_tool(self, server_name, server_cfg, defaults, session, remote_tool) -> Tool:
+    def _mirror_tool(
+        self, server_name, server_cfg, defaults, session, remote_tool, registry=None,
+    ) -> Tool:
         timeout_s = float(defaults.get("call_timeout_s", 8))
         schema = _without_account_parameter(
             remote_tool.inputSchema,
@@ -1269,6 +1402,13 @@ class McpServers:
         )
         description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
         transform = _tool_transform(server_cfg, remote_tool.name)
+        links = _link_extraction(server_cfg) if registry is not None else None
+        if links is not None:
+            # The registry needs the same closed host vocabulary this mint
+            # site checks against, so its open-time re-check can enforce the
+            # sentence rather than trust it -- the _configure_root_names
+            # precedent.
+            registry._configure_link_hosts(links[1])
 
         async def run(arguments: dict) -> str:
             text = await self._call_session(
@@ -1283,6 +1423,11 @@ class McpServers:
             # matches on the raw "Found N messages"/"Thread ID:" shape.
             if transform is not None:
                 text = transform(text)
+            if links is not None:
+                # After transform (so a rewritten line is what gets scanned)
+                # and before _bounded_text (so a truncation can never cut a
+                # URL in half and leave a handle pointing at a prefix).
+                text = _mint_link_handles(text, links[0], links[1], registry)
             return _bounded_text(text)
 
         return Tool(

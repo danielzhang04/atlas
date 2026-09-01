@@ -1,10 +1,12 @@
 """Bounded Win32 desktop control with host-side window resolution."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 import ctypes
 from ctypes import wintypes
 import ntpath
 import os
+import time
 from typing import Any
 
 __all__ = [
@@ -14,6 +16,7 @@ __all__ = [
     "DesktopControlError",
     "click",
     "find_window_by_process_path",
+    "focus_new_window",
     "focus_resolved_window",
     "focus_window",
     "focused_window_identity",
@@ -24,7 +27,9 @@ __all__ = [
     "press_keys",
     "resolve_window",
     "type_text",
+    "visible_window_handles",
     "window_action",
+    "windows_by_process_path",
 ]
 
 INPUT_MOUSE = 0
@@ -379,6 +384,20 @@ def focus_resolved_window(
     user32: Any | None = None,
     kernel32: Any | None = None,
 ) -> dict:
+    """Focus a window the host resolved earlier, after proving it is still it.
+
+    A stored record can be up to tools._LAST_OPENED_TTL_S (10 minutes) old,
+    and an HWND is not a durable name: Windows RECYCLES handles, so ten
+    minutes after Daniel's document window closed its number can belong to
+    something else entirely. A dead handle already failed safe -- the focus
+    call simply failed -- but a recycled one did not: it focused a stranger's
+    window and reported the record's own stale title for it.
+
+    So the handle is re-enumerated and matched back to the pid it was
+    recorded with before anything is focused, and what gets focused (and
+    reported) is the LIVE record. That way the identity Atlas speaks back is
+    the window's identity now, not what it was called when it was stored.
+    """
     user32, kernel32 = _apis(user32, kernel32)
     if (
         not isinstance(record, dict)
@@ -390,7 +409,19 @@ def focus_resolved_window(
         or not isinstance(record.get("pid"), int)
     ):
         raise DesktopControlError("invalid resolved window identity")
-    return _focus_record(record, user32=user32, kernel32=kernel32)
+    live = next(
+        (
+            item for item in _window_records(user32=user32, kernel32=kernel32)
+            if item["_handle"] == record["_handle"]
+            and item["pid"] == record["pid"]
+        ),
+        None,
+    )
+    if live is None:
+        # Closed, no longer visible, or the handle now belongs to another
+        # process. All three are "this is not the window that was stored".
+        raise DesktopControlError("window is no longer available")
+    return _focus_record(live, user32=user32, kernel32=kernel32)
 
 
 def _focus_record(record: dict[str, Any], *, user32: Any, kernel32: Any) -> dict:
@@ -675,18 +706,181 @@ def _normalized_process_path(path: str) -> str:
 def find_window_by_process_path(
     process_path: str,
     *,
+    exclude_handles: Any = (),
     user32: Any | None = None,
     kernel32: Any | None = None,
 ) -> dict | None:
+    """The first visible window of a process, optionally ignoring known ones.
+
+    `exclude_handles` is a host-taken pre-spawn snapshot. It is what makes
+    "the window this launch produced" distinguishable from "some window of
+    that process that was already on screen" -- which matters most for
+    explorer.exe, where every folder window shares one long-lived process, so
+    an unfiltered lookup after opening a folder can hand back an unrelated
+    Explorer window that happened to enumerate first.
+    """
+    found = windows_by_process_path(
+        process_path, exclude_handles=exclude_handles,
+        user32=user32, kernel32=kernel32,
+    )
+    return found[0] if found else None
+
+
+def windows_by_process_path(
+    process_path: str,
+    *,
+    exclude_handles: Any = (),
+    user32: Any | None = None,
+    kernel32: Any | None = None,
+) -> list[dict]:
+    """Every visible window of a process, so callers can see ambiguity.
+
+    find_window_by_process_path answers "a window of this app", which is the
+    right question when an app has one. It is the wrong question for
+    explorer.exe, where every folder window shares one process: "the first
+    one" is an arbitrary folder. Callers that must not guess ask for the
+    whole list and refuse to act when it holds more than one.
+    """
     if not isinstance(process_path, str) or not ntpath.isabs(process_path):
         raise DesktopControlError("process path must be absolute")
+    excluded = _handle_set(exclude_handles)
     user32, kernel32 = _apis(user32, kernel32)
     wanted = _normalized_process_path(process_path)
-    for record in _window_records(user32=user32, kernel32=kernel32):
-        if record["_process_path"] and _normalized_process_path(record["_process_path"]) == wanted:
+    return [
+        {
+            "title": record["title"],
+            "pid": record["pid"],
+            "_handle": record["_handle"],
+        }
+        for record in _window_records(user32=user32, kernel32=kernel32)
+        if record["_handle"] not in excluded
+        and record["_process_path"]
+        and _normalized_process_path(record["_process_path"]) == wanted
+    ]
+
+
+def _handle_set(handles: Any) -> frozenset[int]:
+    """Host-supplied HWNDs only -- never a model argument (rule 12)."""
+    if handles is None:
+        return frozenset()
+    if isinstance(handles, (str, bytes)) or not isinstance(handles, Iterable):
+        raise DesktopControlError("invalid window handle set")
+    collected = set()
+    for handle in handles:
+        if isinstance(handle, bool) or not isinstance(handle, int) or handle <= 0:
+            raise DesktopControlError("invalid window handle set")
+        collected.add(handle)
+    return frozenset(collected)
+
+
+def visible_window_handles(
+    *,
+    user32: Any | None = None,
+    kernel32: Any | None = None,
+) -> frozenset[int]:
+    """Snapshot every visible top-level HWND, for a later new-window diff.
+
+    Private by construction: the return value is a set of native handles, so
+    it stays inside host code and is never serialized into a tool result.
+    """
+    user32, kernel32 = _apis(user32, kernel32)
+    return frozenset(
+        record["_handle"] for record in _window_records(user32=user32, kernel32=kernel32)
+    )
+
+
+def _process_path_set(paths: Any) -> frozenset[str]:
+    """Host-resolved executable paths only -- never a model argument (rule 7)."""
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Iterable):
+        raise DesktopControlError("invalid expected process path set")
+    collected = set()
+    for path in paths:
+        if not isinstance(path, str) or not ntpath.isabs(path):
+            raise DesktopControlError("invalid expected process path set")
+        collected.add(_normalized_process_path(path))
+    return frozenset(collected)
+
+
+def focus_new_window(
+    before_hwnds: Any,
+    timeout_s: float = 2.5,
+    *,
+    expected_process_paths: Any = None,
+    interval_s: float = 0.15,
+    user32: Any | None = None,
+    kernel32: Any | None = None,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> dict | None:
+    """Focus the ONE window this open produced, or do nothing at all.
+
+    Opening something is asynchronous: os.startfile and a folder spawn both
+    return long before a window exists, which is why "open" never used to end
+    with the thing actually in front. This polls for the window that open
+    produced and focuses it.
+
+    "The window this open produced" needs BOTH halves, and new-since-snapshot
+    is only the first. A new HWND is not evidence of causation: the desktop
+    keeps producing windows Atlas did not ask for, and during the 2.5s poll a
+    Teams call toast, a meeting reminder or an updater balloon is entirely
+    ordinary. With only the freshness diff the toast was focused, the open
+    reported focused: true about it, and the opened-record observer filed the
+    TOAST's title and pid under the opened file's label -- so a later
+    focus_last_opened raised a stranger's window and called it Daniel's
+    document. `expected_process_paths` is the second half: the host resolves,
+    ahead of the open, which executable is going to handle it (for a file,
+    the registered association) and only windows belonging to that process
+    are candidates.
+
+    Identity is required, not preferred. When the caller cannot say which
+    process to expect -- passes None, or an empty set -- this focuses NOTHING
+    and returns None. The thing still opened; the host simply will not claim
+    it put a window in front when it cannot tell which window that is.
+
+    Exactly one, or nothing, applies on top of that. Two candidates means the
+    host cannot tell which it caused -- a splash screen plus a document, or
+    Daniel opening a second file of the same type at that moment -- and
+    guessing would steal focus to an arbitrary window. Ambiguity does nothing
+    and says so by returning None, which the caller reports as focused: false
+    rather than swallowing. Foreign windows do not count toward that
+    ambiguity: a toast arriving alongside the document must not be able to
+    stop the document from being focused, only to fail to be focused itself.
+
+    Returns the private window record (with `_handle`) so the host can
+    remember what it focused; callers publish only host-shaped fields.
+    """
+    before = _handle_set(before_hwnds)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s < 0:
+        raise DesktopControlError("invalid focus timeout")
+    expected = (
+        frozenset() if expected_process_paths is None
+        else _process_path_set(expected_process_paths)
+    )
+    if not expected:
+        # No identity to check against: nothing here can be attributed to
+        # this open, so nothing is focused and nothing is recorded.
+        return None
+    user32, kernel32 = _apis(user32, kernel32)
+    deadline = clock() + float(timeout_s)
+    while True:
+        records = _window_records(user32=user32, kernel32=kernel32)
+        candidates = [
+            record for record in records
+            if record["_handle"] not in before
+            and record["_process_path"]
+            and _normalized_process_path(record["_process_path"]) in expected
+        ]
+        if len(candidates) > 1:
+            # Ambiguous, and more polling only ever adds candidates.
+            return None
+        if candidates:
+            record = candidates[0]
+            _focus_record(record, user32=user32, kernel32=kernel32)
             return {
                 "title": record["title"],
                 "pid": record["pid"],
                 "_handle": record["_handle"],
             }
-    return None
+        if clock() >= deadline:
+            return None
+        sleep(min(interval_s, max(0.0, deadline - clock())))

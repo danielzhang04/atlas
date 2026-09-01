@@ -1,6 +1,7 @@
 import ctypes
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -213,7 +214,12 @@ def test_native_launcher_uses_resolved_executable_without_shell(monkeypatch):
     assert captured["command"] == ["C:/fixed/chrome.exe", "https://example.com/"]
     assert captured["kwargs"]["shell"] is False
     assert "PATH" not in captured["kwargs"]["env"]
-    assert result == {"application": "chrome.exe", "pid": 42, "targeted": True}
+    # No window ever appeared (the conftest fixture keeps the suite off the
+    # real desktop), so focus is reported as the failure it was.
+    assert result == {
+        "application": "chrome.exe", "pid": 42, "targeted": True, "focused": False,
+        "_window": None,
+    }
 
 
 def test_native_launcher_resolves_signed_path_before_focusing_exact_existing_window(
@@ -228,8 +234,8 @@ def test_native_launcher_resolves_signed_path_before_focusing_exact_existing_win
     )
     monkeypatch.setattr(
         desktopapps,
-        "_visible_profile_window",
-        lambda executable: calls.append(("inventory", executable)) or selected,
+        "_profile_windows",
+        lambda executable: calls.append(("inventory", executable)) or [selected],
     )
     monkeypatch.setattr(
         desktopapps,
@@ -250,6 +256,282 @@ def test_native_launcher_resolves_signed_path_before_focusing_exact_existing_win
         ("inventory", "C:/Windows/notepad.exe"),
         ("focus", selected),
     ]
+
+
+def test_native_launcher_polls_for_its_own_new_window_and_focuses_it(monkeypatch):
+    """The post-spawn half: Popen returns before any window exists.
+
+    Without this poll the launcher returned immediately and nothing was ever
+    focused -- the app arrived on screen behind whatever Daniel was looking
+    at. The lookup excludes the pre-spawn snapshot so it focuses the window
+    THIS launch produced, not one that was already open.
+    """
+    fresh = {"title": "Untitled - Notepad", "pid": 55, "_handle": 9100}
+    seen = []
+    focused = []
+    polls = [None, None, fresh]
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Windows/notepad.exe",
+    )
+    monkeypatch.setattr(desktopapps, "_visible_window_snapshot", lambda: frozenset({1, 2}))
+    monkeypatch.setattr(desktopapps, "_profile_window", lambda *_a, **kwargs: (
+        seen.append(kwargs.get("exclude_handles")) or polls.pop(0)
+    ))
+    monkeypatch.setattr(desktopapps, "_focus_profile_window", focused.append)
+    # The real wait, restored from the suite-wide zero, on a fake clock.
+    monkeypatch.setattr(desktopapps, "_LAUNCH_WINDOW_WAIT_S", 2.5)
+    monkeypatch.setattr(
+        desktopapps.subprocess, "Popen", lambda *_a, **_k: type("P", (), {"pid": 42})(),
+    )
+    elapsed = [0.0]
+
+    def clock():
+        elapsed[0] += 0.05
+        return elapsed[0]
+
+    result = native_launcher(
+        "notepad.exe", None, clock=clock, sleep=lambda _s: None,
+    )
+
+    assert result == {
+        "application": "notepad.exe", "pid": 42, "targeted": False, "focused": True,
+        "_window": fresh,
+    }
+    assert focused == [fresh]
+    # Every poll excludes the pre-spawn snapshot, so only a window THIS
+    # launch produced can be focused.
+    assert seen == [frozenset({1, 2}), frozenset({1, 2}), frozenset({1, 2})]
+
+
+def test_native_launcher_with_a_url_focuses_the_window_that_handled_it(monkeypatch):
+    """A running browser answers a URL in its EXISTING window.
+
+    So the url case needs the pre-spawn lookup too -- not to skip the launch
+    (the URL still has to be delivered) but to know what to focus when no new
+    window ever appears.
+    """
+    existing = {"title": "Drive", "pid": 77, "_handle": 8100}
+    focused = []
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Apps/chrome.exe",
+    )
+    monkeypatch.setattr(desktopapps, "_profile_windows", lambda _e: [existing])
+    monkeypatch.setattr(desktopapps, "_await_profile_window", lambda *_a, **_k: None)
+    monkeypatch.setattr(desktopapps, "_focus_profile_window", focused.append)
+    captured = []
+    monkeypatch.setattr(desktopapps.subprocess, "Popen", lambda command, **_k: (
+        captured.append(command) or type("P", (), {"pid": 43})()
+    ))
+
+    result = native_launcher("chrome.exe", "https://drive.google.com/x")
+
+    # The launch still happened: an existing window must not swallow the URL.
+    assert captured == [["C:/Apps/chrome.exe", "https://drive.google.com/x"]]
+    assert result == {
+        "application": "chrome.exe", "pid": 43, "targeted": True, "focused": True,
+        "_window": existing,
+    }
+    assert focused == [existing]
+
+
+def test_native_launcher_will_not_guess_which_of_several_windows_answered(monkeypatch):
+    """explorer.exe: one process, many folder windows, none of them new.
+
+    Falling back to "a window of that process" here would raise an arbitrary
+    folder -- the wrong one, confidently. Several windows and nothing new
+    means the host cannot tell which one answered, so it focuses nothing and
+    says so.
+    """
+    windows = [
+        {"title": "Downloads", "pid": 5, "_handle": 8001},
+        {"title": "Documents", "pid": 5, "_handle": 8002},
+    ]
+    focused = []
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Windows/explorer.exe",
+    )
+    monkeypatch.setattr(desktopapps, "_profile_windows", lambda _e: windows)
+    monkeypatch.setattr(desktopapps, "_await_profile_window", lambda *_a, **_k: None)
+    monkeypatch.setattr(desktopapps, "_focus_profile_window", focused.append)
+    monkeypatch.setattr(
+        desktopapps.subprocess, "Popen", lambda *_a, **_k: type("P", (), {"pid": 45})(),
+    )
+
+    result = native_launcher("explorer.exe", "C:/Users/danie/Downloads")
+
+    assert result["focused"] is False
+    assert result["_window"] is None
+    assert focused == []
+
+
+def test_the_association_lookup_is_read_only_bounded_and_fails_soft(monkeypatch):
+    """DD-2/F2's identity source. Advisory only, and never fatal.
+
+    The answer is used ONLY to filter which windows the host is willing to
+    focus -- it never launches anything, so an executable path never travels
+    back out to the model (rule 7). Anything unresolvable is None, and the
+    caller then focuses nothing rather than grabbing an unattributable
+    window.
+    """
+    # Junk never reaches the shell at all.
+    for junk in ("", ".", 7, None, ".txt/../../evil", "a:b"):
+        assert desktopapps.associated_executable_path(junk) is None
+
+    # A shell that answers with a relative path, or refuses, is None.
+    monkeypatch.setattr(
+        desktopapps.ctypes, "windll",
+        SimpleNamespace(shlwapi=SimpleNamespace(
+            AssocQueryStringW=lambda *_a: 0x80004005,
+        )),
+    )
+    assert desktopapps.associated_executable_path(".txt") is None
+
+    # A shell missing the entry point entirely is None, not an exception.
+    class _NoShlwapi:
+        def __getattr__(self, _name):
+            raise AttributeError("no shlwapi")
+
+    monkeypatch.setattr(desktopapps.ctypes, "windll", _NoShlwapi())
+    assert desktopapps.associated_executable_path(".txt") is None
+
+
+def test_native_launcher_will_not_raise_an_arbitrary_already_open_window(monkeypatch):
+    """DD-2/F10, the pre-spawn end of the same rule.
+
+    "The app is already running, so focus its window" took found[0]. With
+    several windows already on screen that is an arbitrary one of them, and
+    raising the wrong window is worse than launching: the launch below
+    produces a window the new-window diff CAN attribute to this open.
+    """
+    windows = [
+        {"title": "Inbox", "pid": 5, "_handle": 8001},
+        {"title": "Docs", "pid": 5, "_handle": 8002},
+    ]
+    fresh = {"title": "New Tab", "pid": 6, "_handle": 8003}
+    focused = []
+    launched = []
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Apps/chrome.exe",
+    )
+    monkeypatch.setattr(desktopapps, "_profile_windows", lambda _e, **_k: windows)
+    monkeypatch.setattr(desktopapps, "_await_profile_window", lambda *_a, **_k: fresh)
+    monkeypatch.setattr(desktopapps, "_focus_profile_window", focused.append)
+    monkeypatch.setattr(desktopapps.subprocess, "Popen", lambda command, **_k: (
+        launched.append(command) or type("P", (), {"pid": 46})()
+    ))
+
+    result = native_launcher("chrome.exe", None)
+
+    # It did NOT take the "existing: True" short circuit on an arbitrary
+    # window; it launched, and focused the window that launch produced.
+    assert "existing" not in result
+    assert launched == [["C:/Apps/chrome.exe"]]
+    assert focused == [fresh]
+    assert result["_window"] is fresh
+
+
+def test_profile_window_refuses_when_a_launch_produced_two_new_windows(monkeypatch):
+    """DD-2/F10, the post-spawn end. Same rule focus_new_window applies.
+
+    Two new windows of the same process -- a splash plus the real one, or two
+    documents -- means the host cannot tell which one to raise, so it raises
+    neither and the launch reports focused: false.
+    """
+    both = [
+        {"title": "Splash", "pid": 7, "_handle": 9001},
+        {"title": "Untitled", "pid": 7, "_handle": 9002},
+    ]
+
+    class _Control:
+        DesktopControlError = desktopapps._desktopcontrol().DesktopControlError
+
+        @staticmethod
+        def windows_by_process_path(_path, **_kwargs):
+            return list(both)
+
+    monkeypatch.setattr(desktopapps, "_desktopcontrol", lambda: _Control)
+
+    assert desktopapps._profile_window("C:/Windows/notepad.exe") is None
+    # One is unambiguous, and is still returned.
+    both.pop()
+    assert desktopapps._profile_window("C:/Windows/notepad.exe") == {
+        "title": "Splash", "pid": 7, "_handle": 9001,
+    }
+    # The exclude set reaches the enumeration, so "new since the snapshot"
+    # is still what is being counted.
+    seen = []
+
+    class _Recording(_Control):
+        @staticmethod
+        def windows_by_process_path(_path, **kwargs):
+            seen.append(kwargs.get("exclude_handles"))
+            return []
+
+    monkeypatch.setattr(desktopapps, "_desktopcontrol", lambda: _Recording)
+    assert desktopapps._profile_window(
+        "C:/Windows/notepad.exe", exclude_handles=frozenset({1, 2}),
+    ) is None
+    assert seen == [frozenset({1, 2})]
+
+
+def test_the_launcher_window_record_never_reaches_a_tool_result():
+    """`_window` is a native HWND; it stays inside host code (rule 12).
+
+    worker/tools.py builds its own dict from the launcher's public fields, so
+    this asserts the seam rather than trusting it: no code path returns the
+    launcher's mapping to a caller that serializes it.
+    """
+    from pathlib import Path as _Path
+
+    source = (_Path(__file__).parents[1] / "worker" / "tools.py").read_text(
+        encoding="utf-8",
+    )
+    # The key, in either quoting -- not the substring, which "list_windows"
+    # contains innocently.
+    assert '"_window"' not in source
+    assert "'_window'" not in source
+    # The one place the launcher's result is read at all reads only these.
+    assert 'opened.get("focused")' in source
+    assert 'opened.get("existing")' in source
+
+
+def test_native_launcher_reports_focus_failure_instead_of_claiming_success(monkeypatch):
+    from worker.desktopcontrol import DesktopControlError
+
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Windows/notepad.exe",
+    )
+    monkeypatch.setattr(
+        desktopapps, "_await_profile_window",
+        lambda *_a, **_k: {"title": "t", "pid": 5, "_handle": 9},
+    )
+    monkeypatch.setattr(
+        desktopapps, "_focus_profile_window",
+        lambda _window: (_ for _ in ()).throw(DesktopControlError("foreground locked")),
+    )
+    monkeypatch.setattr(
+        desktopapps.subprocess, "Popen", lambda *_a, **_k: type("P", (), {"pid": 44})(),
+    )
+
+    # The app really did launch, so this is not an error -- but focus failed,
+    # and the result says so rather than pretending.
+    assert native_launcher("notepad.exe", None) == {
+        "application": "notepad.exe", "pid": 44, "targeted": False, "focused": False,
+        "_window": None,
+    }
+
+
+def test_profile_executable_path_resolves_only_allowlisted_profiles(monkeypatch):
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable", lambda _e: "C:/Windows/notepad.exe",
+    )
+    assert desktopapps.profile_executable_path("notepad.exe") == "C:/Windows/notepad.exe"
+
+    monkeypatch.setattr(
+        desktopapps, "_resolve_executable",
+        lambda _e: (_ for _ in ()).throw(desktopapps.DesktopAppError("nope")),
+    )
+    assert desktopapps.profile_executable_path("notepad.exe") is None
 
 
 def test_profile_focus_carries_selected_hwnd_instead_of_resolving_pid(monkeypatch):
@@ -276,11 +558,26 @@ def test_native_launcher_falls_back_to_launch_when_window_inventory_fails(monkey
     monkeypatch.setattr(
         desktopapps, "_resolve_executable", lambda _executable: "C:/Windows/notepad.exe",
     )
-    monkeypatch.setattr(
-        desktopapps,
-        "_visible_profile_window",
-        lambda _path: (_ for _ in ()).throw(DesktopControlError("inventory failed")),
-    )
+    failure = DesktopControlError
+
+    class _BrokenInventory:
+        # Bound from the enclosing scope: a class body cannot read a name it
+        # is itself assigning.
+        DesktopControlError = failure
+
+        @staticmethod
+        def visible_window_handles():
+            raise failure("inventory failed")
+
+        @staticmethod
+        def windows_by_process_path(_path, **_kwargs):
+            raise failure("inventory failed")
+
+        @staticmethod
+        def find_window_by_process_path(_path, **_kwargs):
+            raise failure("inventory failed")
+
+    monkeypatch.setattr(desktopapps, "_desktopcontrol", lambda: _BrokenInventory)
 
     class Proc:
         pid = 42
@@ -292,7 +589,8 @@ def test_native_launcher_falls_back_to_launch_when_window_inventory_fails(monkey
     )
 
     assert native_launcher("notepad.exe", None) == {
-        "application": "notepad.exe", "pid": 42, "targeted": False,
+        "application": "notepad.exe", "pid": 42, "targeted": False, "focused": False,
+        "_window": None,
     }
 
 
