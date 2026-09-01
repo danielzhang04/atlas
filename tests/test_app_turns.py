@@ -363,12 +363,16 @@ def test_non_reflex_is_left_for_the_conversational_lane():
     assert handled is False
 
 
-def test_tool_events_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged():
+def test_tool_events_no_longer_reach_the_transcript_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged():
     publisher = StatePublisher()
     session = FakeSession()
     engagement = Engagement(120)
     engagement.wake()
 
+    # _record_tool is the on_tool callback wired to services.brain.on_tool; it
+    # used to mirror a "tool" role line into the transcript ring, but that
+    # cluttered the chat -- tool calls are already recorded in the traces DB
+    # independently (worker/tools.py). It must be a no-op on the transcript.
     app._record_tool(publisher, "open", SimpleNamespace(status="ok"))
     succeeded = SimpleNamespace(state=JobState.SUCCEEDED, summary="  Draft   verified.  ")
     app._announce_terminal(succeeded, publisher, session, engagement)
@@ -378,10 +382,10 @@ def test_tool_events_and_terminal_jobs_are_mirrored_and_spoken_only_when_engaged
 
     lines = [(line["role"], line["text"]) for line in publisher.snapshot()["transcript"]]
     assert lines == [
-        ("tool", "open: ok"),
         ("atlas", "Done -- Draft verified."),
         ("atlas", "That task hit a problem; it's in History."),
     ]
+    assert "tool" not in [role for role, _text in lines]
     assert engagement.state != ENGAGED
     assert session.spoken == ["Done -- Draft verified."]
 
