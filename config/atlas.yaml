@@ -2,9 +2,23 @@ fast_model: claude-sonnet-5
 # Projected to the UI as /state user.name; no extra endpoint.
 user: {name: "Daniel"}
 google_account: daniel.zhang.t1@gmail.com
+# Per model response, not per turn. MAX_TOOL_ROUNDS (4) x 12s exceeds
+# turn_ceiling_s by design: the 30s ceiling binds first and bounds the whole
+# turn, so the per-response timeout never has to be sized for the worst case.
 turn_timeout_s: 12.0
 turn_ceiling_s: 30.0
-max_tokens: 400
+# Per model response, not per turn: each tool round spends its own budget, and
+# the tool-call JSON is charged to it before any spoken text. A larger cap
+# makes a round that stops INSIDE the tool_use block -- no text at all, total
+# silence -- less likely; it does not guarantee room for a reply, and nothing
+# here can. EMPTY_TURN_REPLY (worker/brain.py) is what makes that case safe.
+# 500 rather than 700 for timeout headroom, measured: 700-token rounds ran
+# 8.9-14.9s end to end (time-to-first-token variance dominates) and 2 of 8
+# exceeded turn_timeout_s. A timeout mid-stream discards the round and speaks
+# "I lost that one" after ~11s of audio, which is worse than truncation now
+# that truncation says TRUNCATED_REPLY honestly -- so the cap, not the
+# timeout, should be the likelier terminator of a long reply.
+max_tokens: 500
 engagement_timeout_s: 120
 addressed_window_s: 90
 address_vocab: [gmail, inbox, unread, calendar, youtube, notion, github, spotify, workers]
