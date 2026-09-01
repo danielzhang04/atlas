@@ -99,28 +99,46 @@ def test_is_match_two_tokens_requires_a_contiguous_bigram():
     assert not app._echo_is_match(["the", "stop"], buffer, min_overlap_ratio=0.0)
 
 
-def test_is_match_three_plus_tokens_in_order_subsequence_regardless_of_contiguity():
-    # "meeting ... two ... five" appears in order but not contiguously.
+# --- F2(a): contiguity now covers 3-4 tokens too ---------------------------
+
+def test_is_match_three_and_four_tokens_require_contiguity():
     buffer = ["the", "meeting", "is", "at", "two", "fifty", "five"]
-    assert app._echo_is_match(["meeting", "two", "five"], buffer, min_overlap_ratio=0.8)
+    # Contiguous tail fragment -> still an echo.
+    assert app._echo_is_match(["two", "fifty", "five"], buffer, min_overlap_ratio=0.8)
+    assert app._echo_is_match(["at", "two", "fifty", "five"], buffer, min_overlap_ratio=0.8)
+    # "meeting ... two ... five" is in order but scattered: at three words
+    # that is chance overlap with a long reply, not an echo.
+    assert not app._echo_is_match(["meeting", "two", "five"], buffer, min_overlap_ratio=0.8)
+    # Out of order is not an echo either, whatever the overlap ratio says.
+    assert not app._echo_is_match(["five", "two", "meeting"], buffer, min_overlap_ratio=0.8)
 
 
-def test_is_match_three_plus_tokens_out_of_order_relies_on_overlap_ratio():
-    buffer = ["the", "meeting", "is", "at", "two", "fifty", "five"]
-    # "five two meeting" is not an in-order subsequence, but all 3 tokens
-    # are present somewhere -> 3/3 = 100% overlap clears the ratio gate.
-    assert app._echo_is_match(["five", "two", "meeting"], buffer, min_overlap_ratio=0.8)
+def test_is_match_contiguity_is_not_backwards_between_lengths():
+    # The old rule protected "stop it" (2 tokens, contiguity required) but
+    # not the longer, more specific "stop it now" (3 tokens, subsequence).
+    buffer = ["i", "ll", "stop", "the", "music", "now", "if", "you", "want"]
+    assert not app._echo_is_match(["stop", "it"], buffer, min_overlap_ratio=0.8)
+    assert not app._echo_is_match(["stop", "it", "now"], buffer, min_overlap_ratio=0.8)
+
+
+def test_is_match_five_tokens_keep_the_subsequence_rule():
+    buffer = ["the", "meeting", "today", "is", "at", "two", "fifty", "five", "sharp"]
+    # Five in-order words scattered through the buffer is unambiguous.
+    assert app._echo_is_match(
+        ["meeting", "is", "two", "fifty", "five"], buffer, min_overlap_ratio=0.8,
+    )
 
 
 def test_is_match_overlap_ratio_boundary():
-    buffer = ["alpha", "bravo", "charlie", "delta"]
-    # 4 tokens, "echo" is the only non-match -> 3/4 = 75%.
-    below_words = ["alpha", "bravo", "charlie", "echo"]
-    assert not app._echo_is_match(below_words, buffer, min_overlap_ratio=0.8)
-    assert app._echo_is_match(below_words, buffer, min_overlap_ratio=0.75)
-    # 5 tokens, 4 match -> 80%, clears a 0.8 gate exactly.
-    at_words = ["alpha", "bravo", "charlie", "delta", "echo"]
-    assert app._echo_is_match(at_words, buffer, min_overlap_ratio=0.8)
+    buffer = ["alpha", "bravo", "charlie", "delta", "foxtrot"]
+    # 5 tokens, "echo" is the only non-match -> 4/5 = 80%, clears a 0.8 gate
+    # exactly; the same words against a 0.9 gate do not.
+    words = ["alpha", "bravo", "charlie", "delta", "echo"]
+    assert app._echo_is_match(words, buffer, min_overlap_ratio=0.8)
+    assert not app._echo_is_match(words, buffer, min_overlap_ratio=0.9)
+    # 6 tokens, 4 match -> 67%, below the gate and not in-order-complete.
+    below = ["alpha", "bravo", "charlie", "delta", "echo", "golf"]
+    assert not app._echo_is_match(below, buffer, min_overlap_ratio=0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +184,94 @@ def test_two_word_contiguous_echo_is_dropped():
     guard, _clock = _guard()
     guard.record_spoken("I'll stop the music for you now")
     assert guard.should_drop("stop the", speaking=True)
+
+
+# --- F2(a) at the should_drop level: the reviewer's live probes -------------
+
+_LONG_REPLY = (
+    "There are three things on the calendar that stand out today. "
+    "The first one is the design review at ten, which usually runs long, "
+    "so I would close out anything else before that. "
+    "After that there is a gap until one, and then the vendor call, "
+    "which is the one that keeps moving around in the week. "
+    "The last one is a check in with the team late in the afternoon, "
+    "and I can move that one if you would rather keep the evening clear. "
+    "Where things stand right now, nothing is double booked, "
+    "and the only travel is the trip out to the office on Thursday. "
+    "I can read any of that back in more detail if you want it."
+)
+
+
+def test_genuine_barge_in_survives_a_long_reply_in_the_buffer():
+    # The reviewer's probes: every word of these is somewhere in a 100+ word
+    # reply, and the old 3-token subsequence rule ate both of them.
+    guard, _clock = _guard()
+    guard.record_spoken(_LONG_REPLY)
+    assert not guard.should_drop("close that one", speaking=True)
+    assert not guard.should_drop("where is that one", speaking=True)
+    assert guard.dropped_count == 0
+
+
+def test_a_contiguous_fragment_of_that_same_long_reply_is_still_dropped():
+    guard, _clock = _guard()
+    guard.record_spoken(_LONG_REPLY)
+    # Said back to back by Atlas -> a real echo, and still caught.
+    assert guard.should_drop("the design review at ten", speaking=True)
+    assert guard.should_drop("move that one", speaking=True)
+
+
+def test_the_diagnosed_echo_is_still_dropped_after_the_tightening():
+    guard, _clock = _guard()
+    guard.record_spoken("The meeting is at two fifty five.")
+    assert guard.should_drop("two fifty five", speaking=True)
+
+
+# --- F2(b): the recency bound ----------------------------------------------
+
+def test_a_new_utterance_clears_the_previous_reply_from_the_buffer():
+    guard, clock = _guard(tail_s=1.0, buffer_window_s=600.0)
+    guard.record_spoken("The meeting is at two fifty five.")
+    guard.note_speaking(True)  # that reply's speech ends at T=0
+    clock.advance(180.0)  # three minutes later, Daniel says something else
+    # buffer_window_s is far away, so only the recency bound can clear this.
+    assert not guard.should_drop("what about tomorrow instead", speaking=False)
+    guard.record_spoken("Okay, I will hold off on that.")  # a new utterance
+    guard.note_speaking(True)
+
+    # Words from the earlier reply are no longer matchable against anything.
+    assert not guard.should_drop("two fifty five", speaking=True)
+    assert not guard.should_drop("the meeting is at two fifty five", speaking=True)
+    # The utterance actually being spoken is still guarded.
+    assert guard.should_drop("i will hold off", speaking=True)
+
+
+def test_a_long_reply_is_never_cleared_out_from_under_itself():
+    guard, clock = _guard(tail_s=1.0, buffer_window_s=600.0)
+    # Production shape after the session's first reply: a previous utterance
+    # set the speaking anchor, then went quiet past the tail.
+    guard.note_speaking(True)
+    clock.advance(120.0)
+    # Text drains chunk by chunk; between chunks an STT event lands in the TTS
+    # time-to-first-byte gap while agent_state is not yet "speaking" (the F2b
+    # re-review race) and must NOT reset the latch and wipe earlier chunks.
+    guard.record_spoken("the meeting today is scheduled for three")
+    guard.note_speaking(False)
+    clock.advance(0.5)  # text drains fast (no backpressure); sub-tail gaps
+    guard.record_spoken("oclock this afternoon in the main office")
+    guard.note_speaking(False)
+    clock.advance(0.5)
+    guard.record_spoken("with the whole team")
+    assert guard.should_drop("scheduled for three oclock", speaking=True)
+
+
+def test_rapid_consecutive_utterances_still_share_one_buffer():
+    guard, clock = _guard(tail_s=1.0, buffer_window_s=600.0)
+    guard.record_spoken("The meeting is at two fifty five.")
+    guard.note_speaking(True)
+    clock.advance(0.4)  # still inside the tail: the audio overlaps
+    guard.record_spoken("Anything else?")
+    guard.note_speaking(True)
+    assert guard.should_drop("two fifty five", speaking=True)
 
 
 # --- BLOCKER 2: eviction anchored to the speech lifecycle, not record time -
@@ -377,6 +483,61 @@ def test_stt_node_never_filters_non_transcript_event_types(monkeypatch):
     result = asyncio.run(_collect(agent))
 
     assert result == [start_event]
+
+
+def test_stt_node_drops_an_echoing_final_transcript_while_speaking(monkeypatch):
+    """F5(b): FINAL_TRANSCRIPT is in _ECHO_FILTERED_EVENT_TYPES and nothing
+    pinned it -- yet it is the event that actually becomes a user turn. An
+    interim event that slips through is a spurious interruption; a final one
+    that slips through is a whole turn Atlas answers itself with."""
+    agent = _SttWiringAgent(agent_state="speaking")
+    agent.echo_guard.record_spoken("The meeting is at two fifty five.")
+    events = [_speech_event(stt.SpeechEventType.FINAL_TRANSCRIPT, "two fifty five")]
+    _patch_default_stt_stream(monkeypatch, events)
+
+    result = asyncio.run(_collect(agent))
+
+    assert result == []
+    assert agent.echo_guard.dropped_count == 1
+
+
+def test_stt_node_drops_an_echoing_preflight_transcript_while_speaking(monkeypatch):
+    agent = _SttWiringAgent(agent_state="speaking")
+    agent.echo_guard.record_spoken("The meeting is at two fifty five.")
+    events = [_speech_event(stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, "two fifty five")]
+    _patch_default_stt_stream(monkeypatch, events)
+
+    result = asyncio.run(_collect(agent))
+
+    assert result == []
+    assert agent.echo_guard.dropped_count == 1
+
+
+def test_tts_node_feeds_every_chunk_it_speaks_into_the_echo_guard(monkeypatch):
+    """F5(a): the whole guard rests on this one feed line in tts_node --
+    without it the buffer is always empty and the filter silently never
+    fires, with every should_drop test above still passing."""
+    agent = _SttWiringAgent(agent_state="speaking")
+
+    async def _fake_default_tts(_agent, text, _model_settings):
+        async for chunk in text:
+            yield chunk
+
+    monkeypatch.setattr(app.Agent.default, "tts_node", _fake_default_tts)
+
+    async def _text():
+        yield "The meeting is at "
+        yield "two fifty five."
+
+    async def _drain():
+        return [chunk async for chunk in agent.tts_node(_text(), None)]
+
+    spoken = asyncio.run(_drain())
+
+    assert "".join(spoken).strip() == "The meeting is at two fifty five."
+    # Both chunks reached the guard, in the order Atlas speaks them.
+    assert agent.echo_guard.should_drop("the meeting is at", speaking=True)
+    assert agent.echo_guard.should_drop("two fifty five", speaking=True)
 
 
 def test_stt_node_notes_speaking_state_even_on_non_transcript_events(monkeypatch):

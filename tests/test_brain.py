@@ -2114,10 +2114,15 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert (
         "it reports conversations, matching what Daniel's Gmail shows, not raw messages"
     ) in BASE_SYSTEM
+    # F6: scoped to what the local_time transform actually rewrites -- the
+    # column-0 "Date:" lines. A header that does not parse as RFC 2822 passes
+    # through raw, and times written in a message BODY are never touched, so
+    # "mail times" claimed more than the host delivers.
     assert (
-        "Mail times from Gmail tools are already in Daniel's local time; never convert or rename their\n"
+        "Date lines from Gmail tools are already in Daniel's local time; never convert or rename their\n"
         "timezones. Calendar events state their own timezone -- read it as written."
     ) in BASE_SYSTEM
+    assert "Mail times from Gmail tools" not in BASE_SYSTEM
     assert (
         "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."
@@ -2253,6 +2258,73 @@ def test_timeout_still_rebuts_an_unbacked_held_sentence_it_flushes():
     # Salvaging the tail must not smuggle an unbacked claim past the guard.
     assert asyncio.run(collect(brain, "open my downloads")) == [
         UNBACKED_ACTION_REPLY, TIMEOUT_REPLY,
+    ]
+
+
+def test_timeout_after_spoken_sentences_offers_to_continue_and_keeps_the_prefix():
+    # F1: the long reply ran out of clock mid-stream after Daniel already
+    # heard most of it. "I lost that one to a timeout" was false, and the
+    # abort path never remembered the prefix, so "continue" had nothing to
+    # resume.
+    sentences = [
+        "The calendar is clear until eleven. ",
+        "After that there are two blocks back to back. ",
+        "The second one runs long. ",
+    ]
+    client = FakeClient(DelayedFinalStream(
+        sentences,
+        content=[text_block("".join(sentences))],
+        final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    spoken = asyncio.run(collect(brain, "what does my day look like"))
+
+    assert spoken == [*sentences, TRUNCATED_REPLY]
+    assert TIMEOUT_REPLY not in "".join(spoken)
+    assert brain._history == [
+        {"role": "user", "content": "what does my day look like"},
+        {"role": "assistant", "content": "".join(sentences) + TRUNCATED_REPLY},
+    ]
+
+
+def test_timeout_before_any_sentence_still_says_it_lost_the_turn():
+    client = FakeClient(DelayedFinalStream(
+        [], content=[], final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # Nothing was delivered, so the honest line is the timeout one -- and an
+    # empty prefix is not worth a history entry.
+    assert asyncio.run(collect(brain, "what does my day look like")) == [TIMEOUT_REPLY]
+    assert brain._history == []
+
+
+def test_provider_failure_after_spoken_sentences_keeps_the_prefix_in_history():
+    class ProviderFailure(RuntimeError):
+        status_code = 500
+
+    spoken = "The calendar is clear until eleven. "
+    client = FakeClient(
+        FakeStream([spoken], content=[tool_block(name="lookup")], stop_reason="tool_use"),
+        ProviderFailure("boom"),
+    )
+    brain = Brain(client, FakeRegistry(ToolResult("ok", "looked up")), model="fast", persona="")
+
+    # The model genuinely errored, so PROVIDER_REPLY's wording stands; only
+    # the amnesia was wrong.
+    assert asyncio.run(collect(brain, "what does my day look like")) == [
+        spoken, PROVIDER_REPLY,
+    ]
+    assert brain._history == [
+        {"role": "user", "content": "what does my day look like"},
+        {"role": "assistant", "content": spoken + PROVIDER_REPLY},
     ]
 
 

@@ -25,10 +25,17 @@ ROOT = Path(__file__).resolve().parents[1]
 # _voice_config: parsing + validation
 # ---------------------------------------------------------------------------
 
+_ECHO_DEFAULTS = {
+    "tail_s": 1.0,
+    "buffer_window_s": 10.0,
+    "max_words": 500,
+    "min_overlap_ratio": 0.8,
+}
 _DEFAULTS = {
     "min_interruption_words": 2,
     "min_interruption_duration_s": 0.8,
     "aec_warmup_duration_s": 4.0,
+    "echo_guard": _ECHO_DEFAULTS,
 }
 
 
@@ -50,6 +57,7 @@ def test_voice_config_overrides_are_used_when_present():
         "min_interruption_words": 3,
         "min_interruption_duration_s": 1.2,
         "aec_warmup_duration_s": 5.0,
+        "echo_guard": _ECHO_DEFAULTS,
     }
 
 
@@ -89,6 +97,72 @@ def test_production_config_voice_section_resolves_to_the_chosen_defaults():
     assert app._voice_config(cfg) == _DEFAULTS
 
 
+# --- F7: the echo guard's own tunables, exposed in the same section --------
+
+def test_echo_guard_knobs_are_written_out_in_the_production_config():
+    """They must be VISIBLE in atlas.yaml, not merely defaulted: the point of
+    F7 is that the knobs that decide whether a genuine barge-in survives are
+    the ones Daniel can reach without editing Python."""
+    raw = yaml.safe_load(
+        (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )["voice"]
+    for name, value in _ECHO_DEFAULTS.items():
+        assert raw[name] == value
+
+
+def test_echo_guard_knobs_are_the_speech_echo_guard_constructor_keywords():
+    """1:1 with SpeechEchoGuard(...), so a config value cannot mean something
+    else in code -- and so a renamed constructor keyword fails here rather
+    than at worker start."""
+    import inspect
+
+    params = inspect.signature(app.SpeechEchoGuard.__init__).parameters
+    for name, value in _ECHO_DEFAULTS.items():
+        assert name in params
+        assert params[name].default == value
+
+
+def test_echo_guard_overrides_are_used_when_present():
+    cfg = {"voice": {
+        "tail_s": 2.5,
+        "buffer_window_s": 30.0,
+        "max_words": 120,
+        "min_overlap_ratio": 0.95,
+    }}
+    assert app._voice_config(cfg)["echo_guard"] == {
+        "tail_s": 2.5,
+        "buffer_window_s": 30.0,
+        "max_words": 120,
+        "min_overlap_ratio": 0.95,
+    }
+
+
+def test_echo_guard_partial_override_keeps_other_defaults():
+    resolved = app._voice_config({"voice": {"tail_s": 3.0}})["echo_guard"]
+    assert resolved == {**_ECHO_DEFAULTS, "tail_s": 3.0}
+
+
+@pytest.mark.parametrize("name", ["tail_s", "buffer_window_s"])
+@pytest.mark.parametrize("bad", [0, -1.0, "1.0", True])
+def test_voice_config_rejects_invalid_echo_guard_seconds(name, bad):
+    with pytest.raises(ValueError, match=f"voice.{name}"):
+        app._voice_config({"voice": {name: bad}})
+
+
+@pytest.mark.parametrize("bad", [0, -5, 1.5, "500", True])
+def test_voice_config_rejects_invalid_echo_guard_max_words(bad):
+    with pytest.raises(ValueError, match="voice.max_words"):
+        app._voice_config({"voice": {"max_words": bad}})
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.01, 2, "0.8", True])
+def test_voice_config_rejects_invalid_echo_guard_min_overlap_ratio(bad):
+    # Above 1 can never be met and at/below 0 is met by anything: both would
+    # silently turn the guard off or all the way up.
+    with pytest.raises(ValueError, match="voice.min_overlap_ratio"):
+        app._voice_config({"voice": {"min_overlap_ratio": bad}})
+
+
 def test_agent_session_signature_still_has_the_three_voice_kwargs():
     """Pin the exact kwarg names this unit passes to AgentSession(...). If a
     future livekit-agents upgrade renames or removes one of these (they were
@@ -116,12 +190,15 @@ def _run_entrypoint_capturing_session(monkeypatch, cfg: dict):
     """Drive worker.app.entrypoint() far enough (in TEXT_MODE) to reach the
     AgentSession construction, mirroring the harness in
     test_stateserver.test_entrypoint_warms_model_only_after_build_and_state_server_start.
-    Returns (agent_session_kwargs, handlers) where handlers maps event name
-    (e.g. "speech_created") to the callback worker.app registered via
-    session.on(...).
+    Returns (agent_session_kwargs, handlers, atlas_agent_kwargs) where
+    handlers maps event name (e.g. "speech_created") to the callback
+    worker.app registered via session.on(...), and atlas_agent_kwargs is what
+    AtlasAgent(...) was constructed with (F7: the echo guard is built from
+    config there).
     """
     session_kwargs: dict = {}
     handlers: dict = {}
+    agent_kwargs: dict = {}
 
     class FakeWork:
         launcher = SimpleNamespace(available=True)
@@ -211,7 +288,11 @@ def _run_entrypoint_capturing_session(monkeypatch, cfg: dict):
         lambda **_kwargs: SimpleNamespace(start=lambda: None),
     )
     monkeypatch.setattr(app, "AgentSession", fake_agent_session)
-    monkeypatch.setattr(app, "AtlasAgent", lambda **_kwargs: SimpleNamespace(turn_handler=None))
+    def fake_atlas_agent(**kwargs):
+        agent_kwargs.update(kwargs)
+        return SimpleNamespace(turn_handler=None)
+
+    monkeypatch.setattr(app, "AtlasAgent", fake_atlas_agent)
     monkeypatch.setattr(app, "_build_tts", lambda _cfg: object())
     monkeypatch.setattr(app.deepgram, "STTv2", lambda **_kwargs: object())
     monkeypatch.setattr(app.silero.VAD, "load", lambda: object())
@@ -220,7 +301,7 @@ def _run_entrypoint_capturing_session(monkeypatch, cfg: dict):
     monkeypatch.setattr(app, "_emit_ui_url", lambda *_args: None)
 
     asyncio.run(app.entrypoint(FakeContext()))
-    return session_kwargs, handlers
+    return session_kwargs, handlers, agent_kwargs
 
 
 _BASE_CFG = {
@@ -234,7 +315,7 @@ _BASE_CFG = {
 
 
 def test_session_construction_passes_default_voice_knobs_to_agent_session(monkeypatch):
-    session_kwargs, _handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    session_kwargs, _handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
 
     assert session_kwargs["min_interruption_words"] == 2
     assert session_kwargs["min_interruption_duration"] == 0.8
@@ -249,15 +330,37 @@ def test_session_construction_passes_configured_voice_knobs_to_agent_session(mon
         "min_interruption_duration_s": 1.5,
         "aec_warmup_duration_s": 6.0,
     })
-    session_kwargs, _handlers = _run_entrypoint_capturing_session(monkeypatch, cfg)
+    session_kwargs, _handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, cfg)
 
     assert session_kwargs["min_interruption_words"] == 4
     assert session_kwargs["min_interruption_duration"] == 1.5
     assert session_kwargs["aec_warmup_duration"] == 6.0
 
 
+def test_configured_echo_guard_knobs_reach_the_agents_guard(monkeypatch):
+    """F7 end to end: config -> _voice_config -> the SpeechEchoGuard the
+    AtlasAgent actually filters with. Without the wiring the guard would keep
+    its class defaults and the config section would be decoration."""
+    cfg = dict(_BASE_CFG, voice={
+        "tail_s": 2.0,
+        "buffer_window_s": 25.0,
+        "max_words": 90,
+        "min_overlap_ratio": 0.6,
+    })
+    _session_kwargs, _handlers, agent_kwargs = _run_entrypoint_capturing_session(
+        monkeypatch, cfg,
+    )
+
+    guard = agent_kwargs["echo_guard"]
+    assert isinstance(guard, app.SpeechEchoGuard)
+    assert guard._tail_s == 2.0
+    assert guard._buffer_window_s == 25.0
+    assert guard._max_words == 90
+    assert guard._min_overlap_ratio == 0.6
+
+
 def test_session_construction_registers_a_speech_created_listener(monkeypatch):
-    _session_kwargs, handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    _session_kwargs, handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
 
     assert callable(handlers.get("speech_created"))
 
@@ -294,7 +397,7 @@ class _FakeSpeechHandle:
 
 
 def test_speech_created_handler_marks_the_active_turn_when_interrupted(monkeypatch):
-    _session_kwargs, handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    _session_kwargs, handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
     on_speech_created = handlers["speech_created"]
     # Imported here, not at module top: worker/app.py's _on_speech_created
     # also does `from worker import traces as traces_mod` lazily at call
@@ -330,7 +433,7 @@ def test_speech_created_handler_marks_the_active_turn_when_interrupted(monkeypat
 
 
 def test_speech_created_handler_leaves_the_turn_unmarked_when_not_interrupted(monkeypatch):
-    _session_kwargs, handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    _session_kwargs, handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
     on_speech_created = handlers["speech_created"]
     # See the comment in the previous test: import fresh here, not at
     # module top, to avoid a stale worker.traces module reference.
@@ -368,7 +471,7 @@ def test_speech_created_handler_is_a_no_op_before_any_turn_is_active(monkeypatch
     traces.activate()/reset() -- so active_turn() is NOT None for those.
     See test_dismiss_and_repeat_reflex_speech_sets_the_flag_but_never_persists_it
     below for that (different, still harmless) case."""
-    _session_kwargs, handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    _session_kwargs, handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
     on_speech_created = handlers["speech_created"]
     # See the comment in the marks_the_active_turn test above: import fresh
     # here, not at module top, to avoid a stale worker.traces reference.
@@ -390,7 +493,7 @@ def test_dismiss_and_repeat_reflex_speech_sets_the_flag_but_never_persists_it(mo
     ever calls TraceRecorder.respond() (only _submit_voice_turn's tee'd
     response does) -- so the flag lands on the in-memory _Turn object but is
     never read into a persisted RESPOND step: turn.steps stays empty."""
-    _session_kwargs, handlers = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
+    _session_kwargs, handlers, _agent_kwargs = _run_entrypoint_capturing_session(monkeypatch, dict(_BASE_CFG))
     on_speech_created = handlers["speech_created"]
     from worker import traces as traces_mod
 

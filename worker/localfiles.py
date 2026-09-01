@@ -297,8 +297,13 @@ class LocalFiles:
         # Checked AGAIN on the resolved path, not just the lexical one. The
         # lexical check reads the name the caller typed; resolve() reads the
         # name Windows really uses, and the two differ for 8.3 short names
-        # ("APPDAT~1" -> "AppData") and for trailing dots or spaces, each of
-        # which would otherwise walk straight past the exclusion above.
+        # ("APPDAT~1" -> "AppData"), which would otherwise walk straight past
+        # the exclusion above -- pinned by
+        # test_an_8_3_short_name_cannot_walk_past_the_exclusion, which fails
+        # if this line goes. (Trailing dots and spaces are handled one step
+        # earlier: os.path.abspath above goes through GetFullPathName, which
+        # strips them, so "AppData./notes.md" is already "AppData\notes.md"
+        # by the time the lexical check runs.)
         _refuse_excluded(resolved, resolved_root)
         return resolved
 

@@ -165,7 +165,7 @@
     const PARTICLE_SIZE_BASE = 4.4; // px @ index%3===0, was 2.2
     const PARTICLE_SIZE_STEP = 2.6; // px added per size tier, was 1.35
     const PARTICLE_GLOW_RADIUS_PX = 48; // particleSprite backing size, was 32
-    const TRAIL_FADE_ALPHA = .12; // per-frame destination-out fade, .08-.15
+    const TRAIL_FADE_ALPHA = .12; // destination-out fade per 60fps frame, .08-.15 (dt-scaled at use)
     // Trail canvas backing-store resolution multiplier against CSS-px
     // width/height. 1 = CSS-px (NOT pixelRatio-scaled like tickRingSprite/
     // segmentRingSprite -- see the resize()/drawParticles() notes on
@@ -882,7 +882,11 @@
       // texture + the CSS radial-gradient behind the canvas element) and
       // would silently drift out of sync the moment any of those change.
       trailContext.globalCompositeOperation = "destination-out";
-      trailContext.globalAlpha = TRAIL_FADE_ALPHA;
+      // Frame-rate-independent, same idiom as drawWaveform/prepareFrameSignal:
+      // a flat per-frame alpha made the trail length a function of frame rate
+      // (a long comet at 30fps, a short one at 120), which is the one thing
+      // this canvas is for.
+      trailContext.globalAlpha = 1 - Math.pow(1 - TRAIL_FADE_ALPHA, dt / 16.67);
       trailContext.fillStyle = "#000";
       trailContext.fillRect(0, 0, trailCanvas.width, trailCanvas.height);
 
@@ -1134,8 +1138,18 @@
 
     // Idle (ASLEEP/OFFLINE) pauses the rAF loop entirely; a live preview override
     // (headless review) keeps it running so any state can still be inspected.
+    //
+    // ...but not while the palette is still moving. A state change starts a
+    // 420ms color transition (the same window drawTickRing/drawSegmentRings
+    // key off), and going idle used to pause the loop on its first frame:
+    // the ASLEEP palette never finished arriving, so what froze on screen was
+    // a half-decayed smear of the previous state's colors, held until the
+    // next wake. Letting those ~25 frames run costs nothing measurable and
+    // renders the transition to completion; the first frame after the window
+    // closes pauses exactly as before.
     function isIdleNow() {
       return (realState === "ASLEEP" || realState === "OFFLINE")
+        && performance.now() - transitionAt > 420
         && !ENGINE_STATES.has(window.__atlasEnginePreview);
     }
 
@@ -1159,17 +1173,21 @@
       // CC6: the same freeze applies to the comet trail (drawParticles()
       // simply doesn't run while paused), so trailCanvas just holds its last
       // painted frame rather than being explicitly cleared here. Freeze, not
-      // clear-on-pause, is the deliberate choice: an idle state already gets
-      // its own CSS treatment (.is-idle, see styles.css), so an abrupt "trail
-      // vanishes the instant the engine goes idle" would be a second, jarring
-      // transition on top of that -- freezing lets it read as "paused", and
+      // clear-on-pause, is the deliberate choice: going idle already changes
+      // the card's look -- `.is-idle` REMOVES the holoIdle breathing
+      // animation, which styles.css runs on `.engine-card:not(.is-idle)`
+      // (it does not add an idle animation; the earlier note here had that
+      // backwards) -- so an abrupt "trail vanishes the instant the engine
+      // goes idle" would be a second, jarring change on top of the card
+      // going still. Freezing lets it read as "paused", and
       // start() below clears it so a *resumed* session never shows a stale,
       // already-faded trail ghost left over from before the pause. (Neither
       // this freeze/clear nor anything else in the canvas engine currently
       // reads prefers-reduced-motion -- confirmed by checking: none of
       // drawTickRing/drawSegmentRings/drawScanner/drawParticles/drawWaveform/
-      // drawCore ever did, before or after CC6. Only the DOM-level `.is-idle`
-      // breathing animation in styles.css is reduced-motion-gated. The trail
+      // drawCore ever did, before or after CC6. Only the DOM-level holoIdle
+      // breathing animation in styles.css -- the one `.is-idle` turns OFF --
+      // is reduced-motion-gated. The trail
       // inherits the same idle-based pause every other animated element in
       // this engine already has; it does not add or remove reduced-motion
       // support, which would be a broader, separate pass across the whole

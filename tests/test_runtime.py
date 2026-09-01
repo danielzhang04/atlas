@@ -94,6 +94,29 @@ def test_build_composes_every_lane_without_connecting_or_launching(monkeypatch, 
         built.store.close()
 
 
+def test_the_checked_in_response_cap_is_500_in_both_places_it_lives():
+    """F5(d): 500 was measured, not guessed -- 700-token rounds ran 8.9-14.9s
+    and 2 of 8 blew past turn_timeout_s, so a long reply must end at the CAP
+    (which says TRUNCATED_REPLY honestly) rather than at the timeout. Nothing
+    pinned it: atlas.yaml's value and the Brain default runtime.build falls
+    back to could each drift silently, in opposite directions. Both here.
+    """
+    import inspect
+
+    import yaml
+
+    cfg = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "atlas.yaml").read_text(
+            encoding="utf-8",
+        ),
+    )
+    assert cfg["max_tokens"] == 500
+    assert inspect.signature(Brain.__init__).parameters["max_tokens"].default == 500
+    # runtime.build's own fallback, for a config that omits the key entirely.
+    source = inspect.getsource(runtime.build)
+    assert 'cfg.get("max_tokens", 500)' in source
+
+
 def test_production_registry_has_no_api_incompatible_tool_schemas(monkeypatch, tmp_path):
     """Regression test for the tools.11.custom.input_schema 400.
 

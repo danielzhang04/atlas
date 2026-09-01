@@ -179,6 +179,13 @@ def test_state_signal_assets_and_security_headers():
     assert "const PARTICLE_SIZE_STEP = 2.6;" in script[2]
     assert "const PARTICLE_GLOW_RADIUS_PX = 48;" in script[2]
     assert "const TRAIL_FADE_ALPHA = .12;" in script[2]
+    # ...and it is spent per 60fps frame, not per frame: a flat alpha made
+    # trail length a function of frame rate (long comet at 30fps, short at
+    # 120). Same 1 - (1-k)^(dt/16.67) idiom as drawWaveform.
+    assert (
+        "trailContext.globalAlpha = 1 - Math.pow(1 - TRAIL_FADE_ALPHA, dt / 16.67);"
+    ) in script[2]
+    assert "trailContext.globalAlpha = TRAIL_FADE_ALPHA;" not in script[2]
     assert "const TRAIL_RESOLUTION_SCALE = 1;" in script[2]
     assert (
         "const size = (PARTICLE_SIZE_BASE + index % 3 * PARTICLE_SIZE_STEP) * (1 + frameEnergy * .4);"
@@ -193,7 +200,6 @@ def test_state_signal_assets_and_security_headers():
     assert 'const trailCanvas = document.createElement("canvas");' in script[2]
     assert "const trailContext = trailCanvas.getContext(" in script[2]
     assert 'trailContext.globalCompositeOperation = "destination-out";' in script[2]
-    assert "trailContext.globalAlpha = TRAIL_FADE_ALPHA;" in script[2]
     assert "trailContext.fillRect(0, 0, trailCanvas.width, trailCanvas.height);" in script[2]
     assert 'trailContext.globalCompositeOperation = "screen";' in script[2]
     assert "context.drawImage(trailCanvas, 0, 0, width, height);" in script[2]
@@ -338,6 +344,14 @@ def test_state_signal_assets_and_security_headers():
     assert "lastFrameNow = 0;" in pause_loop
     start_loop = script[2].split("function start()", 1)[1].split("function stop()", 1)[0]
     assert "lastFrameNow = 0;" in start_loop
+    # F9: the loop must not pause in the middle of a color transition.
+    # Pausing on the first ASLEEP frame froze a half-decayed smear of the
+    # previous palette on screen instead of rendering the ASLEEP look; the
+    # idle test stays false for the same 420ms window the rings key off.
+    is_idle_now = script[2].split("function isIdleNow()", 1)[1].split(
+        "function pauseLoop()", 1,
+    )[0]
+    assert "performance.now() - transitionAt > 420" in is_idle_now
     assert "TOOL:" in script[2]
     assert "renderGreeting" in script[2]
     assert "renderTool" in script[2]

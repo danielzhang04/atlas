@@ -799,6 +799,11 @@ def builtin(
         # separate unit, deliberately NOT attempted here, because doing it
         # badly (a keyword filter on query strings) would read as protection
         # while providing none.
+        # What that chain CAN read is now bounded on every path (2026-09-01
+        # final gate, F3): the files MCP server is write-only, so reads run
+        # only through find_file/read_file here, behind localfiles.resolve's
+        # credential shield. The steerable material is Daniel's ordinary
+        # documents, never a credential-shaped file.
         query = _text_argument(arguments, "query", maximum=512)
         root = arguments.get("root")
         if root is not None:

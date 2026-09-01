@@ -117,7 +117,7 @@ If read_file reports truncated, do not analyse the preview -- call launch_work w
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
 in:inbox for all; it reports conversations, matching what Daniel's Gmail shows, not raw messages;
 never count from a search page.
-Mail times from Gmail tools are already in Daniel's local time; never convert or rename their
+Date lines from Gmail tools are already in Daniel's local time; never convert or rename their
 timezones. Calendar events state their own timezone -- read it as written.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
 that close will close every window of that app.
@@ -256,7 +256,7 @@ def _abort_flush(
     tool_results: list[tuple[str, bool]],
     host_line: str | None,
     reason: str,
-) -> list[str]:
+) -> tuple[list[str], list[str | None]]:
     """Salvage held sentences on an aborted turn instead of discarding them.
 
     The timeout and provider-error paths used to drop `guarded_chunks` wholesale,
@@ -272,9 +272,13 @@ def _abort_flush(
     Truthfulness still holds there -- a held claim is never voiced without its
     rebuttal, only dropped together with it -- and that is the pre-existing
     shape of barge-in, not something this flush changes.
+
+    Returns the ordered chunks together with their verdicts, so the caller can
+    apply the same substitution-suppression rule the token-cap flush uses
+    before appending a host line of its own.
     """
     if not guarded_chunks:
-        return []
+        return [], []
     logger.warning(
         "held reply chunks flushed on %s (held=%d)", reason, len(guarded_chunks),
     )
@@ -287,7 +291,7 @@ def _abort_flush(
         if host_line is not None and any(not ok for _name, ok in tool_results)
         else UNBACKED_ACTION_REPLY
     )
-    return _substitution_last(verdicts, rebuttal)
+    return _substitution_last(verdicts, rebuttal), verdicts
 
 
 def _field(block: Any, name: str) -> Any:
@@ -891,14 +895,32 @@ class Brain:
                     # the spoken prefix, not sentences Daniel never heard.
                     self._remember(prompt, "".join(spoken))
         except TimeoutError:
-            flushed = _abort_flush(
+            flushed, verdicts = _abort_flush(
                 guarded_chunks, guard, tool_results, host_line, "timeout",
             )
-            for chunk in flushed:
+            # A turn that already delivered sentences did not lose them -- it
+            # ran out of clock mid-reply. TIMEOUT_REPLY ("I lost that one")
+            # is false there, and the abort path never remembered the prefix,
+            # so "continue" had nothing to resume. Offer the continuation
+            # through the shared helper instead (same substitution
+            # suppression as the token-cap flush) and remember what was said.
+            # With nothing spoken the turn really was lost: TIMEOUT_REPLY
+            # stands, and an empty prefix is not worth a history entry. Held
+            # chunks salvaged by the flush are not a delivered prefix -- they
+            # reach Daniel only now, with the turn already over.
+            delivered = bool(spoken)
+            if host_line is None and delivered:
+                tail = _with_truncation_offer(flushed, spoken, verdicts)
+            else:
+                flushed.append(_host_tail(
+                    (flushed or spoken or [""])[-1], host_line or TIMEOUT_REPLY,
+                ))
+                tail = flushed
+            for chunk in tail:
+                spoken.append(chunk)
                 yield chunk
-            yield _host_tail(
-                (flushed or spoken or [""])[-1], host_line or TIMEOUT_REPLY,
-            )
+            if host_line is None and delivered:
+                self._remember(prompt, "".join(spoken))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             has_status_code = isinstance(status, int) and not isinstance(status, bool)
@@ -916,14 +938,21 @@ class Brain:
                 status if isinstance(status, (int, float)) else "unknown",
                 detail,
             )
-            flushed = _abort_flush(
+            flushed, _verdicts = _abort_flush(
                 guarded_chunks, guard, tool_results, host_line, "provider error",
             )
-            for chunk in flushed:
-                yield chunk
-            yield _host_tail(
+            # The model genuinely errored, so PROVIDER_REPLY's wording stands;
+            # only the amnesia is wrong. Sentences Daniel already heard stay
+            # in history so the next turn follows on from them.
+            delivered = bool(spoken)
+            flushed.append(_host_tail(
                 (flushed or spoken or [""])[-1], host_line or PROVIDER_REPLY,
-            )
+            ))
+            for chunk in flushed:
+                spoken.append(chunk)
+                yield chunk
+            if host_line is None and delivered:
+                self._remember(prompt, "".join(spoken))
 
     def _now_system_text(self) -> str:
         now = self._clock().astimezone()

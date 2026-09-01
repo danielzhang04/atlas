@@ -3,10 +3,16 @@ spawns the actual npx-installed @modelcontextprotocol/server-filesystem
 package (no fakes, no in-memory FastMCP fixture) through Atlas's own
 worker.mcp_client spec-resolution and connect path, and proves:
 
-  * the 12 curated tools register, matching the checked-in config/mcp.yaml
-    expose: list exactly;
-  * a real read (read_text_file) against a seeded file under the resolved
-    file_write_roots returns real file content;
+  * the 5 curated tools register, matching the checked-in config/mcp.yaml
+    expose: list exactly -- write-only since the 2026-09-01 final gate (F3),
+    so NONE of the 9 read tools the real server ships is registered, and
+    the model cannot reach a Downloads credential file by asking this
+    server for it instead of shield-covered find_file/read_file;
+  * the server itself is genuinely live and readable underneath that
+    policy: a raw read (read_text_file via call_raw, bypassing the host
+    registry) of a seeded file under the resolved file_write_roots returns
+    real file content, which is what makes the absence of a registered read
+    tool a host decision rather than a broken connection;
   * THE ROOTS TRAP does not bite Atlas: list_allowed_directories reports
     EXACTLY the resolved file_write_roots the host passed as CLI argv, not
     something the server negotiated over the MCP roots protocol (which
@@ -60,12 +66,15 @@ _PREFETCH_TIMEOUT_S = 90
 # produced.
 _CONNECT_TIMEOUT_S = 200
 
-_READ_TOOLS = (
-    "read_text_file", "read_multiple_files",
+# Every read tool the real server ships. None may be registered (F3): they
+# take a raw path with none of localfiles.resolve's credential shield on it.
+_SERVER_READ_TOOLS = (
+    "read_file", "read_text_file", "read_media_file", "read_multiple_files",
     "list_directory", "list_directory_with_sizes", "directory_tree",
-    "search_files", "get_file_info", "list_allowed_directories",
+    "search_files", "get_file_info",
 )
 _MUTATION_TOOLS = ("write_file", "edit_file", "create_directory", "move_file")
+_EXPOSED_TOOLS = (*_MUTATION_TOOLS, "list_allowed_directories")
 
 pytestmark = pytest.mark.skipif(_NPX is None, reason="npx is not on PATH")
 
@@ -198,13 +207,18 @@ def test_files_server_end_to_end_against_the_real_npx_server(npx_prefetched, tmp
         servers, registry = await _connect_real_files_server(mcp_path, atlas_path)
         try:
             names = sorted(registry.names())
-            read_result = await registry.call(
-                "files__read_text_file", {"path": str(seeded)},
+            # Raw, below the host's expose: list -- the server can still read
+            # (proving this is a live connection), the host just never hands
+            # the model a tool that does.
+            raw_read = await servers.call_raw(
+                "files", "read_text_file", {"path": str(seeded)},
             )
             allowed_result = await registry.call("files__list_allowed_directories", {})
-            read_only_result = await registry.call(
-                "files__list_directory", {"path": str(tmp_path / "read_only_root")},
-            )
+            with pytest.raises(McpToolError, match="Access denied"):
+                await servers.call_raw(
+                    "files", "list_directory",
+                    {"path": str(tmp_path / "read_only_root")},
+                )
             write_result = await registry.call(
                 "files__write_file",
                 {
@@ -212,22 +226,22 @@ def test_files_server_end_to_end_against_the_real_npx_server(npx_prefetched, tmp
                     "content": "nope",
                 },
             )
-            return names, read_result, allowed_result, read_only_result, write_result
+            return names, raw_read, allowed_result, write_result
         finally:
             await servers.close()
 
-    names, read_result, allowed_result, read_only_result, write_result = asyncio.run(scenario())
+    names, raw_read, allowed_result, write_result = asyncio.run(scenario())
 
-    # 1. Exactly the 12 curated tools registered (8 reads + 4 mutations),
-    # matching config/mcp.yaml's expose: list.
-    assert names == sorted(
-        f"files__{name}" for name in (*_READ_TOOLS, *_MUTATION_TOOLS)
-    )
-    assert "files__read_media_file" not in names
+    # 1. Exactly the 5 curated tools registered (4 mutations plus
+    # list_allowed_directories), matching config/mcp.yaml's expose: list --
+    # and not one of the server's 9 read tools (F3).
+    assert names == sorted(f"files__{name}" for name in _EXPOSED_TOOLS)
+    for read_tool in _SERVER_READ_TOOLS:
+        assert f"files__{read_tool}" not in names
 
-    # 2. A real read against a real file returns real content.
-    assert read_result.status == "ok"
-    assert read_result.content == "hello from atlas c2"
+    # 2. The server underneath really can read that file -- so the empty
+    # read surface above is Atlas's policy, not a dead connection.
+    assert raw_read == "hello from atlas c2"
 
     # 3. THE ROOTS TRAP: the effective allowlist reported by the real
     # server is EXACTLY the resolved file_write_roots the host passed as CLI
@@ -243,13 +257,12 @@ def test_files_server_end_to_end_against_the_real_npx_server(npx_prefetched, tmp
 
     # 3b. WRITE SCOPE (blocker 2): the second file_roots entry -- standing
     # in for the kb checkout, which is a read root and must never become a
-    # write root -- is not in the allowlist above and is refused live by the
-    # real server. This is what proves the argv expanded
-    # "{file_write_roots}" and not "{file_roots}": were the old token still
-    # there, both directories would be allowed and this read would succeed.
+    # write root -- is not in the allowlist above, and the raw list_directory
+    # in the scenario above was refused live by the real server. This is what
+    # proves the argv expanded "{file_write_roots}" and not "{file_roots}":
+    # were the old token still there, both directories would be allowed and
+    # that call would have succeeded.
     assert str(tmp_path / "read_only_root") not in allowed_result.content
-    assert read_only_result.status == "error"
-    assert "Access denied" in read_only_result.content
 
     # 4. write_file is NOT EXECUTED: it stops at needs_confirmation, and
     # this test never sends the matching confirm.
@@ -264,7 +277,7 @@ def test_move_file_refuses_to_move_outside_all_configured_roots(npx_prefetched, 
     nothing moved -- verified live against the pinned version. Called
     directly via McpServers.call_raw, not through the host's registry,
     because move_file is confirm-policy host-side (covered by
-    test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation
+    test_checked_in_files_config_is_write_only_and_confirms_every_mutation
     in tests/test_mcp_client.py) -- this test's job is proving the server's
     own guardrail still holds, independent of that host gate."""
     roots_dir = tmp_path / "atlas_files_root"

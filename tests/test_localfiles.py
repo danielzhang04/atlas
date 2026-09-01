@@ -649,32 +649,45 @@ def test_a_trailing_dot_cannot_walk_past_the_exclusion(tmp_path):
     """Windows strips trailing dots when it opens a path.
 
     "AppData." is not "appdata" to a string comparison, but it IS AppData to
-    the filesystem -- so the lexical check alone would let it through. The
-    re-check on the resolved path is what closes it.
+    the filesystem. The file is BENIGN (notes.md, no credential segment
+    anywhere in it), so the only thing that can refuse this path is the
+    excluded DIRECTORY name -- if the trailing dot laundered it, the read
+    would go through.
+
+    Where it is closed: os.path.abspath in LocalFiles.resolve goes through
+    GetFullPathName, which strips the trailing dot, so the LEXICAL check
+    already sees "AppData". The post-resolve re-check is pinned separately by
+    the 8.3 test below, the case abspath does not normalize away.
     """
     home = tmp_path / "home"
     (home / "AppData").mkdir(parents=True)
-    token = home / "AppData" / "token.json"
-    token.write_text("secret", encoding="utf-8")
+    (home / "AppData" / "notes.md").write_text("ordinary", encoding="utf-8")
     files = LocalFiles([home], opener=lambda _path: None)
 
     with pytest.raises(ValueError, match="excluded path"):
-        files.resolve(home / "AppData" / "token.json")
+        files.resolve(home / "AppData" / "notes.md")
     with pytest.raises(ValueError, match="excluded path"):
-        files.resolve(str(home / "AppData") + "./token.json")
+        files.resolve(str(home / "AppData") + "./notes.md")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="8.3 short names are Windows-only")
 def test_an_8_3_short_name_cannot_walk_past_the_exclusion(tmp_path):
-    """"Application Data" also answers to "APPLIC~1" on an 8.3-enabled volume."""
+    """"Application Data" also answers to "APPLIC~1" on an 8.3-enabled volume.
+
+    The target file is BENIGN (notes.md): the aliased path shares no text
+    with "application data" and the filename carries nothing incriminating,
+    so ONLY the re-check on the resolved path (localfiles.resolve, after
+    Path.resolve expands the 8.3 alias) can refuse it. Deleting that second
+    _refuse_excluded call fails this test -- which it did not when the target
+    was named token.json and the lexical filename rule caught it first.
+    """
     import ctypes
     import ntpath
 
     home = tmp_path / "home"
     excluded = home / "Application Data"
     excluded.mkdir(parents=True)
-    token = excluded / "token.json"
-    token.write_text("secret", encoding="utf-8")
+    (excluded / "notes.md").write_text("ordinary", encoding="utf-8")
     buffer = ctypes.create_unicode_buffer(1024)
     ctypes.windll.kernel32.GetShortPathNameW(str(excluded), buffer, 1024)
     short = buffer.value
@@ -693,7 +706,7 @@ def test_an_8_3_short_name_cannot_walk_past_the_exclusion(tmp_path):
     # The alias shares no component text with "application data", so only the
     # post-resolve check can catch it.
     with pytest.raises(ValueError, match="excluded path"):
-        files.resolve(alias / "token.json")
+        files.resolve(alias / "notes.md")
 
 
 def test_credential_stems_are_refused_whatever_extension_they_wear(tmp_path):

@@ -83,6 +83,18 @@ _VOICE_DEFAULTS = {
     "min_interruption_duration_s": 0.8,
     "aec_warmup_duration_s": 4.0,
 }
+# SpeechEchoGuard's tunables (2026-09-01 final gate, F7). These are the knobs
+# that decide whether a genuine barge-in survives, and they were reachable
+# only by editing the class default -- while the three livekit knobs above,
+# which the diagnosis showed do NOT fix self-barge-in, were the configurable
+# ones. Same names as the constructor keywords, so the mapping is 1:1 and a
+# value here cannot silently mean something else in code.
+_ECHO_GUARD_DEFAULTS = {
+    "tail_s": 1.0,
+    "buffer_window_s": 10.0,
+    "max_words": 500,
+    "min_overlap_ratio": 0.8,
+}
 
 
 def _voice_config(cfg: dict) -> dict:
@@ -110,6 +122,37 @@ def _voice_config(cfg: dict) -> dict:
         "min_interruption_words": words,
         "min_interruption_duration_s": float(duration),
         "aec_warmup_duration_s": float(warmup),
+        "echo_guard": _echo_guard_config(raw),
+    }
+
+
+def _echo_guard_config(raw: dict) -> dict:
+    """Validate the echo-guard knobs inside the `voice:` section (F7), in the
+    same style as the three above: a missing key takes the class default, a
+    present one is type/range checked and raises rather than falling back to
+    a value nobody chose. The keys are SpeechEchoGuard's own constructor
+    keywords."""
+    def _positive(name: str) -> float:
+        value = raw.get(name, _ECHO_GUARD_DEFAULTS[name])
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"invalid Atlas configuration: voice.{name}")
+        return float(value)
+
+    max_words = raw.get("max_words", _ECHO_GUARD_DEFAULTS["max_words"])
+    if isinstance(max_words, bool) or not isinstance(max_words, int) or max_words < 1:
+        raise ValueError("invalid Atlas configuration: voice.max_words")
+    ratio = raw.get("min_overlap_ratio", _ECHO_GUARD_DEFAULTS["min_overlap_ratio"])
+    # A ratio over 1 can never be met and one at/below 0 is met by anything,
+    # so both ends are refused rather than silently disabling or maximizing
+    # the guard.
+    if (isinstance(ratio, bool) or not isinstance(ratio, (int, float))
+            or not 0 < ratio <= 1):
+        raise ValueError("invalid Atlas configuration: voice.min_overlap_ratio")
+    return {
+        "tail_s": _positive("tail_s"),
+        "buffer_window_s": _positive("buffer_window_s"),
+        "max_words": max_words,
+        "min_overlap_ratio": float(ratio),
     }
 
 
@@ -217,11 +260,14 @@ def _echo_normalize(text: str) -> list[str]:
     return _ECHO_NON_WORD_RE.sub(" ", text.casefold()).split()
 
 
-def _echo_contains_contiguous_bigram(pair: tuple[str, str], buffer_words: list[str]) -> bool:
-    first, second = pair
+def _echo_contains_contiguous_ngram(words: list[str], buffer_words: list[str]) -> bool:
+    """Did Atlas say exactly these words, back to back and in this order?"""
+    n = len(words)
+    if n == 0 or len(buffer_words) < n:
+        return False
     return any(
-        buffer_words[i] == first and buffer_words[i + 1] == second
-        for i in range(len(buffer_words) - 1)
+        buffer_words[i:i + n] == words
+        for i in range(len(buffer_words) - n + 1)
     )
 
 
@@ -237,15 +283,23 @@ def _echo_is_match(
         already can't be interrupted by a lone word, so the event needs to
         survive to let plain confirmations ("yes", "no", "stop") through --
         dropping it here would be strictly worse than not filtering at all.
-      - 2 tokens: an echo only if Atlas spoke those exact two words back to
+      - 2 to 4 tokens: an echo only if Atlas spoke those exact words back to
         back, contiguously and in that order -- "stop the" matches Atlas
         having literally said "...stop the...", but "stop it" does NOT match
-        "...stop the music..." even though "stop" is common to both.
-      - 3+ tokens: the original rule -- an in-order (not necessarily
-        contiguous) subsequence of the buffer (catches a clean tail
-        fragment like "two fifty five" out of "...at two fifty five"), or at
-        least min_overlap_ratio of tokens present anywhere in the buffer
-        (for a short/garbled/reordered fragment).
+        "...stop the music..." even though "stop" is common to both. A clean
+        tail fragment ("two fifty five" out of "...at two fifty five") is
+        contiguous by construction, so it still drops.
+      - 5+ tokens: an in-order (not necessarily contiguous) subsequence of
+        the buffer, or at least min_overlap_ratio of tokens present anywhere
+        in it (for a garbled or reordered fragment). At this length an echo
+        is unambiguous; scattered matches of that many words are not chance.
+
+    2026-09-01 final gate, F2(a): the discontiguous subsequence rule started
+    at 3 tokens, which ate genuine barge-ins whenever the buffer was long --
+    "close that one" and "where is that one" both dissolve into the scattered
+    words of a 191-word reply. It also read backwards: "stop it" was
+    protected by the contiguity requirement while the longer, MORE specific
+    "stop it now" was not. Contiguity now covers every short transcript.
 
     Known limitation (does not need a tier of its own -- it's a floor on
     accuracy, not a bug): this is exact/near-exact word matching, not
@@ -259,10 +313,8 @@ def _echo_is_match(
         return False
     if n == 1:
         return False
-    if n == 2:
-        return _echo_contains_contiguous_bigram(
-            (transcript_words[0], transcript_words[1]), buffer_words,
-        )
+    if n <= 4:
+        return _echo_contains_contiguous_ngram(transcript_words, buffer_words)
     remaining = iter(buffer_words)
     if all(word in remaining for word in transcript_words):
         return True
@@ -303,14 +355,20 @@ class SpeechEchoGuard:
     buffer_window_s both then run from THAT moment, not from individual
     words' record time.
 
+    Bounded the other way by the recency rule in `_begin_speech_if_idle`
+    (2026-09-01 final gate, F2b): the buffer holds the current utterance,
+    not the conversation. A new utterance starting after the previous
+    speech's tail has passed clears it first, so no transcript is ever
+    checked against a reply from minutes ago.
+
     Known tradeoff: a user who deliberately echoes Atlas immediately after
     it stops speaking ("yes, 2:55" right after Atlas says "...2:55") can
-    still be dropped if it lands inside the short tail window and matches
-    closely enough (3+ words -- a lone "yes" is protected by the 1-token
-    rule above regardless of timing). This is accepted -- the tail window is
-    short (~1s default) and near-total-overlap is required for anything but
-    a clean in-order subsequence, so it only bites genuinely Atlas-shaped
-    phrasing said immediately after Atlas stops, not ordinary conversation.
+    still be dropped if it lands inside the short tail window and repeats
+    Atlas's own wording closely enough (a lone "yes" is protected by the
+    1-token rule above regardless of timing). This is accepted -- the tail
+    window is short (~1s default) and anything under 5 words must repeat
+    Atlas contiguously, so it only bites genuinely Atlas-shaped phrasing
+    said immediately after Atlas stops, not ordinary conversation.
     """
 
     def __init__(
@@ -329,6 +387,8 @@ class SpeechEchoGuard:
         self._clock = clock
         self._buffer: deque[str] = deque()
         self._speaking_last_seen_at: float | None = None
+        self._last_recorded_at: float | None = None
+        self._utterance_open = False
         self._dropped_count = 0
 
     @property
@@ -342,9 +402,44 @@ class SpeechEchoGuard:
         words = _echo_normalize(text)
         if not words:
             return
+        self._begin_speech_if_idle()
+        self._last_recorded_at = self._clock()
         self._buffer.extend(words)
         while len(self._buffer) > self._max_words:
             self._buffer.popleft()
+
+    def _begin_speech_if_idle(self) -> None:
+        """Recency bound (2026-09-01 final gate, F2b): the first chunk of a
+        NEW utterance clears the buffer.
+
+        Without this, words from a reply given minutes ago stayed matchable
+        for as long as max_words held them, so a later unrelated utterance
+        was checked against a reply Daniel had long since heard and answered.
+        The buffer's only job is the CURRENT speech (plus whatever is still
+        draining right behind it), so cross-utterance matching may span
+        rapid consecutive utterances -- their audio overlaps -- but never a
+        reply from a previous exchange.
+
+        "New" means: no speech is open, and the last confirmed speaking is
+        more than tail_s ago (i.e. even the echo tail of that speech has
+        passed). Chunks of the utterance already in flight leave the latch
+        set, so a long reply is never cleared out from under itself.
+        """
+        if self._utterance_open:
+            return
+        self._utterance_open = True
+        # Final-gate re-review (F2b race): the latch can be reset by an STT
+        # event arriving in the TTS time-to-first-byte gap, when text has
+        # drained but agent_state is not yet "speaking". Anchor idleness on
+        # BOTH clocks -- last confirmed audio AND last recorded text -- so a
+        # reply mid-drain is never treated as a stale previous utterance and
+        # cleared out from under itself.
+        candidates = [
+            anchor for anchor in (self._speaking_last_seen_at, self._last_recorded_at)
+            if anchor is not None
+        ]
+        if candidates and (self._clock() - max(candidates)) > self._tail_s:
+            self._buffer.clear()
 
     def note_speaking(self, speaking: bool) -> None:
         """Sample the live agent_state. Called from AtlasAgent.stt_node on
@@ -357,7 +452,15 @@ class SpeechEchoGuard:
         now = self._clock()
         if speaking:
             self._speaking_last_seen_at = now
+            self._utterance_open = True
         else:
+            if (
+                self._speaking_last_seen_at is not None
+                and (now - self._speaking_last_seen_at) > self._tail_s
+            ):
+                # Speech is over, tail included: the next recorded chunk
+                # belongs to a new utterance (see _begin_speech_if_idle).
+                self._utterance_open = False
             self._maybe_clear_stale_buffer(now)
 
     def _maybe_clear_stale_buffer(self, now: float) -> None:
@@ -400,10 +503,12 @@ class SpeechEchoGuard:
 class AtlasAgent(Agent):
     """Suppress autonomous LiveKit replies after the host handles a finalized turn."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, echo_guard: SpeechEchoGuard | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.turn_handler = None
-        self.echo_guard = SpeechEchoGuard()
+        # Config-built when the worker constructs it (F7); the class defaults
+        # stand for tests and any caller that does not care.
+        self.echo_guard = SpeechEchoGuard() if echo_guard is None else echo_guard
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         handler = self.turn_handler
@@ -1417,6 +1522,7 @@ async def entrypoint(ctx: JobContext) -> None:
             instructions="Atlas voice I/O is host controlled.",
             llm=None,
             tools=[],
+            echo_guard=SpeechEchoGuard(**voice_cfg["echo_guard"]),
         )
         await session.start(agent=agent, room=ctx.room)
         session_started = True

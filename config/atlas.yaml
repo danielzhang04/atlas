@@ -47,10 +47,30 @@ stt_keyterms: [Atlas]
 #     first "speaking" transition) -- every later response gets none of it.
 # Validated on load by worker.app._voice_config, which raises on load if a
 # value is out of range.
+# The four knobs after the livekit three are SpeechEchoGuard's own, exposed
+# here rather than living only as class defaults (2026-09-01 final gate, F7):
+# they are the ones that actually decide whether a genuine barge-in survives,
+# so they are the ones worth tuning. Same names as the constructor keywords.
+#   - tail_s: how long after Atlas stops speaking an echo can still arrive.
+#     Nothing is ever filtered outside speaking + this tail, and a new
+#     utterance starting more than this after the last speech clears the
+#     buffer, so raising it widens BOTH windows.
+#   - buffer_window_s: how long after speech stops the buffer survives at all.
+#   - max_words: memory cap on the buffer; the whole current utterance is
+#     held regardless of length while speaking, bounded only by this.
+#   - min_overlap_ratio: for 5+ word transcripts only, the share of words that
+#     must appear in the buffer for a scattered/reordered fragment to count as
+#     an echo. Shorter transcripts require a contiguous match and ignore this.
+# Every value is validated on load by worker.app._voice_config; an out-of-range
+# one raises rather than falling back.
 voice:
   min_interruption_words: 2
   min_interruption_duration_s: 0.8
   aec_warmup_duration_s: 4.0
+  tail_s: 1.0
+  buffer_window_s: 10.0
+  max_words: 500
+  min_overlap_ratio: 0.8
 
 traces: {enabled: true, path: "%LOCALAPPDATA%/Atlas/traces.db", retention_days: 30}
 pricing:
@@ -129,6 +149,10 @@ tts_output_device: follow
 # of a narrow root. Note the scope of that claim: it covers find_file, read_file,
 # open_file and open_folder. launch_work is NOT bounded by it -- it hands a brief
 # to a background claude --bg with its own filesystem access.
+# Every OTHER read path was closed rather than left to hold the same claim
+# twice: the files MCP server exposes no read tool at all (config/mcp.yaml,
+# files: -- 2026-09-01 final gate, F3), so the tools above are the only way a
+# model-shaped request reads a file, and the shield is on all of them.
 file_roots:
   - known:Desktop
   - known:Documents
