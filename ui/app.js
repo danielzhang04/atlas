@@ -6,7 +6,10 @@
   const ROUTES = new Set([...document.querySelectorAll("[data-view]")].map((view) => view.dataset.view));
   const VOICE_STATES = new Set(["ASLEEP", "LISTENING", "THINKING", "SPEAKING"]);
   const ENGINE_STATES = new Set([...VOICE_STATES, "TOOL"]);
-  const TRANSCRIPT_ROLES = new Set(["user", "atlas", "tool", "ambient", "system"]);
+  // No "tool" role: the host stopped mirroring tool calls into the
+  // transcript (worker/app.py _record_tool), so an unknown role falls
+  // through to "system" like any other.
+  const TRANSCRIPT_ROLES = new Set(["user", "atlas", "ambient", "system"]);
   const ACTIVE_JOB_STATES = new Set(["queued", "launching", "running"]);
   const ACTION_HEADER = "x-atlas-action-token";
   const PAIRING_STORAGE_KEY = "atlas.pairing";
@@ -189,6 +192,13 @@
     const particleRadius = new Float32Array(PARTICLE_COUNT);
     const particleSpeed = new Float32Array(PARTICLE_COUNT);
     const particlePhase = new Float32Array(PARTICLE_COUNT);
+    // Waveform per-bar scratch geometry, reused every frame (no per-frame
+    // allocation) so the bar-stroke pass and tip-fill pass can read the same
+    // computed coordinates without rebuilding a Path2D for each.
+    const waveInnerX = new Float32Array(BAR_COUNT);
+    const waveInnerY = new Float32Array(BAR_COUNT);
+    const waveOuterX = new Float32Array(BAR_COUNT);
+    const waveOuterY = new Float32Array(BAR_COUNT);
     const primaryColor = new Float32Array(3);
     const secondaryColor = new Float32Array(3);
     const coreColor = new Float32Array(3);
@@ -204,7 +214,16 @@
     const backdropSprite = document.createElement("canvas");
     const glowSprite = document.createElement("canvas");
     const particleSprite = document.createElement("canvas");
-    const metrics = {samples: 0, lastMs: 0, averageMs: 0, maxMs: 0, running: false};
+    // Tick ring + segment ring geometry is pre-rendered here (once per resize,
+    // or while a color transition is active) instead of live-stroking up to
+    // 120 segments every frame; the frame path only rotates + drawImages them.
+    const tickRingSprite = document.createElement("canvas");
+    const segmentRingSprite = document.createElement("canvas");
+    const FRAME_BUCKET_MS = [17, 25, 33, 50];
+    const metrics = {
+      samples: 0, lastMs: 0, averageMs: 0, maxMs: 0, running: false,
+      frameHistogram: new Uint32Array(5), drops: 0, totalFrames: 0,
+    };
     let realState = "OFFLINE";
     let visualState = "OFFLINE";
     let energy = 0;
@@ -227,6 +246,35 @@
     let majorTickPath = new Path2D();
     let minorTickPath = new Path2D();
     let innerSegmentPath = new Path2D();
+    let tickRingSpriteSize = 0;
+    let segmentRingSpriteSize = 0;
+    // Every cache below is keyed on the COLOR STRINGS it was built with, not
+    // on a time window. A `now - transitionAt <= 420` key is only correct
+    // while the rAF loop is running: pausing mid-transition (ASLEEP/OFFLINE,
+    // tab hidden) froze these at whatever half-blended color the last frame
+    // baked, and the window had long expired by the time the loop resumed,
+    // so the stale raster/gradient stayed on screen indefinitely. Comparing
+    // the color actually wanted this frame against the color actually baked
+    // in the cache cannot go stale: it rebuilds exactly when the pixels
+    // would differ, and self-heals on the first frame after any pause with
+    // no coupling to pauseLoop()/start() at all. Empty string = never built.
+    let tickRingMinorColor = "", tickRingMajorColor = "";
+    let segmentRingColor = "";
+    // Cached gradient objects. Canvas gradient stop coordinates are evaluated
+    // against the CTM active at fill()-time, not at creation-time (confirmed:
+    // gradients follow the paint-time transform, same as patterns), so both
+    // of these can be created once and reused across frames — drawScanner's
+    // local-space gradient re-orients itself via the per-frame rotate(), and
+    // drawCore's is built in a unit-radius local space and re-scaled per
+    // frame via context.scale(coreRadius, coreRadius) so its continuously
+    // "breathing" radius never forces a rebuild. Both are only rebuilt when
+    // geometry that actually needs new coordinates changes (scannerGradient:
+    // resize) or when one of their own color stops changes — see
+    // drawScanner/drawCore and the cache-key note above.
+    let scannerGradient = null, scannerGradientRadius = -1;
+    let scannerStopInner = "", scannerStopMid = "", scannerStopOuter = "";
+    let coreGradient = null;
+    let coreStopCenter = "", coreStopInner = "", coreStopOuter = "", coreStopEdge = "";
 
     for (let index = 0; index < BAR_COUNT; index += 1) {
       const angle = -Math.PI / 2 + index * TAU / BAR_COUNT;
@@ -327,6 +375,22 @@
         innerSegmentPath.arc(0, 0, .295 * scale, start, start + length);
       }
 
+      // Geometry changed size, so the ring sprites must be rebuilt now
+      // regardless of transition state (drawTickRing/drawSegmentRings only
+      // rebuild on their own during a color transition).
+      renderTickRingSprite();
+      renderSegmentRingSprite();
+
+      // NOTE (pre-existing, not part of this pass): like the ring sprites
+      // above before this fix, this backing store is CSS-px sized, not
+      // pixelRatio-scaled, so it rasterizes at 1x and gets bilinearly
+      // upscaled at any display scale above 100%. Left as-is deliberately:
+      // this sprite's own geometry (middle/unit/hex coordinates below) is
+      // defined directly in spriteSize units with no separate logical-size
+      // variable, so a proper fix means introducing one and rewriting every
+      // coordinate below, not a one-line change like the ring sprites got.
+      // It stays imperceptible in practice — drawBackdrop() paints it at
+      // .075-.36 alpha as a faint decorative texture.
       const spriteSize = Math.max(256, Math.ceil(scale * 1.08));
       backdropSprite.width = spriteSize;
       backdropSprite.height = spriteSize;
@@ -466,31 +530,158 @@
       context.globalAlpha = 1;
     }
 
+    // Ring-sprite rebuild: bakes the tick-ring / segment-ring stroke geometry
+    // (which never changes shape outside a resize) at the current theme
+    // color/alpha into an offscreen canvas. Safe to skip most frames because
+    // primaryColor/secondaryColor/motion only move during a color transition;
+    // once settled they are exactly constant, so re-stroking every frame
+    // would draw an identical raster. The per-frame draw path only rotates +
+    // drawImages it. The rebuild trigger is the baked color itself, not a
+    // time window — see the cache-key note above.
+    function tickRingMinorColorNow() {
+      return colorString(primaryColor, (.15 + motion[1] * .1) * (visualState === "OFFLINE" ? .18 : 1));
+    }
+
+    function tickRingMajorColorNow() {
+      return colorString(secondaryColor, (.35 + motion[1] * .2) * (visualState === "OFFLINE" ? .18 : 1));
+    }
+
+    // Strokes the tick ring into `target`, which the caller has already
+    // translated to the ring centre. One routine for both destinations: the
+    // offscreen sprite context and — during a transition — the live frame
+    // context, so the two paths can never drift in width, cap or order.
+    function strokeTickRing(target, minorColor, majorColor) {
+      target.lineCap = "butt";
+      target.lineWidth = Math.max(.45, scale * .0012);
+      target.strokeStyle = minorColor;
+      target.stroke(minorTickPath);
+      target.lineWidth = Math.max(.7, scale * .0021);
+      target.strokeStyle = majorColor;
+      target.stroke(majorTickPath);
+    }
+
+    function renderTickRingSprite(
+      minorColor = tickRingMinorColorNow(),
+      majorColor = tickRingMajorColorNow(),
+    ) {
+      const majorWidth = Math.max(.7, scale * .0021);
+      const outerRadius = .475 * scale;
+      const size = Math.max(2, Math.ceil(outerRadius * 2 + majorWidth * 4));
+      // Backing store must be device-pixel sized (size * pixelRatio), same as
+      // the main canvas in resize(), or this rasterizes at 1x and gets
+      // bilinearly upscaled by the drawImage in drawTickRing (soft/blurry at
+      // any display scale above 100%). The offscreen context is scaled by
+      // pixelRatio so every draw call below keeps using CSS-px-equivalent
+      // `size` units; the sprite is still drawImage'd back at CSS-px `size`
+      // (tickRingSpriteSize, unchanged) since the destination context already
+      // has pixelRatio baked into its own CTM (also set in resize()).
+      const deviceSize = Math.max(2, Math.round(size * pixelRatio));
+      if (tickRingSprite.width !== deviceSize || tickRingSprite.height !== deviceSize) {
+        tickRingSprite.width = deviceSize;
+        tickRingSprite.height = deviceSize;
+      }
+      const spriteContext = tickRingSprite.getContext("2d");
+      spriteContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      spriteContext.clearRect(0, 0, size, size);
+      spriteContext.save();
+      spriteContext.translate(size / 2, size / 2);
+      strokeTickRing(spriteContext, minorColor, majorColor);
+      spriteContext.restore();
+      tickRingSpriteSize = size;
+      tickRingMinorColor = minorColor;
+      tickRingMajorColor = majorColor;
+    }
+
+    function segmentRingColorNow() {
+      return colorString(secondaryColor, (.22 + motion[1] * .42) * (visualState === "OFFLINE" ? .16 : 1));
+    }
+
+    // Same contract as strokeTickRing: `target` is already centred.
+    function strokeSegmentRing(target, color) {
+      target.lineCap = "round";
+      target.lineWidth = Math.max(.65, scale * .0022);
+      target.strokeStyle = color;
+      target.stroke(innerSegmentPath);
+    }
+
+    function renderSegmentRingSprite(color = segmentRingColorNow()) {
+      const lineWidth = Math.max(.65, scale * .0022);
+      const outerRadius = .295 * scale;
+      const size = Math.max(2, Math.ceil(outerRadius * 2 + lineWidth * 4));
+      // See the matching comment in renderTickRingSprite: backing store is
+      // device-pixel sized (size * pixelRatio) and the offscreen context is
+      // scaled by pixelRatio so drawing stays in CSS-px-equivalent `size`
+      // units; drawImage back in drawSegmentRings still targets CSS-px
+      // `size` (segmentRingSpriteSize, unchanged).
+      const deviceSize = Math.max(2, Math.round(size * pixelRatio));
+      if (segmentRingSprite.width !== deviceSize || segmentRingSprite.height !== deviceSize) {
+        segmentRingSprite.width = deviceSize;
+        segmentRingSprite.height = deviceSize;
+      }
+      const spriteContext = segmentRingSprite.getContext("2d");
+      spriteContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      spriteContext.clearRect(0, 0, size, size);
+      spriteContext.save();
+      spriteContext.translate(size / 2, size / 2);
+      strokeSegmentRing(spriteContext, color);
+      spriteContext.restore();
+      segmentRingSpriteSize = size;
+      segmentRingColor = color;
+    }
+
+    // A ring is in one of two regimes. SETTLED (the overwhelming majority of
+    // frames): the color is constant, so the sprite is valid and the frame
+    // costs one rotate + one blit. TRANSITIONING: the color changes every
+    // frame, so a sprite would have to be re-stroked every frame AND blitted
+    // — the stroke cost plus a blit the live path never pays. So a
+    // transition live-strokes into the frame context exactly like the
+    // pre-sprite code did, and the sprite is re-rendered ONCE, on the first
+    // frame after the color settles (its cached color no longer matches).
     function drawTickRing(now) {
-      const visibility = visualState === "OFFLINE" ? .18 : 1;
+      const minorColor = tickRingMinorColorNow();
+      const majorColor = tickRingMajorColorNow();
+      const transitioning = now - transitionAt <= 420;
+      if (
+        !transitioning
+        && (tickRingSpriteSize === 0
+          || minorColor !== tickRingMinorColor
+          || majorColor !== tickRingMajorColor)
+      ) renderTickRingSprite(minorColor, majorColor);
       context.save();
       context.translate(centerX, centerY);
       context.rotate(now * .000018 * (1 + motion[0]));
-      context.lineCap = "butt";
-      context.lineWidth = Math.max(.45, scale * .0012);
-      context.strokeStyle = colorString(primaryColor, (.15 + motion[1] * .1) * visibility);
-      context.stroke(minorTickPath);
-      context.lineWidth = Math.max(.7, scale * .0021);
-      context.strokeStyle = colorString(secondaryColor, (.35 + motion[1] * .2) * visibility);
-      context.stroke(majorTickPath);
+      if (transitioning) {
+        strokeTickRing(context, minorColor, majorColor);
+      } else {
+        context.drawImage(
+          tickRingSprite,
+          -tickRingSpriteSize / 2, -tickRingSpriteSize / 2,
+          tickRingSpriteSize, tickRingSpriteSize,
+        );
+      }
       context.restore();
     }
 
     function drawSegmentRings(now) {
+      const color = segmentRingColorNow();
+      const transitioning = now - transitionAt <= 420;
+      if (
+        !transitioning
+        && (segmentRingSpriteSize === 0 || color !== segmentRingColor)
+      ) renderSegmentRingSprite(color);
       const speed = .000035 + motion[0] * .00016;
-      const visibility = visualState === "OFFLINE" ? .16 : 1;
-      context.lineCap = "round";
       context.save();
       context.translate(centerX, centerY);
       context.rotate(-now * speed * 1.32);
-      context.lineWidth = Math.max(.65, scale * .0022);
-      context.strokeStyle = colorString(secondaryColor, (.22 + motion[1] * .42) * visibility);
-      context.stroke(innerSegmentPath);
+      if (transitioning) {
+        strokeSegmentRing(context, color);
+      } else {
+        context.drawImage(
+          segmentRingSprite,
+          -segmentRingSpriteSize / 2, -segmentRingSpriteSize / 2,
+          segmentRingSpriteSize, segmentRingSpriteSize,
+        );
+      }
       context.restore();
     }
 
@@ -498,14 +689,43 @@
       if (motion[4] < .04) return;
       const rotation = now * (.00018 + motion[4] * .00034);
       const radius = .44 * scale;
+      // Gradient stop coordinates are evaluated against the CTM active at
+      // fill()-time, not at createLinearGradient()-time (confirmed: gradients
+      // follow the paint-time transform the same way patterns do), so a
+      // gradient created once in the LOCAL (0,0)-(radius,0) space established
+      // by translate+rotate below re-orients itself correctly every frame as
+      // `rotation` changes with zero need to recreate it. Only rebuilt when
+      // `radius` changes (resize) or one of its own color stops changes.
+      const stopInner = colorString(primaryColor, 0);
+      const stopMid = colorString(primaryColor, .02 + motion[4] * .09);
+      const stopOuter = colorString(secondaryColor, .08 + motion[4] * .38);
+      if (
+        scannerGradient === null
+        || scannerGradientRadius !== radius
+        || stopInner !== scannerStopInner
+        || stopMid !== scannerStopMid
+        || stopOuter !== scannerStopOuter
+      ) {
+        scannerGradient = context.createLinearGradient(0, 0, radius, 0);
+        scannerGradient.addColorStop(0, stopInner);
+        scannerGradient.addColorStop(.72, stopMid);
+        scannerGradient.addColorStop(1, stopOuter);
+        scannerGradientRadius = radius;
+        scannerStopInner = stopInner;
+        scannerStopMid = stopMid;
+        scannerStopOuter = stopOuter;
+      }
       context.save();
       context.translate(centerX, centerY);
       context.rotate(rotation);
-      const sweep = context.createLinearGradient(0, 0, radius, 0);
-      sweep.addColorStop(0, colorString(primaryColor, 0));
-      sweep.addColorStop(.72, colorString(primaryColor, .02 + motion[4] * .09));
-      sweep.addColorStop(1, colorString(secondaryColor, .08 + motion[4] * .38));
-      context.fillStyle = sweep;
+      // Restores the cap the pre-sprite drawSegmentRings used to leave on
+      // the frame context (it set lineCap = "round" outside its own
+      // save/restore, so every stroke after it inherited round caps). Now
+      // that the rings stroke into their own sprite contexts, the arc below
+      // and drawCore's strokes set it explicitly instead of inheriting a
+      // leak — same pixels, no action at a distance.
+      context.lineCap = "round";
+      context.fillStyle = scannerGradient;
       context.beginPath();
       context.moveTo(0, 0);
       context.arc(0, 0, radius, -.11, .11);
@@ -557,8 +777,6 @@
       const rate = dt / 16.67;
       const growFactor = 1 - Math.pow(1 - .32, rate);
       const shrinkFactor = 1 - Math.pow(1 - .1, rate);
-      const barPath = new Path2D();
-      const tipPath = new Path2D();
       for (let index = 0; index < BAR_COUNT; index += 1) {
         const mirroredIndex = index < UNIQUE_BANDS ? index : BAR_COUNT - 1 - index;
         let target = .025 + breathing * .02;
@@ -571,27 +789,38 @@
         const value = barValues[index];
         const innerRadius = baseRadius - inwardRange * value;
         const outerRadius = baseRadius + .008 * scale + outwardRange * value;
-        const innerX = centerX + cosine[index] * innerRadius;
-        const innerY = centerY + sine[index] * innerRadius;
-        const outerX = centerX + cosine[index] * outerRadius;
-        const outerY = centerY + sine[index] * outerRadius;
-        barPath.moveTo(innerX, innerY);
-        barPath.lineTo(outerX, outerY);
-        tipPath.moveTo(outerX + Math.max(1, scale * .0026), outerY);
-        tipPath.arc(outerX, outerY, Math.max(.8, scale * .0026), 0, TAU);
+        waveInnerX[index] = centerX + cosine[index] * innerRadius;
+        waveInnerY[index] = centerY + sine[index] * innerRadius;
+        waveOuterX[index] = centerX + cosine[index] * outerRadius;
+        waveOuterY[index] = centerY + sine[index] * outerRadius;
       }
       if (layerPresence <= 0) return;
       context.save();
       context.globalAlpha = layerPresence;
       context.lineCap = "round";
+      // Two passes over the SAME current path (beginPath()/moveTo/lineTo, no
+      // Path2D object): stroke() re-strokes whatever path is current without
+      // rebuilding it, exactly reproducing the former two-pass Path2D stroke.
+      context.beginPath();
+      for (let index = 0; index < BAR_COUNT; index += 1) {
+        context.moveTo(waveInnerX[index], waveInnerY[index]);
+        context.lineTo(waveOuterX[index], waveOuterY[index]);
+      }
       context.lineWidth = Math.max(3, scale * .009);
       context.strokeStyle = colorString(primaryColor, .05 + motion[1] * .11);
-      context.stroke(barPath);
+      context.stroke();
       context.lineWidth = Math.max(1.15, scale * .0035);
       context.strokeStyle = colorString(secondaryColor, .34 + motion[3] * .56);
-      context.stroke(barPath);
+      context.stroke();
+      const tipMoveOffset = Math.max(1, scale * .0026);
+      const tipRadius = Math.max(.8, scale * .0026);
+      context.beginPath();
+      for (let index = 0; index < BAR_COUNT; index += 1) {
+        context.moveTo(waveOuterX[index] + tipMoveOffset, waveOuterY[index]);
+        context.arc(waveOuterX[index], waveOuterY[index], tipRadius, 0, TAU);
+      }
       context.fillStyle = colorString(secondaryColor, .28 + motion[3] * .62);
-      context.fill(tipPath);
+      context.fill();
       context.restore();
     }
 
@@ -612,18 +841,52 @@
       );
       context.restore();
 
-      const coreGradient = context.createRadialGradient(
-        centerX - coreRadius * .22, centerY - coreRadius * .25, coreRadius * .04,
-        centerX, centerY, coreRadius,
-      );
-      coreGradient.addColorStop(0, colorString(secondaryColor, .7 + motion[3] * .25));
-      coreGradient.addColorStop(.28, colorString(coreColor, .22 + motion[3] * .24));
-      coreGradient.addColorStop(.72, colorString(primaryColor, .08 + motion[3] * .1));
-      coreGradient.addColorStop(1, colorString(primaryColor, .015));
+      // coreRadius breathes every frame (idle animation) even outside a
+      // transition, so the gradient's absolute position changes constantly —
+      // but gradient stops are evaluated against the CTM at fill()-time (see
+      // note above scannerGradient), so instead of rebuilding the gradient
+      // every frame we build it ONCE in a unit-radius local space and scale
+      // the context by coreRadius before filling; the cached gradient
+      // reproduces the exact original absolute-space gradient every frame
+      // with zero per-frame allocation. Only rebuilt when one of its own
+      // color stops changes.
+      const stopCenter = colorString(secondaryColor, .7 + motion[3] * .25);
+      const stopInner = colorString(coreColor, .22 + motion[3] * .24);
+      const stopOuter = colorString(primaryColor, .08 + motion[3] * .1);
+      const stopEdge = colorString(primaryColor, .015);
+      if (
+        coreGradient === null
+        || stopCenter !== coreStopCenter
+        || stopInner !== coreStopInner
+        || stopOuter !== coreStopOuter
+        || stopEdge !== coreStopEdge
+      ) {
+        coreGradient = context.createRadialGradient(-.22, -.25, .04, 0, 0, 1);
+        coreGradient.addColorStop(0, stopCenter);
+        coreGradient.addColorStop(.28, stopInner);
+        coreGradient.addColorStop(.72, stopOuter);
+        coreGradient.addColorStop(1, stopEdge);
+        coreStopCenter = stopCenter;
+        coreStopInner = stopInner;
+        coreStopOuter = stopOuter;
+        coreStopEdge = stopEdge;
+      }
+      context.save();
+      context.translate(centerX, centerY);
+      context.scale(coreRadius, coreRadius);
       context.beginPath();
-      context.arc(centerX, centerY, coreRadius, 0, TAU);
+      context.arc(0, 0, 1, 0, TAU);
       context.fillStyle = coreGradient;
       context.fill();
+      context.restore();
+      // Same restored cap as drawScanner: the core outline, the inner ring
+      // and (through the save() below, which inherits it) the dashed ring
+      // all rendered with round caps while drawSegmentRings leaked that
+      // setting into the frame context. The dashed ring is where it is
+      // visible — every dash gets rounded ends.
+      context.lineCap = "round";
+      context.beginPath();
+      context.arc(centerX, centerY, coreRadius, 0, TAU);
       context.lineWidth = Math.max(.8, scale * .0028);
       context.strokeStyle = colorString(secondaryColor, .24 + motion[3] * .58);
       context.stroke();
@@ -646,6 +909,24 @@
       context.restore();
     }
 
+    // CONVENTION: nothing under draw()/frame() (or any function they call —
+    // drawBackdrop, drawTickRing, drawSegmentRings, drawScanner, drawParticles,
+    // drawWaveform, drawCore) may allocate. That means no `new Path2D()`,
+    // `new Float32Array()`/other typed-array or array literal, no
+    // `createRadialGradient`/`createLinearGradient`/`createPattern` whose
+    // result isn't cached across frames, and no object/array literals. Each
+    // per-frame allocation becomes GC churn and shows up as a stutter in
+    // frameHistogram's >25ms buckets. Reuse a preallocated buffer or a
+    // resize-time/color-keyed cache instead (see waveInnerX/etc.,
+    // tickRingSprite/segmentRingSprite, scannerGradient/coreGradient). The
+    // only allocation-allowed call sites are resize() (runs on resize, not
+    // every frame) and the cache-miss branches inside drawScanner/drawCore/
+    // renderTickRingSprite/renderSegmentRingSprite, which can only be
+    // reached when the color they baked actually changed — i.e. during a
+    // transition, not in steady state. The one steady-state allocation left
+    // is the colorString() key each cache is compared against: short-lived
+    // young-generation strings, deliberately paid to make staleness
+    // impossible (see the cache-key note above tickRingMinorColor).
     function draw(now) {
       // boss-authorized preview override for headless review; visuals only
       const previewState = ENGINE_STATES.has(window.__atlasEnginePreview)
@@ -665,6 +946,7 @@
       drawParticles(now);
       drawWaveform(now, dt);
       drawCore(now);
+      return dt;
     }
 
     // Idle (ASLEEP/OFFLINE) pauses the rAF loop entirely; a live preview override
@@ -677,6 +959,13 @@
     function pauseLoop() {
       running = false;
       metrics.running = false;
+      // Forget the last frame's timestamp. dt is "time since the previous
+      // frame", which is meaningless across a pause: waking after 12s idle
+      // would otherwise hand the first frame a dt clamped to 100ms and
+      // record a >=50ms "drop" that never happened, plus a full-strength
+      // waveform decay step. 0 makes the next draw() use the 16.67ms
+      // first-frame default, exactly as at startup.
+      lastFrameNow = 0;
       canvas.dataset.animation = "paused";
       if (animationFrame) cancelAnimationFrame(animationFrame);
       animationFrame = 0;
@@ -686,12 +975,23 @@
       if (!running) return;
       if (isIdleNow()) { pauseLoop(); return; }
       const started = performance.now();
-      draw(now);
+      const dt = draw(now);
       const elapsed = performance.now() - started;
       metrics.samples += 1;
       metrics.lastMs = elapsed;
       metrics.averageMs += (elapsed - metrics.averageMs) * (metrics.samples < 60 ? 1 / metrics.samples : .035);
       metrics.maxMs = Math.max(metrics.maxMs, elapsed);
+      // Frame-interval histogram (preallocated Uint32Array(5), no per-frame
+      // allocation): buckets by dt (this frame's interval since the last
+      // one), not by draw cost above. Bucket edges: <17 / 17-25 / 25-33 /
+      // 33-50 / >=50 ms. A dt >= 25ms is a visible drop (same boundary as
+      // the 25-33 bucket edge, so drops stays self-consistent with the
+      // histogram — it's exactly the sum of the >=25ms buckets).
+      let bucket = 0;
+      while (bucket < FRAME_BUCKET_MS.length && dt >= FRAME_BUCKET_MS[bucket]) bucket += 1;
+      metrics.frameHistogram[bucket] += 1;
+      metrics.totalFrames += 1;
+      if (dt >= 25) metrics.drops += 1;
       if (metrics.samples % 30 === 0) {
         canvas.setAttribute("data-frame-cost-ms", metrics.averageMs.toFixed(3));
         canvas.dataset.frameMaxMs = metrics.maxMs.toFixed(3);
@@ -705,6 +1005,13 @@
       resize();
       running = true;
       metrics.running = true;
+      // resize() above may have forced an out-of-band draw() while paused,
+      // which sets lastFrameNow; that timestamp is not "the previous frame"
+      // of the loop starting now either (see pauseLoop).
+      lastFrameNow = 0;
+      metrics.frameHistogram.fill(0);
+      metrics.drops = 0;
+      metrics.totalFrames = 0;
       canvas.dataset.animation = "running";
       animationFrame = requestAnimationFrame(frame);
     }

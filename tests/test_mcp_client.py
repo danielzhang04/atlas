@@ -11,7 +11,7 @@ import subprocess
 import sys
 from types import ModuleType
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -32,6 +32,10 @@ except ModuleNotFoundError:
         input_schema: dict
         run: Callable[[dict], Awaitable[Any]]
         policy: Literal["instant", "confirm"] = "instant"
+        prepare: Any = None
+        execute_prepared: Any = None
+        domain: str | None = None
+        escalate: Callable[[Mapping], bool] | None = None
 
     class McpToolError(RuntimeError):
         pass
@@ -697,14 +701,223 @@ def test_checked_in_chrome_devtools_config_has_explicit_safe_policy():
     defaults = config["defaults"]
 
     assert server["from_claude_config"] == "chrome-devtools"
+    assert server["domain"] == "browser"
     assert set(server["blocked"]) == {
         "get_network_request",
         "list_network_requests",
     }
-    for name in ("list_pages", "get_console_message", "take_snapshot", "take_screenshot"):
+    assert set(server["expose"]) == {
+        "navigate_page", "take_snapshot", "click", "fill",
+        "take_screenshot", "list_pages", "wait_for",
+    }
+    for name in ("list_pages", "take_snapshot", "take_screenshot"):
         assert policy_for(server, defaults, name) == "instant"
-    for name in ("navigate_page", "click", "fill", "evaluate_script"):
+    for name in ("navigate_page", "click", "fill", "wait_for"):
         assert policy_for(server, defaults, name) == "confirm"
+
+
+def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["google"]
+    defaults = config["defaults"]
+
+    assert server["domain"] == "google"
+    # Pins the Track C3 version pin itself: a version bump or a --tools
+    # typo in the checked-in config fails this test rather than silently
+    # spawning a different workspace-mcp release or tool set.
+    assert server["args_override"] == [
+        "workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar",
+    ]
+    assert set(server["expose"]) == {
+        "search_gmail_messages", "get_gmail_message_content", "get_gmail_thread_content",
+        "list_gmail_labels", "get_events", "list_calendars", "query_freebusy",
+        "search_drive_files", "list_drive_items", "get_drive_file_content",
+        "send_gmail_message", "draft_gmail_message",
+        "get_drive_shareable_link", "manage_event",
+    }
+    for name in (
+        "search_gmail_messages", "get_gmail_message_content", "get_gmail_thread_content",
+        "list_gmail_labels", "get_events", "list_calendars", "query_freebusy",
+        "search_drive_files", "list_drive_items", "get_drive_file_content",
+    ):
+        assert policy_for(server, defaults, name) == "instant"
+    # Named in the plan as tiered mutations, both now confirm. A name-lying
+    # read (get_drive_shareable_link creates a sharing grant) stays confirm
+    # outright. manage_event was instant for action: create via instant_when
+    # until the BB-wave review (blocker 1) pointed out that an instant create
+    # still accepts attendees:/send_updates:, i.e. sends real email to third
+    # parties on a model assertion -- rule 5. EVERY calendar mutation
+    # confirms now, and there is no instant_when rule for it at all; a
+    # future instant create needs an argument-PRESENCE predicate, which the
+    # value-allowlist instant_when compiles today cannot express.
+    assert policy_for(server, defaults, "get_drive_shareable_link") == "confirm"
+    assert policy_for(server, defaults, "manage_event") == "confirm"
+    assert "manage_event" not in server["instant"]
+    assert "instant_when" not in server
+    # The escalate machinery itself stays in place and tested (it is general,
+    # and is the right shape for the next tool whose safe subset is a set of
+    # argument values) -- it just has no rules configured. Every instant
+    # google tool therefore compiles to no escalate hook.
+    for name in server["instant"]:
+        assert mcp_client._compile_instant_when(server, name) is None
+    # Product decision: send_gmail_message/draft_gmail_message are exposed
+    # (everyday send/draft is the point) but not in instant: -- and
+    # never_instant's "send" pattern independently forces confirm on
+    # send_gmail_message even if it were ever added there by mistake.
+    assert "send_gmail_message" not in server["instant"]
+    assert "draft_gmail_message" not in server["instant"]
+    assert policy_for(server, defaults, "send_gmail_message") == "confirm"
+    assert policy_for(server, defaults, "draft_gmail_message") == "confirm"
+
+
+def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation():
+    """Official @modelcontextprotocol/server-filesystem (Track C2): 8 reads
+    instant, the 4 mutations (write_file, edit_file, create_directory,
+    move_file) confirm by omission from instant: -- there is no delete tool
+    on this server at all, a structural guardrail rather than a policy
+    choice made here."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["files"]
+    defaults = config["defaults"]
+
+    assert server["domain"] == "files"
+    # enabled_from is consumed during spec-resolution (see
+    # _resolve_command_config); the checked-in atlas.yaml's non-empty
+    # file_write_roots resolves it to True here. The reference itself and its
+    # empty/malformed-roots behavior are covered directly by
+    # test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty
+    # and test_file_roots_reference_rejects_malformed_file_roots_config.
+    assert server["enabled"] is True
+    read_tools = {
+        "read_text_file", "read_multiple_files",
+        "list_directory", "list_directory_with_sizes", "directory_tree",
+        "search_files", "get_file_info", "list_allowed_directories",
+    }
+    mutation_tools = {"write_file", "edit_file", "create_directory", "move_file"}
+    assert set(server["expose"]) == read_tools | mutation_tools
+    assert set(server["instant"]) == read_tools
+    assert "read_file" not in server["expose"]  # deprecated alias of read_text_file
+    # BB-wave review, finding 11: read_media_file returns base64 image/audio
+    # through the same 4096-char _MAX_CONTENT bound as every other MCP
+    # result, so it can only ever deliver a truncated, unusable fragment.
+    assert "read_media_file" not in server["expose"]
+    assert "delete" not in {t.lower() for t in server["expose"]}
+    for name in read_tools:
+        assert policy_for(server, defaults, name) == "instant"
+    for name in mutation_tools:
+        # Neither in instant: (checked above) nor caught by instant_prefixes
+        # (write_/edit_/create_/move_ are not among get_/list_/search_/
+        # query_/read_/check_) -- confirmed by omission, not by
+        # never_instant (none of write_file/edit_file/create_directory/
+        # move_file contain a never_instant substring either).
+        assert not any(
+            name.startswith(prefix) for prefix in defaults["instant_prefixes"]
+        )
+        assert policy_for(server, defaults, name) == "confirm"
+    # Every mutation's description states the confirm gate; the two read
+    # overrides (BB-wave review, finding 11) state the limits that make a
+    # naive call useless -- read_text_file's 4KB truncation, and that
+    # search_files' plain paths are not the handles open_file/open_folder
+    # need after a tainting read.
+    assert set(server["describe"]) == mutation_tools | {"read_text_file", "search_files"}
+    for name in mutation_tools:
+        description = server["describe"][name].lower()
+        assert "confirm" in description or "yes" in description
+    assert "4kb" in server["describe"]["read_text_file"].lower()
+    assert "launch_work" in server["describe"]["read_text_file"]
+    assert "find_file" in server["describe"]["search_files"]
+    assert "handle" in server["describe"]["search_files"].lower()
+
+    # Blocker 2 (write scope): this server -- the only component with write
+    # tools -- is started with file_write_roots, NOT file_roots, so the kb
+    # checkout stays a read root reachable only through the built-in
+    # LocalFiles tools. The argv token and the enabled_from reference must
+    # both name the write list, or one of the two silently reintroduces kb.
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "mcp.yaml").read_text(encoding="utf-8"),
+    )["servers"]["files"]
+    assert "{file_write_roots}" in raw["command"]
+    assert "{file_roots}" not in raw["command"]
+    assert raw["enabled_from"] == "file_write_roots.enabled"
+    atlas = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )
+    assert atlas["file_write_roots"] == ["known:Desktop", "known:Documents", "known:Downloads"]
+    # The write list is a strict subset of the read list, and kb is in the
+    # difference -- the whole point of the split.
+    assert set(atlas["file_write_roots"]) < set(atlas["file_roots"])
+    assert not any("kb" in root.casefold() for root in atlas["file_write_roots"])
+    assert any("kb" in root.casefold() for root in atlas["file_roots"])
+    # The resolved argv the server actually spawns with contains no kb path.
+    assert not any("kb" in argument.casefold() for argument in server["args"])
+
+
+def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path):
+    """Net prompt surface: kb (32, a commented constant -- kb tools require a
+    live bridge connection this test does not make; see
+    handoffs/2026-08-27-atlas-xwave.md) + google (38->14) +
+    chrome-devtools (27->7) + files (12, Track C2 minus read_media_file --
+    BB-wave review finding 11) + built-in host tools (constructed here via
+    the real builtin()/register_count_mail() registration path, not
+    guessed) = 84. This is OVER the 72 C0 set
+    (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0), itself already
+    2-3x the ~30-50 model-accuracy threshold the survey named -- the plan's
+    Track C2 row prioritizes the files domain for this wave over holding
+    72, and flags 84 for a per-turn tool-projection follow-up (config/
+    mcp.yaml's top-of-file comment carries the same note). This test locks
+    in the actual number so a future change to it is a deliberate, visible
+    diff rather than a silent drift.
+    """
+    from worker.localfiles import LocalFiles
+    from worker.tools import ToolRegistry, builtin, register_count_mail
+
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    google_expose = config["servers"]["google"]["expose"]
+    chrome_expose = config["servers"]["chrome-devtools"]["expose"]
+    files_expose = config["servers"]["files"]["expose"]
+    assert len(google_expose) == 14
+    assert len(chrome_expose) == 7
+    assert len(files_expose) == 12
+
+    class _FakeJob:
+        job_id = "job"
+        title = "t"
+        state = "done"
+        created_at = "now"
+
+    class _FakeWork:
+        def launch(self, _title, _brief):
+            return _FakeJob()
+
+        def active(self):
+            return []
+
+        def recent(self, _n):
+            return []
+
+        def cancel(self, _job_id):
+            return _FakeJob()
+
+    async def _search(_arguments):
+        return "Found 0 messages matching x"
+
+    builtin_registry = ToolRegistry()
+    files = LocalFiles([str(tmp_path)], opener=lambda _path: None)
+    builtin(builtin_registry, {}, _FakeWork(), files=files)
+    register_count_mail(builtin_registry, _search)
+    builtin_count = len(builtin_registry.schemas())
+
+    KB_COUNT = 32  # commented constant: see docstring above
+
+    total = (
+        KB_COUNT + len(google_expose) + len(chrome_expose)
+        + len(files_expose) + builtin_count
+    )
+    # Track C2 (files) pushes the curated total from 72 to 84 -- over the
+    # C0 budget, flagged rather than hidden; see this test's docstring.
+    assert builtin_count == 19
+    assert total == 84
+    assert total < 116  # still net negative against the pre-C0 baseline
 
 
 def test_blocked_server_tools_are_never_registered_or_callable():
@@ -791,7 +1004,9 @@ def test_one_factory_failure_is_class_only_and_does_not_block_other_server(caplo
                     "broken": {"command": "bad"},
                     "google": {"command": "unused", "instant": ["get_events"]},
                 },
-                "defaults": {"connect_timeout_s": 1},
+                # connect_retries: 1: this test is about a single broken
+                # server not blocking a healthy one, not about retry.
+                "defaults": {"connect_timeout_s": 1, "connect_retries": 1},
             },
             session_factory=factory,
         )
@@ -874,7 +1089,10 @@ def test_connect_timeout_is_reported_by_class_name():
         servers = McpServers(
             {
                 "servers": {"slow": {"command": "unused"}},
-                "defaults": {"connect_timeout_s": 0.01},
+                # connect_retries: 1 isolates the single-attempt timeout
+                # classification this test is about from the retry-with-
+                # backoff behavior covered by its own tests.
+                "defaults": {"connect_timeout_s": 0.01, "connect_retries": 1},
             },
             session_factory=factory,
         )
@@ -939,7 +1157,12 @@ def test_connection_failures_have_closed_bounded_details(failure, expected_error
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"broken": {"command": "C:/private/path/missing.exe?token=secret"}}},
+            {
+                "servers": {"broken": {"command": "C:/private/path/missing.exe?token=secret"}},
+                # connect_retries: 1: this test is about single-attempt
+                # detail classification (spawn_failed is otherwise retried).
+                "defaults": {"connect_retries": 1},
+            },
             session_factory=factory,
         )
         await servers.connect(FakeRegistry())
@@ -1078,6 +1301,7 @@ def test_status_detail_vocabulary_rejects_unknown_pairs():
 
     expected = {
         ("connecting", "connection pending"),
+        ("connecting", "retrying (attempt 2 of 3)"),
         ("connected", "ready"),
         ("configured", "signed executable found"),
         ("not_configured", "disabled by configuration"),
@@ -1124,7 +1348,10 @@ def test_tool_listing_failure_is_reported_without_exception_text():
     }]
 
 
-def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
+def test_status_transition_hook_ignores_polls_and_reconnect_replaces_detail():
+    """A fresh top-level connect() call (e.g. a future manual "reconnect")
+    is a different thing from the automatic per-attempt retry-with-backoff
+    covered elsewhere -- connect_retries: 1 isolates that here."""
     attempts = [OSError("first private failure"), FileNotFoundError("second private failure")]
     transitions = []
 
@@ -1133,7 +1360,10 @@ def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"google": {"command": "C:/private/tool.exe"}}},
+            {
+                "servers": {"google": {"command": "C:/private/tool.exe"}},
+                "defaults": {"connect_retries": 1},
+            },
             session_factory=factory,
             on_state=lambda name, state, snapshot: transitions.append((name, state, snapshot)),
         )
@@ -1155,6 +1385,357 @@ def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
         ("google", "connecting"),
         ("google", "error"),
     ]
+
+
+# --- connect retry-with-backoff (plan Track C3): -------------------------
+
+def test_connect_retries_timeout_then_succeeds_with_observed_backoff():
+    calls = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    good_factory = _memory_factory(_server())
+
+    @asynccontextmanager
+    async def factory(server_name, spec):
+        calls.append(server_name)
+        if len(calls) <= 2:
+            raise TimeoutError("simulated cold-cache resolution")
+        async with good_factory(server_name, spec) as session:
+            yield session
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": True, "tools": 3, "error": None,
+        "state": "connected", "detail": "ready",
+    }]
+    assert len(calls) == 3
+    assert sleeps == [2.0, 8.0]
+
+
+def test_connect_retries_spawn_failure_then_succeeds_with_observed_backoff():
+    """Mirrors the timeout retry test above but for the other retryable
+    class -- a generic exception with no special-cased FileNotFoundError/
+    TimeoutError/McpError shape, which the real _failure_status pipeline
+    falls through to classifying as "spawn failed". Exercises retry
+    end-to-end through the actual classifier and renderer (not a hardcoded
+    "spawn failed" literal) so a change to that fallback path or to the
+    vocabulary's wording is caught here if it stops being retried."""
+    calls = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    good_factory = _memory_factory(_server())
+
+    @asynccontextmanager
+    async def factory(server_name, spec):
+        calls.append(server_name)
+        if len(calls) <= 2:
+            raise RuntimeError("simulated spawn failure")
+        async with good_factory(server_name, spec) as session:
+            yield session
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": True, "tools": 3, "error": None,
+        "state": "connected", "detail": "ready",
+    }]
+    assert len(calls) == 3
+    assert sleeps == [2.0, 8.0]
+
+
+def test_retry_exhausts_after_configured_attempts_and_state_is_visible_between_attempts():
+    observed = []
+    holder: dict = {}
+
+    async def fake_sleep(_seconds):
+        observed.append(holder["servers"].status()[0])
+
+    def factory(_server_name, _spec):
+        raise TimeoutError("simulated cold-cache resolution")
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1, "connect_retries": 2},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        holder["servers"] = servers
+        await servers.connect(FakeRegistry())
+        final = servers.status()
+        await servers.close()
+        return final
+
+    final = asyncio.run(scenario())
+
+    # After attempt 1/2 fails, state stays "connecting" (visible via status())
+    # with a "retrying" detail naming the *next* attempt about to run --
+    # the on_state hook does not fire for this because state didn't change.
+    assert observed == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "TimeoutError", "state": "connecting",
+        "detail": "retrying (attempt 2 of 2)",
+    }]
+    assert final == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "TimeoutError", "state": "error",
+        "detail": "handshake timeout after 1s",
+    }]
+
+
+def test_config_entry_missing_does_not_retry(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text('{"mcpServers": {}}', encoding="utf-8")
+    calls = []
+
+    def factory(_server_name, _spec):
+        calls.append(True)
+        raise AssertionError("session_factory must not run for a config error")
+
+    async def fake_sleep(_seconds):
+        raise AssertionError("must not back off / retry a config error")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(FakeRegistry())
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": False, "tools": 0, "error": "KeyError",
+        "state": "not_configured", "detail": "config entry missing",
+    }]
+    assert calls == []
+
+
+def test_config_malformed_does_not_retry(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text("{malformed", encoding="utf-8")
+
+    async def fake_sleep(_seconds):
+        raise AssertionError("must not back off / retry a config error")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+            sleep=fake_sleep,
+        )
+        await servers.connect(FakeRegistry())
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "JSONDecodeError", "state": "error",
+        "detail": "config malformed",
+    }]
+
+
+def test_connect_attempts_and_backoffs_default_when_unconfigured():
+    assert mcp_client._connect_attempts({}) == 3
+    assert mcp_client._connect_backoffs({}) == (2.0, 8.0)
+
+
+def test_connect_retries_rejects_invalid_values():
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": 0})
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": True})
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": "3"})
+
+
+def test_connect_retry_backoff_rejects_invalid_values():
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": []})
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": [2, -1]})
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": "2,8"})
+
+
+def test_is_retryable_failure_matches_only_timeout_and_spawn_failed():
+    assert mcp_client._is_retryable_failure("error", "spawn failed") is True
+    assert mcp_client._is_retryable_failure("error", "handshake timeout after 60s") is True
+    assert mcp_client._is_retryable_failure("error", "config malformed") is False
+    assert mcp_client._is_retryable_failure("error", "config entry missing") is False
+    assert mcp_client._is_retryable_failure("error", "executable not found: tool.exe") is False
+    assert mcp_client._is_retryable_failure("not_configured", "config entry missing") is False
+
+
+def test_is_retryable_failure_is_derived_from_the_real_vocabulary_renderers():
+    """_is_retryable_failure must not hardcode a copy of the rendered text
+    -- it is checked here against worker.statusdetail's own render function,
+    not a literal, so a future rewording of the "timeout"/"spawn_failed"
+    detail strings cannot silently desync the retry set from the
+    vocabulary (the failure mode the C3 review flagged)."""
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "spawn_failed"),
+    ) is True
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "timeout", timeout_s=42),
+    ) is True
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "config_malformed"),
+    ) is False
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "executable_missing", executable="x.exe"),
+    ) is False
+
+
+# --- args_override / package pin (plan Track C3): -------------------------
+
+def test_args_override_replaces_from_claude_config_argv_without_spawning(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text(
+        json.dumps({
+            "mcpServers": {
+                "google-workspace": {
+                    "command": "uvx",
+                    "args": ["workspace-mcp", "--tools", "gmail", "drive", "calendar"],
+                    "env": {"USER_GOOGLE_EMAIL": "daniel.zhang.t1@gmail.com"},
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    seen = []
+
+    def factory(_server_name, spec):
+        seen.append(spec)
+        raise LookupError("must stop before any real spawn")
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "from_claude_config": "google-workspace",
+                        "args_override": [
+                            "workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar",
+                        ],
+                    },
+                },
+                "defaults": {"connect_retries": 1},
+            },
+            claude_config_path=claude_config,
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    assert seen[0].command == "uvx"
+    assert seen[0].args == ["workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar"]
+    assert seen[0].env == {"USER_GOOGLE_EMAIL": "daniel.zhang.t1@gmail.com"}
+
+
+def test_args_override_rejects_a_malformed_list():
+    with pytest.raises(ValueError, match="args_override"):
+        mcp_client._args_override(["ok", 7])
+    with pytest.raises(ValueError, match="args_override"):
+        mcp_client._args_override("not-a-list")
+
+
+def test_cancellation_during_backoff_kills_tree_and_exits_cleanly():
+    """The existing connect-cancellation test below covers cancellation
+    while suspended entering stdio; this covers the other suspension point
+    the retry loop introduces -- ``await self._sleep(backoff)`` between
+    attempts. A pid is set right at the point of cancellation (simulating a
+    still-tracked child at that suspension point) so the assertion proves
+    the unconditional `finally` cleanup runs, not just the per-attempt
+    cleanup that already ran before the backoff await."""
+    events = []
+    entered_backoff = asyncio.Event()
+
+    def factory(_server_name, _spec):
+        raise TimeoutError("simulated cold-cache resolution")
+
+    async def fake_sleep(_seconds):
+        events.append("backoff entered")
+        entered_backoff.set()
+        await asyncio.Event().wait()  # never set -- must be cancelled to resume
+
+    async def scenario():
+        kills = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+            killer=lambda pid, **kwargs: kills.append((pid, kwargs)),
+        )
+        task = asyncio.create_task(servers.connect(FakeRegistry()))
+        await entered_backoff.wait()
+        servers._server_pids["google"] = 4242
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # A subsequent close() must not raise and must not find an orphan
+        # task still tracked.
+        await servers.close()
+        return kills, task.done(), dict(servers._server_tasks)
+
+    kills, done, remaining_tasks = asyncio.run(scenario())
+
+    assert kills == [(4242, {"check": False})]
+    assert events == ["backoff entered"]
+    assert done is True
+    assert remaining_tasks == {}
 
 
 def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
@@ -1251,7 +1832,12 @@ def test_claude_config_resolves_child_spec_without_leaking_env(tmp_path, caplog)
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            {
+                "servers": {"google": {"from_claude_config": "google-workspace"}},
+                # connect_retries: 1: this test is about the resolved spec
+                # and env leak-safety, not about retry.
+                "defaults": {"connect_retries": 1},
+            },
             claude_config_path=claude_config,
             session_factory=factory,
         )
@@ -1325,7 +1911,9 @@ def test_failed_server_task_ends_and_retains_disconnected_status():
             raise LookupError("unavailable")
 
         servers = McpServers(
-            {"servers": {"broken": {"command": "bad"}}},
+            # connect_retries: 1: this test is about the server task ending
+            # and retaining disconnected status, not about retry.
+            {"servers": {"broken": {"command": "bad"}}, "defaults": {"connect_retries": 1}},
             session_factory=factory,
         )
         await servers.connect(FakeRegistry())
@@ -1464,6 +2052,340 @@ def test_command_config_is_dormant_by_default_and_resolves_a_minimal_environment
         "PATH": "minimal-path",
         "SystemRoot": "C:/Windows",
     }
+
+
+# --- files: {file_roots} spec-resolution (Track C2) ----------------------
+
+
+def _files_mcp_yaml(key: str = "file_roots") -> str:
+    """A minimal command: server using one of the two roots keys. Both go
+    through identical machinery (see _ROOTS_ARGV_TOKENS /
+    _ROOTS_ENABLED_REFERENCES), which is why every behavior below is
+    asserted for each key rather than for a hardcoded one."""
+    return (
+        "servers:\n"
+        "  files:\n"
+        f'    command: [npx, "-y", "pkg", "{{{key}}}"]\n'
+        f"    enabled_from: {key}.enabled\n"
+    )
+
+
+def test_any_empty_roots_token_disables_a_server_using_both_tokens(tmp_path):
+    """Final-review nit: the zero-resolved guard accumulates across ALL roots
+    tokens in one argv -- with two tokens, an empty first token must disable
+    the server even when the second resolves fine (and vice versa), not just
+    whichever token happened to be processed last."""
+    real = tmp_path / "real"
+    real.mkdir()
+    missing = tmp_path / "does_not_exist"
+    for first, second in (("file_roots", "file_write_roots"),
+                          ("file_write_roots", "file_roots")):
+        mcp_path = tmp_path / "mcp.yaml"
+        mcp_path.write_text(
+            "servers:\n"
+            "  files:\n"
+            f'    command: [npx, "-y", "pkg", "{{{first}}}", "{{{second}}}"]\n'
+            f"    enabled_from: {second}.enabled\n",
+            encoding="utf-8",
+        )
+        atlas_path = tmp_path / "atlas.yaml"
+        atlas_path.write_text(
+            f"{first}:\n  - {missing}\n{second}:\n  - {real}\n",
+            encoding="utf-8",
+        )
+        config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+        server = config["servers"]["files"]
+        assert server["enabled"] is False, f"empty {first} did not disable"
+        assert server["disabled_reason"] == "config_entry_missing"
+
+
+def test_file_roots_argv_token_expands_to_existing_directories_and_skips_missing_ones(
+    tmp_path,
+):
+    """{file_roots} in a command: server's argv resolves through the exact
+    same code path worker/runtime.py uses to build the built-in LocalFiles
+    tools (worker/localfiles.py's resolve_file_roots), so a directory that
+    doesn't exist is silently dropped from BOTH surfaces identically, not
+    just from one of them -- one allowlist, not two that could drift."""
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    missing = tmp_path / "missing"
+
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path.write_text(
+        f"file_roots:\n  - {kept}\n  - {missing}\n",
+        encoding="utf-8",
+    )
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["command"] == "npx"
+    assert server["args"] == ["-y", "pkg", str(kept.resolve())]
+    assert server["enabled"] is True
+    assert server["exact_environment"] is True
+
+
+def test_file_roots_argv_token_calls_the_same_resolver_localfiles_tools_use(
+    tmp_path, monkeypatch,
+):
+    """Proves the wiring, not just the outcome: the token expansion goes
+    through worker.localfiles.resolve_file_roots (patched here to a spy),
+    the identical function worker/runtime.py uses for the built-in
+    find_file/open_file/read_file tools -- confirming there is one resolver
+    behind both surfaces rather than a second implementation that merely
+    happens to agree with it today.
+
+    The spy is called twice with identical args: once expanding the argv's
+    {file_roots} token, and once more for enabled_from's file_roots.enabled
+    reference (adversarial review F1 -- enabled now reflects the RESOLVED
+    root count, not just the raw config strings, so it independently
+    re-resolves rather than trusting the argv expansion's result)."""
+    import worker.localfiles as localfiles_module
+
+    calls = []
+
+    def spy(roots):
+        calls.append(tuple(roots))
+        return (tmp_path,)
+
+    monkeypatch.setattr(localfiles_module, "resolve_file_roots", spy)
+
+    mcp_path = tmp_path / "mcp.yaml"
+    atlas_path = tmp_path / "atlas.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path.write_text("file_roots: [known:Desktop, C:/extra]\n", encoding="utf-8")
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert calls == [("known:Desktop", "C:/extra")] * 2
+    assert server["args"] == ["-y", "pkg", str(tmp_path)]
+    assert server["enabled"] is True
+
+
+def test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty(tmp_path):
+    """The files server's enabled_from mirrors worker/runtime.py's own
+    `files = LocalFiles(raw_roots) if raw_roots else None` gate: an empty
+    or absent file_roots disables the MCP server exactly like it disables
+    the built-in localfiles tools, rather than needing a second config
+    flag someone could forget to keep in sync."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+
+    empty_atlas = tmp_path / "empty.yaml"
+    empty_atlas.write_text("{}\n", encoding="utf-8")
+    disabled = load_mcp_config(mcp_path, atlas_path=empty_atlas)
+    assert disabled["servers"]["files"]["enabled"] is False
+
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    nonempty_atlas = tmp_path / "nonempty.yaml"
+    nonempty_atlas.write_text(f"file_roots: [{kept}]\n", encoding="utf-8")
+    enabled = load_mcp_config(mcp_path, atlas_path=nonempty_atlas)
+    assert enabled["servers"]["files"]["enabled"] is True
+
+
+def test_file_roots_reference_rejects_malformed_file_roots_config(tmp_path):
+    """Same validation, and the same error text, worker/runtime.py raises
+    for a malformed file_roots -- one failure mode for the one config key,
+    not two independently-worded ones."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text("file_roots: not-a-list\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid Atlas configuration: file_roots"):
+        load_mcp_config(mcp_path, atlas_path=atlas_path)
+
+
+def test_file_roots_that_resolve_to_zero_directories_stay_not_configured(tmp_path):
+    """Adversarial review F1: a typo'd or unmounted file_roots entry is a
+    non-empty RAW list that resolves to zero real directories. Before this
+    fix, enabled_from only checked the raw strings, so this connected as
+    "healthy" even though the argv ended up as just [npx, -y, pkg] -- no
+    root args at all -- and every call would then fail "Access denied".
+    Gating on the RESOLVED count (mirroring LocalFiles.__init__'s own
+    `if not roots: raise ValueError` guard) makes this surface as
+    not_configured / "config entry missing" up front, and -- the
+    structural half of the fix -- forces enabled False even if some future
+    config mistake pointed enabled_from at an unrelated flag that reads
+    True, so the server is never spawned with a rootless argv."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    missing = tmp_path / "does_not_exist"
+    atlas_path.write_text(f"file_roots:\n  - {missing}\n", encoding="utf-8")
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["enabled"] is False
+    assert server["disabled_reason"] == "config_entry_missing"
+    assert server["args"] == ["-y", "pkg"]  # zero roots in the argv
+
+    def factory(_name, _spec):
+        raise AssertionError("files server was spawned with zero resolved roots")
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+    assert status == [{
+        "name": "files",
+        "connected": False,
+        "tools": 0,
+        "error": None,
+        "state": "not_configured",
+        "detail": "config entry missing",
+    }]
+
+
+def test_file_write_roots_token_expands_only_the_write_list_never_the_read_list(tmp_path):
+    """Blocker 2: the files MCP server is the only component with write
+    tools, and the server takes ONE allowlist for reads and writes alike.
+    So its argv expands {file_write_roots}, and a directory that is a read
+    root only -- kb in production -- must not appear in it. Both keys are
+    configured here with different directories precisely so a regression
+    back to {file_roots} cannot pass."""
+    write_root = tmp_path / "documents"
+    write_root.mkdir()
+    read_only_root = tmp_path / "kb_stand_in"
+    read_only_root.mkdir()
+
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text(
+        f"file_roots: [{write_root}, {read_only_root}]\n"
+        f"file_write_roots: [{write_root}]\n",
+        encoding="utf-8",
+    )
+
+    server = load_mcp_config(mcp_path, atlas_path=atlas_path)["servers"]["files"]
+
+    assert server["args"] == ["-y", "pkg", str(write_root.resolve())]
+    assert str(read_only_root.resolve()) not in server["args"]
+    assert server["enabled"] is True
+
+
+def test_file_write_roots_that_resolve_to_zero_directories_stay_not_configured(tmp_path):
+    """The same zero-resolved refusal as {file_roots} (adversarial review
+    F1), for the write token: a typo'd or unmounted file_write_roots entry
+    is a non-empty raw list that resolves to nothing, and must surface as
+    not_configured rather than spawning a rootless server that fails every
+    call with "Access denied". A populated file_roots alongside it must not
+    rescue it -- that would be exactly the read/write conflation blocker 2
+    removed."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+    real = tmp_path / "real_read_root"
+    real.mkdir()
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text(
+        f"file_roots: [{real}]\n"
+        f"file_write_roots: [{tmp_path / 'does_not_exist'}]\n",
+        encoding="utf-8",
+    )
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["enabled"] is False
+    assert server["disabled_reason"] == "config_entry_missing"
+    assert server["args"] == ["-y", "pkg"]  # zero roots in the argv
+
+    def factory(_name, _spec):
+        raise AssertionError("files server was spawned with zero resolved write roots")
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    assert asyncio.run(scenario()) == [{
+        "name": "files",
+        "connected": False,
+        "tools": 0,
+        "error": None,
+        "state": "not_configured",
+        "detail": "config entry missing",
+    }]
+
+
+def test_file_write_roots_enabled_reference_and_malformed_config(tmp_path):
+    """enabled_from: file_write_roots.enabled behaves exactly like its
+    file_roots twin -- absent/empty disables, malformed raises with the
+    key's own name so the error says which list to fix."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+
+    # A perfectly good read list does not enable the write server.
+    read_only = tmp_path / "read_only"
+    read_only.mkdir()
+    reads_only_atlas = tmp_path / "reads_only.yaml"
+    reads_only_atlas.write_text(f"file_roots: [{read_only}]\n", encoding="utf-8")
+    disabled = load_mcp_config(mcp_path, atlas_path=reads_only_atlas)
+    assert disabled["servers"]["files"]["enabled"] is False
+
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    nonempty_atlas = tmp_path / "nonempty.yaml"
+    nonempty_atlas.write_text(f"file_write_roots: [{kept}]\n", encoding="utf-8")
+    assert load_mcp_config(mcp_path, atlas_path=nonempty_atlas)["servers"]["files"]["enabled"] is True
+
+    malformed_atlas = tmp_path / "malformed.yaml"
+    malformed_atlas.write_text("file_write_roots: not-a-list\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid Atlas configuration: file_write_roots"):
+        load_mcp_config(mcp_path, atlas_path=malformed_atlas)
+
+
+def test_file_roots_with_one_resolvable_root_spawns_with_exactly_that_root(tmp_path):
+    """Companion to the zero-resolved-roots case above: a mix of one real
+    directory and one missing one still enables and spawns, with argv
+    containing only the directory that actually resolved."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml(), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    missing = tmp_path / "does_not_exist"
+    atlas_path.write_text(
+        f"file_roots:\n  - {kept}\n  - {missing}\n", encoding="utf-8",
+    )
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+    assert server["enabled"] is True
+    assert "disabled_reason" not in server
+
+    spawned = []
+
+    @asynccontextmanager
+    async def factory(name, spec):
+        spawned.append((name, spec))
+        yield SimpleNamespace(list_tools=lambda: asyncio.sleep(
+            0, result=SimpleNamespace(tools=[]),
+        ))
+
+    async def scenario():
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(FakeRegistry())
+        await servers.close()
+
+    asyncio.run(scenario())
+    assert len(spawned) == 1
+    name, spec = spawned[0]
+    assert name == "files"
+    assert spec.args == ["-y", "pkg", str(kept.resolve())]
 
 
 def test_kb_session_is_notified_after_initialize_and_on_refresh_without_logging(caplog):
@@ -1679,11 +2601,15 @@ def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_too
     config = load_mcp_config(config_dir / "mcp.yaml")
     server = config["servers"]["kb"]
     defaults = config["defaults"]
+    # BB-wave review, finding 10: kb_deployment_inspect and
+    # kb_asset_pull_inspect were listed as instant reads but the bridge does
+    # not offer them (an instant: name the server never sends is inert
+    # decoration); kb_grades, a read it does offer, was missing.
     read_tools = {
         "kb_capabilities", "kb_agents_list", "kb_agent_get",
         "kb_workflows_list", "kb_workflow_get", "kb_runs_list", "kb_run_get",
         "kb_run_events", "kb_run_watch", "kb_inbox_list", "kb_schedules_list",
-        "kb_deployment_inspect", "kb_asset_pull_inspect", "kb_repo_tree",
+        "kb_grades", "kb_repo_tree",
         "kb_repo_file", "kb_repo_history", "kb_repo_search",
         "kb_analytics_snapshot", "kb_trace_list", "kb_trace_get",
         "kb_terminal_list",
@@ -1692,11 +2618,21 @@ def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_too
         "kb_agent_create", "kb_agent_update", "kb_workflow_create",
         "kb_workflow_update", "kb_workflow_launch", "kb_agent_launch",
         "kb_human_respond", "kb_review_dispatch", "kb_schedule_create",
-        "kb_schedule_set_armed", "kb_schedule_delete", "kb_deployment_action",
-        "kb_asset_pull_action", "kb_terminal_close", "kb_run_control",
+        "kb_schedule_set_armed", "kb_schedule_delete", "kb_run_control",
     }
 
     assert set(server["instant"]) == read_tools
+    assert not (read_tools & mutation_tools)
+    # Exactly the 32 tools the bridge offers (enumerated from the built
+    # atlas-bridge server on 2026-08-31; Atlas must not import or depend on
+    # a kb checkout, so the set is pinned here rather than read live). An
+    # instant: entry for a tool the server never sends is silently inert,
+    # which is how the two removed names survived -- kb_deployment_action,
+    # kb_asset_pull_action and kb_terminal_close, listed here before as
+    # mutations, do not exist either and are gone for the same reason.
+    assert len(read_tools | mutation_tools) == 32
+    assert "kb_deployment_inspect" not in server["instant"]
+    assert "kb_asset_pull_inspect" not in server["instant"]
     assert all(policy_for(server, defaults, name) == "instant" for name in read_tools)
     assert all(policy_for(server, defaults, name) == "confirm" for name in mutation_tools)
     assert policy_for(server, defaults, "kb_future_mutation") == "confirm"
@@ -1732,3 +2668,435 @@ def test_kb_tool_descriptions_do_not_claim_to_enforce_t3():
 
     assert "T3 approvals" not in tool.description
     assert tool.policy == "confirm"
+
+
+# --- expose: -----------------------------------------------------------
+
+def test_exposed_tools_returns_none_when_absent_and_a_frozenset_when_present():
+    assert mcp_client._exposed_tools({}) is None
+    assert mcp_client._exposed_tools({"expose": ["a", "b"]}) == frozenset({"a", "b"})
+
+
+def test_exposed_tools_rejects_a_malformed_list():
+    with pytest.raises(ValueError, match="expose"):
+        mcp_client._exposed_tools({"expose": ["a", 1]})
+    with pytest.raises(ValueError, match="expose"):
+        mcp_client._exposed_tools({"expose": "not-a-list"})
+
+
+def test_expose_and_blocked_overlap_blocked_always_wins():
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(
+                    name=name, description=f"{name} tool",
+                    inputSchema={"type": "object", "properties": {}},
+                )
+                for name in ("kept", "overlapping", "unexposed")
+            ])
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "demo": {
+                        "command": "unused",
+                        "expose": ["kept", "overlapping"],
+                        "blocked": ["overlapping"],
+                        "instant": ["kept", "overlapping"],
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        await servers.connect(registry)
+        registered = registry.names()
+        await servers.close()
+        return registered
+
+    assert asyncio.run(scenario()) == ["demo__kept"]
+
+
+# --- never_instant: ------------------------------------------------------
+
+def test_never_instant_forces_confirm_over_an_explicit_instant_listing():
+    server_cfg = {"instant": ["delete_thing", "get_thing"]}
+    defaults = {}
+    assert policy_for(server_cfg, defaults, "get_thing") == "instant"
+    assert policy_for(server_cfg, defaults, "delete_thing") == "confirm"
+
+
+def test_never_instant_default_list_covers_the_documented_patterns():
+    server_cfg = {
+        "instant": [
+            "purchase_item", "revoke_access", "trash_note", "share_file",
+            "remove_item", "send_message", "set_permission",
+        ],
+    }
+    defaults = {}
+    for name in server_cfg["instant"]:
+        assert policy_for(server_cfg, defaults, name) == "confirm"
+
+
+def test_never_instant_matching_is_case_insensitive_on_both_sides():
+    server_cfg = {"instant": ["DeleteFile", "sendEmail", "listFiles"]}
+    defaults = {}
+    assert policy_for(server_cfg, defaults, "DeleteFile") == "confirm"
+    assert policy_for(server_cfg, defaults, "sendEmail") == "confirm"
+    assert policy_for(server_cfg, defaults, "listFiles") == "instant"
+
+
+def test_never_instant_config_patterns_are_also_casefolded():
+    server_cfg = {"instant": ["DELETE_THING"]}
+    defaults = {"never_instant": ["Delete"]}
+    assert policy_for(server_cfg, defaults, "DELETE_THING") == "confirm"
+
+
+def test_never_instant_rejects_an_empty_pattern_list():
+    """An empty list would silently disable the destructive-action backstop
+    -- reject it rather than let it slip through as "no restrictions"."""
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({"instant": ["delete_thing"]}, {"never_instant": []}, "delete_thing")
+
+
+def test_never_instant_can_be_narrowed_by_a_non_empty_replacement_list():
+    server_cfg = {"instant": ["delete_thing", "purchase_item"]}
+    defaults = {"never_instant": ["purchase"]}
+    assert policy_for(server_cfg, defaults, "delete_thing") == "instant"
+    assert policy_for(server_cfg, defaults, "purchase_item") == "confirm"
+
+
+def test_never_instant_rejects_a_malformed_pattern_list():
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({}, {"never_instant": ["ok", 7]}, "get_thing")
+    with pytest.raises(ValueError, match="never_instant"):
+        policy_for({}, {"never_instant": "not-a-list"}, "get_thing")
+
+
+# --- instant_when: -----------------------------------------------------
+
+def test_instant_when_is_an_allowlist_that_escalates_unless_the_value_matches():
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate is not None
+    assert escalate({"action": "create"}) is False
+    assert escalate({"action": "delete"}) is True
+    assert escalate({"action": "update"}) is True
+
+
+@pytest.mark.parametrize("value", ["delete", "Delete", " delete ", "DELETE", "  DeLeTe"])
+def test_instant_when_escalates_case_and_whitespace_variants_of_a_disallowed_value(value):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate({"action": value}) is True
+
+
+@pytest.mark.parametrize("value", ["create", " Create ", "CREATE", "CreAte"])
+def test_instant_when_allows_case_and_whitespace_variants_of_an_allowed_value(value):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate({"action": value}) is False
+
+
+@pytest.mark.parametrize("arguments", [
+    {},                                # missing entirely
+    {"action": ["create"]},            # list, not a string
+    {"action": {"value": "create"}},   # dict, not a string
+    {"action": 7},                     # int, not a string
+    {"action": None},                  # None, not a string
+])
+def test_instant_when_escalates_on_missing_or_non_string_values(arguments):
+    escalate = mcp_client._compile_instant_when(
+        {"instant_when": {"manage_event": {"action": ["create"]}}},
+        "manage_event",
+    )
+    assert escalate(arguments) is True
+
+
+def test_instant_when_absent_for_a_tool_yields_no_escalate_hook():
+    assert mcp_client._compile_instant_when(
+        {"instant_when": {"other_tool": {"x": ["y"]}}}, "manage_event",
+    ) is None
+    assert mcp_client._compile_instant_when({}, "manage_event") is None
+
+
+@pytest.mark.parametrize("rules", [
+    {"manage_event": {}},
+    {"manage_event": {"action": []}},
+    {"manage_event": {7: ["create"]}},
+    {"manage_event": "create"},
+    {"manage_event": {"action": [7]}},
+    {"manage_event": {"action": [""]}},
+])
+def test_instant_when_rejects_malformed_rules(rules):
+    with pytest.raises(ValueError, match="instant_when"):
+        mcp_client._compile_instant_when({"instant_when": rules}, "manage_event")
+
+
+def test_instant_when_rejects_a_non_mapping_top_level_config():
+    with pytest.raises(ValueError, match="instant_when"):
+        mcp_client._compile_instant_when({"instant_when": ["not", "a", "map"]}, "manage_event")
+
+
+# --- describe: ---------------------------------------------------------
+
+def test_describe_overrides_the_mirrored_description():
+    assert mcp_client._tool_description(
+        {"describe": {"manage_event": "Host-authored description."}},
+        "manage_event", "Remote description.",
+    ) == "Host-authored description."
+    assert mcp_client._tool_description(
+        {}, "manage_event", "Remote description.",
+    ) == "Remote description."
+
+
+def test_describe_override_is_truncated_at_the_same_512_char_bound():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo",
+        {"describe": {"widget": "x" * 600}},
+        {},
+        SimpleNamespace(),
+        SimpleNamespace(
+            name="widget", description="short",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+    assert len(tool.description) == 512
+    assert tool.description == "x" * 512
+
+
+def test_describe_rejects_a_non_string_empty_or_malformed_map():
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": {"widget": ""}}, "widget", "remote")
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": {"widget": 7}}, "widget", "remote")
+    with pytest.raises(ValueError, match="describe"):
+        mcp_client._tool_description({"describe": ["not", "a", "map"]}, "widget", "remote")
+
+
+# --- domain: ---------------------------------------------------------------
+
+def test_domain_is_stored_on_mirrored_tools_when_configured():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo", {"domain": "google"}, {}, SimpleNamespace(),
+        SimpleNamespace(name="widget", description="d", inputSchema={"type": "object", "properties": {}}),
+    )
+    assert tool.domain == "google"
+
+
+def test_domain_absent_leaves_mirrored_tool_domain_none():
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "demo", {}, {}, SimpleNamespace(),
+        SimpleNamespace(name="widget", description="d", inputSchema={"type": "object", "properties": {}}),
+    )
+    assert tool.domain is None
+
+
+def test_domain_rejects_a_non_string_or_empty_value():
+    with pytest.raises(ValueError, match="domain"):
+        mcp_client._server_domain({"domain": 7})
+    with pytest.raises(ValueError, match="domain"):
+        mcp_client._server_domain({"domain": ""})
+
+
+# --- function-proof: all five keys through a real connect ------------------
+
+def _c0_curation_server() -> FastMCP:
+    """A fake remote server shaped like the real one this config targets:
+    the mutation tool's argument is named `action` (workspace-mcp 1.25.2's
+    real manage_event parameter, gcalendar/calendar_tools.py:1316), not the
+    `operation` name the config/fixture were mistakenly fitted to before
+    the F2/F3 fix."""
+    server = FastMCP("test-c0")
+
+    @server.tool(description="Read calendar events.")
+    def get_events(calendar: str = "primary") -> str:
+        return "events"
+
+    @server.tool(description="List calendars.")
+    def list_calendars() -> str:
+        return "calendars"
+
+    @server.tool(description="Delete a calendar event.")
+    def delete_event(event_id: str) -> str:
+        return f"deleted {event_id}"
+
+    @server.tool(description="Create, update, or delete an event.")
+    def manage_event(action: str, event_id: str = "") -> str:
+        return f"{action} {event_id}"
+
+    @server.tool(description="Secret internal tool that must never be exposed.")
+    def secret_tool() -> str:
+        return "secret"
+
+    @server.tool(description="A network-inspection tool that stays blocked.")
+    def blocked_tool() -> str:
+        return "blocked"
+
+    return server
+
+
+def test_function_proof_registry_ends_up_with_exactly_the_curated_surface():
+    """Spins the same fake-MCP-server fixture used elsewhere in this file
+    (FastMCP + create_connected_server_and_client_session) with 6 tools,
+    shaped like the real upstream server (manage_event's argument is named
+    `action`), and a config exercising all five new keys (expose,
+    never_instant, instant_when, describe, domain) at once, connects for
+    real through McpServers, and checks the registry lands on exactly the
+    curated set with the right policies, escalate hook, host-authored
+    description, and domain label."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "command": "unused",
+                        "domain": "google",
+                        "expose": ["get_events", "list_calendars", "delete_event", "manage_event"],
+                        "blocked": ["blocked_tool"],
+                        "instant": ["get_events", "list_calendars", "delete_event", "manage_event"],
+                        "instant_when": {
+                            "manage_event": {"action": ["create"]},
+                        },
+                        "describe": {
+                            "manage_event": "Create, update, or delete a calendar event (host-authored).",
+                        },
+                    },
+                },
+                "defaults": {
+                    "instant_prefixes": ["get_", "list_"],
+                    "never_instant": [
+                        "delete", "remove", "trash", "send", "purchase",
+                        "revoke", "permission", "share",
+                    ],
+                    "connect_timeout_s": 1,
+                },
+            },
+            session_factory=_memory_factory(_c0_curation_server()),
+        )
+        await servers.connect(registry)
+        tools = dict(registry._tools)
+        await servers.close()
+        return tools
+
+    tools = asyncio.run(scenario())
+
+    # Exactly the exposed subset: secret_tool (never exposed) and
+    # blocked_tool (exposed AND blocked -- blocked wins) are both absent.
+    assert set(tools) == {
+        "google__get_events", "google__list_calendars",
+        "google__delete_event", "google__manage_event",
+    }
+    assert tools["google__get_events"].policy == "instant"
+    assert tools["google__get_events"].description == "Read calendar events."
+    assert tools["google__list_calendars"].policy == "instant"
+    # never_instant's "delete" pattern forces confirm even though
+    # delete_event was named in this server's instant: list.
+    assert tools["google__delete_event"].policy == "confirm"
+    # manage_event stays instant at the base policy; escalation to confirm
+    # is argument-conditional via instant_when's allowlist, not baked into
+    # the policy. It escalates for anything except an exact (normalized)
+    # "create", including values that only differ by case/whitespace, and
+    # for a missing or non-string action.
+    assert tools["google__manage_event"].policy == "instant"
+    assert tools["google__manage_event"].escalate is not None
+    assert tools["google__manage_event"].escalate({"action": "create"}) is False
+    assert tools["google__manage_event"].escalate({"action": " Create "}) is False
+    assert tools["google__manage_event"].escalate({"action": "delete"}) is True
+    assert tools["google__manage_event"].escalate({"action": "Delete"}) is True
+    assert tools["google__manage_event"].escalate({}) is True
+    assert tools["google__manage_event"].description == (
+        "Create, update, or delete a calendar event (host-authored)."
+    )
+    assert all(tool.domain == "google" for tool in tools.values())
+
+
+def test_missing_exposed_tools_logs_one_bounded_warning_with_names_only(caplog):
+    class FakeSession:
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(
+                    name="kept", description="kept tool",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
+            ])
+
+    @asynccontextmanager
+    async def factory(_server_name, _spec):
+        yield FakeSession()
+
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "demo": {
+                        "command": "unused",
+                        "expose": ["kept", "renamed_tool", "another_missing_tool"],
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+        )
+        with caplog.at_level("WARNING"):
+            await servers.connect(registry)
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "demo" in message
+    assert "renamed_tool" in message
+    assert "another_missing_tool" in message
+    assert "kept" not in message  # only the missing names are listed, not the mirrored ones
+
+
+def test_missing_exposed_tools_says_nothing_when_everything_is_offered(caplog):
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {"command": "unused", "instant": ["get_events"]},
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_server()),
+        )
+        with caplog.at_level("WARNING"):
+            await servers.connect(registry)
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    assert not any("expose" in record.getMessage() for record in caplog.records)
+
+
+def test_missing_exposed_tools_helper_is_bounded_and_names_only():
+    listed = [
+        SimpleNamespace(name="kept", description="d", inputSchema={"type": "object", "properties": {}}),
+    ]
+    assert mcp_client._missing_exposed_tools(None, listed) == ()
+    assert mcp_client._missing_exposed_tools(frozenset({"kept"}), listed) == ()
+    assert mcp_client._missing_exposed_tools(
+        frozenset({"kept", "gone", "also_gone"}), listed,
+    ) == ("also_gone", "gone")

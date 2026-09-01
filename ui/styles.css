@@ -536,10 +536,6 @@ main {
   color: var(--accent-light);
 }
 
-.transcript-line.is-tool .transcript-role {
-  color: #b9b6c7;
-}
-
 .transcript-line.is-ambient,
 .transcript-line.is-system {
   opacity: .62;

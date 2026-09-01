@@ -61,6 +61,10 @@ def _executable_missing(prefix: str) -> DetailRenderer:
 STATUS_DETAIL_RENDERERS: dict[str, dict[str, DetailRenderer]] = {
     "connecting": {
         "pending": _fixed("connection pending"),
+        "retrying": DetailRenderer(
+            lambda *, attempt, max_attempts: f"retrying (attempt {attempt} of {max_attempts})",
+            re.compile(r"retrying \(attempt [0-9]+ of [0-9]+\)"),
+        ),
     },
     "connected": {
         "ready": _fixed("ready"),

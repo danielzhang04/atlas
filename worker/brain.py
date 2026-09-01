@@ -28,8 +28,11 @@ logger = logging.getLogger("atlas.brain")
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
 # Minimum cacheable prefix is model-dependent: 4096 tokens on Haiku-class
-# models, 1024 on Sonnet/Opus-class. Measured prefix on the sonnet-5 lane is
-# ~3.8k, so the haiku floor would false-alarm on every run.
+# models, 1024 on Sonnet/Opus-class. The fully-settled BB-wave prefix measures
+# ~19K tokens (84 tool schemas + system text), comfortably over either floor;
+# the model table exists because a builtin-only snapshot (servers still
+# connecting) can dip toward ~4K, where the haiku floor would false-alarm on
+# the sonnet lane. The floor is a minimum-cacheability check, not a budget.
 _CACHE_FLOOR_BY_MODEL = {"claude-haiku-4-5": 4_096}
 CACHE_FLOOR_TOKENS_DEFAULT = 1_024
 CACHE_FLOOR_MAX_CHECKS = 3
@@ -125,6 +128,9 @@ class _Registry(Protocol):
         ...
 
     def schemas(self) -> list[dict[str, Any]]:
+        ...
+
+    def begin_turn(self) -> None:
         ...
 
     async def call(
@@ -348,7 +354,20 @@ class Brain:
                 "tool schema uses API-incompatible shape, excluded from model (tools=%s)",
                 ",".join(sorted(incompatible))[:300],
             )
-        tools = [dict(schema) for schema in usable_schemas]
+        # Sorted by name, always. The registry hands these back in
+        # registration order, and MCP tools register in whatever order their
+        # servers happen to arrive -- a race between npx/uvx spawns that
+        # differs run to run. The tools array is part of the cached prefix,
+        # so an order that shuffles across restarts silently misses the
+        # prompt cache every time even though the tool SET is identical.
+        # Sorting here (not in ToolRegistry.schemas(), which keeps
+        # registration order for its own callers) makes the outbound array a
+        # pure function of the tool set, and pins cache_control to a stable
+        # last element instead of "whichever server was slowest".
+        tools = [
+            dict(schema)
+            for schema in sorted(usable_schemas, key=lambda item: str(item.get("name") or ""))
+        ]
         if tools:
             tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         self._tool_names = self._schema_names(usable_schemas)
@@ -491,6 +510,9 @@ class Brain:
     async def respond(self, transcript: str, *, context: str | None = None) -> AsyncIterator[str]:
         if not isinstance(transcript, str) or not transcript.strip() or len(transcript) > MAX_TRANSCRIPT:
             raise ValueError("transcript must contain 1 to 4096 characters")
+        # Per-turn host state (the file-handle table) dies here, before any
+        # tool of this turn can run: a handle minted last turn never resolves.
+        self.registry.begin_turn()
         if not self._first_turn_seen:
             self._first_turn_seen = True
             self._arm_cache_floor_check()
@@ -785,8 +807,25 @@ def _capability_system_text(
         and isinstance(item.get("name"), str)
         and item.get("state") in {"connecting", "connected", "not_configured", "error"}
     )
+    # detail is looked up separately (not folded into the sort key) so a
+    # snapshot missing "detail" (older callers, tests) sorts fine instead of
+    # raising when Python compares None against a str tie-breaker.
+    details = {
+        item.get("name"): item.get("detail")
+        for item in mcp_status
+        if isinstance(item, dict)
+    }
     for name, state in states:
-        lines.append(f"{name}: {state}")
+        detail = details.get(name)
+        # Only "error" gets the detail appended: it is the terminal case
+        # where the model needs to say something more specific than "down"
+        # (e.g. "the connector failed to start, I'll retry next launch" for
+        # a spawn/timeout failure vs. a reauth prompt for session_required)
+        # instead of a blanket "access is down". detail always comes from
+        # the closed statusdetail vocabulary, so it is safe to surface
+        # verbatim here.
+        suffix = f" ({detail})" if state == "error" and isinstance(detail, str) and detail else ""
+        lines.append(f"{name}: {state}{suffix}")
         state_count += 1
     if state_count == 0:
         lines.append("none")

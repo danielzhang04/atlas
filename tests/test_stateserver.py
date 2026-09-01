@@ -122,6 +122,114 @@ def test_state_signal_assets_and_security_headers():
     assert '"data-frame-cost-ms"' in script[2]
     assert "requestAnimationFrame" in script[2]
     assert "window.__atlasEngineMetrics" in script[2]
+    # R0: preallocated frame-interval histogram + drop counter, reset on
+    # engine start, with zero per-frame allocation (bucketed with a plain
+    # index into a Uint32Array(5), not a new object/array per frame).
+    assert "frameHistogram: new Uint32Array(5), drops: 0, totalFrames: 0," in script[2]
+    assert "metrics.frameHistogram[bucket] += 1;" in script[2]
+    assert "metrics.totalFrames += 1;" in script[2]
+    # drops must use the same >= boundary as the 25-33ms histogram bucket
+    # edge (FRAME_BUCKET_MS[1] === 25) so it is exactly the sum of the
+    # >=25ms buckets, not off by one frame-interval unit from them.
+    assert "if (dt >= 25) metrics.drops += 1;" in script[2]
+    assert "if (dt > 25) metrics.drops += 1;" not in script[2]
+    assert "metrics.frameHistogram.fill(0);" in script[2]
+    assert "metrics.drops = 0;" in script[2]
+    assert "metrics.totalFrames = 0;" in script[2]
+    # R1: no per-frame Path2D allocation in the waveform draw path (the two
+    # bar/tip Path2D objects were replaced by beginPath()/moveTo/lineTo/arc
+    # against preallocated scratch coordinate arrays).
+    assert "const barPath = new Path2D();" not in script[2]
+    assert "const tipPath = new Path2D();" not in script[2]
+    assert "const waveInnerX = new Float32Array(BAR_COUNT);" in script[2]
+    # R1: tick ring + segment ring are pre-rendered to offscreen sprites
+    # (backdropSprite pattern) instead of live-stroking up to 120 segments
+    # every frame; the frame path only rotates + drawImages them.
+    assert "const tickRingSprite = document.createElement" in script[2]
+    assert "const segmentRingSprite = document.createElement" in script[2]
+    draw_tick_ring = script[2].split("function drawTickRing(now)", 1)[1].split("function drawSegmentRings", 1)[0]
+    draw_segment_rings = script[2].split("function drawSegmentRings(now)", 1)[1].split("function drawScanner", 1)[0]
+    assert "context.drawImage(" in draw_tick_ring and "tickRingSprite," in draw_tick_ring
+    assert "context.stroke(minorTickPath)" not in draw_tick_ring
+    assert "context.drawImage(" in draw_segment_rings and "segmentRingSprite," in draw_segment_rings
+    assert "context.stroke(innerSegmentPath)" not in draw_segment_rings
+    # Ring sprites must be device-pixel sized (size * pixelRatio) and the
+    # offscreen context scaled by pixelRatio before stroking, or they
+    # rasterize at 1x and get bilinearly upscaled -- visibly soft at any
+    # Windows display scale above 100%. A regression back to CSS-px-only
+    # backing-store sizing (e.g. `tickRingSprite.width = size`, no pixelRatio
+    # factor and no offscreen setTransform) must fail this pin.
+    render_tick_sprite = script[2].split("function renderTickRingSprite(", 1)[1].split(
+        "function segmentRingColorNow()", 1
+    )[0]
+    render_segment_sprite = script[2].split("function renderSegmentRingSprite(", 1)[1].split(
+        "function drawTickRing(now)", 1
+    )[0]
+    for sprite_body, sprite_name in ((render_tick_sprite, "tickRingSprite"), (render_segment_sprite, "segmentRingSprite")):
+        assert "const deviceSize = Math.max(2, Math.round(size * pixelRatio));" in sprite_body
+        assert f"{sprite_name}.width !== deviceSize" in sprite_body
+        assert f"{sprite_name}.width = deviceSize;" in sprite_body
+        assert f"{sprite_name}.height = deviceSize;" in sprite_body
+        assert "spriteContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);" in sprite_body
+        assert f"{sprite_name}.width = size;" not in sprite_body
+    # R1: the scanner and core gradients are cached objects, rebuilt only on
+    # a geometry change (resize) or a change in their own color stops — not
+    # unconditionally on every frame.
+    assert "let scannerGradient = null, scannerGradientRadius = -1;" in script[2]
+    assert "let coreGradient = null;" in script[2]
+    # BB blocker 3: NO cache may be keyed on the 420ms transition window.
+    # `now - transitionAt <= 420` is false forever once the loop pauses
+    # mid-transition, which froze every one of these caches at a stale
+    # half-blended color until something else invalidated it. Each is keyed
+    # on the color string it actually baked instead, which self-heals on the
+    # first frame after a resume with no pauseLoop coupling at all.
+    assert "|| now - transitionAt <= 420" not in script[2]
+    assert "if (coreGradient === null || now - transitionAt <= 420) {" not in script[2]
+    assert 'let tickRingMinorColor = "", tickRingMajorColor = "";' in script[2]
+    assert 'let segmentRingColor = "";' in script[2]
+    assert 'let scannerStopInner = "", scannerStopMid = "", scannerStopOuter = "";' in script[2]
+    assert (
+        'let coreStopCenter = "", coreStopInner = "", coreStopOuter = "", coreStopEdge = "";'
+    ) in script[2]
+    for cached, current in (
+        ("tickRingMinorColor", "minorColor"),
+        ("tickRingMajorColor", "majorColor"),
+        ("segmentRingColor", "color"),
+        ("scannerStopInner", "stopInner"),
+        ("scannerStopMid", "stopMid"),
+        ("scannerStopOuter", "stopOuter"),
+        ("coreStopCenter", "stopCenter"),
+        ("coreStopInner", "stopInner"),
+        ("coreStopOuter", "stopOuter"),
+        ("coreStopEdge", "stopEdge"),
+    ):
+        assert f"{current} !== {cached}" in script[2]
+    # BB finding 9: a transition live-strokes into the frame context (the
+    # pre-sprite path) instead of re-rendering the sprite AND blitting it;
+    # the sprite is re-rendered once, when the color settles.
+    assert "const transitioning = now - transitionAt <= 420;" in script[2]
+    assert "strokeTickRing(context, minorColor, majorColor);" in draw_tick_ring
+    assert "strokeSegmentRing(context, color);" in draw_segment_rings
+    # BB finding 8: drawSegmentRings used to set lineCap = "round" on the
+    # frame context OUTSIDE its own save/restore, so the scanner arc and
+    # every core stroke (the dashed core ring above all) inherited round
+    # caps. The rings stroke into sprite contexts now, so those two set it
+    # explicitly rather than depending on a leak.
+    draw_scanner = script[2].split("function drawScanner(now)", 1)[1].split(
+        "function drawParticles(now)", 1
+    )[0]
+    draw_core = script[2].split("function drawCore(now)", 1)[1].split(
+        "// CONVENTION", 1
+    )[0]
+    assert 'context.lineCap = "round";' in draw_scanner
+    assert 'context.lineCap = "round";' in draw_core
+    # BB finding 7: a wake must not fabricate a dropped frame. dt is
+    # meaningless across a pause, so the previous-frame timestamp is
+    # forgotten when the loop stops and when it starts.
+    pause_loop = script[2].split("function pauseLoop()", 1)[1].split("function frame(now)", 1)[0]
+    assert "lastFrameNow = 0;" in pause_loop
+    start_loop = script[2].split("function start()", 1)[1].split("function stop()", 1)[0]
+    assert "lastFrameNow = 0;" in start_loop
     assert "TOOL:" in script[2]
     assert "renderGreeting" in script[2]
     assert "renderTool" in script[2]

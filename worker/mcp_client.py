@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -18,7 +18,7 @@ import weakref
 import yaml
 
 from .jobobject import kill_process_tree
-from .statusdetail import render_status_detail, status_detail_allowed
+from .statusdetail import STATUS_DETAIL_RENDERERS, render_status_detail, status_detail_allowed
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -42,6 +42,38 @@ _KB_BRIDGE_DEFAULTS = {
     "origin": "http://127.0.0.1:5317",
 }
 _TRUNCATED = "…[truncated]"
+_DEFAULT_NEVER_INSTANT = (
+    "delete", "remove", "trash", "send", "purchase", "revoke", "permission", "share",
+)
+_DESCRIPTION_LIMIT = 512
+# Retry-with-backoff for the per-server connect attempt (plan Track C3): the
+# google outage was a uv cache eviction making cold `uvx workspace-mcp`
+# resolution take 16.5s or wedge entirely, losing the race against the
+# connect timeout -- with no retry, one bad attempt was terminal until the
+# next full app restart. 3 attempts, ~2s/8s backoff between them, each
+# attempt getting the *full* connect_timeout_s budget (not a shrinking
+# remainder) so a slow-but-not-hung cold start still gets a fair shot on
+# every attempt.
+_DEFAULT_CONNECT_ATTEMPTS = 3
+_DEFAULT_CONNECT_BACKOFF_S = (2.0, 8.0)
+# Only timeout/spawn-class failures are retried -- the transient, process-
+# level shapes behind the outage. Config-shaped failures (config_malformed,
+# config_entry_missing, config_file_missing, config_unreadable,
+# transport_unavailable, executable_missing, session_required, ...) are
+# permanent for the life of this process; retrying them just spends the same
+# backoff budget for the same outcome. Matched against the rendered detail
+# text (the closed statusdetail vocabulary) rather than exception types,
+# since that is the one place the retry/no-retry line is already drawn.
+#
+# The retryable set is derived from STATUS_DETAIL_RENDERERS' own compiled
+# patterns at import time (not a hardcoded literal like "spawn failed"): a
+# future rewording of the "timeout"/"spawn_failed" detail text moves this
+# set with it automatically, so it can never silently desync from the
+# vocabulary and stop retrying the very failure shapes the outage was.
+_RETRYABLE_ERROR_DETAIL_KEYS = ("timeout", "spawn_failed")
+_RETRYABLE_ERROR_PATTERNS = tuple(
+    STATUS_DETAIL_RENDERERS["error"][key].pattern for key in _RETRYABLE_ERROR_DETAIL_KEYS
+)
 
 
 SessionFactory = Callable[
@@ -50,11 +82,52 @@ SessionFactory = Callable[
 ServerHook = Callable[[str, "ToolRegistry"], None]
 StateHook = Callable[[str, str, list[dict]], None]
 ProcessTreeKiller = Callable[..., subprocess.CompletedProcess]
+SleepFn = Callable[[float], Awaitable[None]]
 _active_servers: weakref.ReferenceType | None = None
 
 
 class McpSessionError(ValueError):
     """A short-lived MCP session was rejected before retention."""
+
+
+class _ConnectExhausted(Exception):
+    """Carries an already-classified terminal connect failure out of the
+    per-server retry loop, so the outer handler doesn't have to reclassify
+    it (and so a genuinely new exception raised after connection, e.g. from
+    ``stop.wait()``, is never mistaken for a connect-phase failure)."""
+
+    def __init__(self, error: str, state: str, detail: str) -> None:
+        super().__init__(detail)
+        self.error = error
+        self.state = state
+        self.detail = detail
+
+
+def _connect_attempts(defaults: Mapping) -> int:
+    value = defaults.get("connect_retries", _DEFAULT_CONNECT_ATTEMPTS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("invalid MCP connect_retries")
+    return value
+
+
+def _connect_backoffs(defaults: Mapping) -> tuple[float, ...]:
+    value = defaults.get("connect_retry_backoff_s", _DEFAULT_CONNECT_BACKOFF_S)
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or not all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) and item >= 0
+            for item in value
+        )
+    ):
+        raise ValueError("invalid MCP connect_retry_backoff_s")
+    return tuple(float(item) for item in value)
+
+
+def _is_retryable_failure(state: str, detail: str) -> bool:
+    if state != "error":
+        return False
+    return any(pattern.fullmatch(detail) for pattern in _RETRYABLE_ERROR_PATTERNS)
 
 
 def _exception_leaves(exc: BaseException) -> list[BaseException]:
@@ -203,6 +276,50 @@ def load_mcp_config(path: Path, *, atlas_path: Path | None = None) -> dict:
     return value
 
 
+# Atlas config keys a server's argv may expand, and the enabled_from
+# reference that gates the same server on that key resolving to at least one
+# real directory. Two scopes, deliberately separate (BB-wave review, blocker
+# 2): file_roots is Atlas's READ scope (what the built-in LocalFiles tools
+# cover, kb included), file_write_roots is the narrower WRITE scope the
+# files MCP server -- the only component with write tools -- is started
+# with. Same resolver, same validation, same zero-resolved refusal for both;
+# only the list differs.
+_ROOTS_ARGV_TOKENS = {
+    "{file_roots}": "file_roots",
+    "{file_write_roots}": "file_write_roots",
+}
+_ROOTS_ENABLED_REFERENCES = {
+    "file_roots.enabled": "file_roots",
+    "file_write_roots.enabled": "file_write_roots",
+}
+
+
+def _validated_roots(atlas: Mapping, key: str) -> tuple[str, ...]:
+    """The exact validation worker/runtime.py applies to file_roots before
+    building the built-in LocalFiles tools -- reused here, for either roots
+    key, so a malformed entry fails the same way for every consumer of it."""
+    raw_roots = atlas.get(key, ())
+    if (
+        isinstance(raw_roots, (str, bytes))
+        or not isinstance(raw_roots, (list, tuple))
+        or not all(isinstance(root, str) and root.strip() for root in raw_roots)
+    ):
+        raise ValueError(f"invalid Atlas configuration: {key}")
+    return tuple(raw_roots)
+
+
+def _resolve_roots_argv(atlas: Mapping, key: str) -> list[str]:
+    """Expand a roots list (config/atlas.yaml) into resolved, existing
+    directory paths for an MCP server's argv, via the same resolver
+    (worker/localfiles.py's resolve_file_roots, known: alias handling
+    included) worker/runtime.py uses to build the built-in localfiles
+    tools -- one place turns a configured root into real filesystem access,
+    not two resolvers that could drift apart."""
+    from .localfiles import resolve_file_roots
+
+    return [str(root) for root in resolve_file_roots(_validated_roots(atlas, key))]
+
+
 def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     if not isinstance(server_cfg, dict):
         return server_cfg
@@ -221,6 +338,19 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
         bridge.update(configured)
 
     def setting(reference: Any) -> Any:
+        # "file_roots.enabled"/"file_write_roots.enabled" are narrow special
+        # cases, not a general namespace like kb_bridge.* -- the files MCP
+        # server (Track C2) is gated by the exact same signal
+        # worker/runtime.py already uses to decide whether the built-in
+        # LocalFiles tools exist at all (`if raw_roots else None`), so there
+        # is one place that grants filesystem access, not a second
+        # independent toggle. This checks the RESOLVED directory count, not
+        # just non-empty raw strings: a typo'd or unmounted root must read
+        # as disabled here too (see the roots_token_used guard below for the
+        # second, structural half of this fix).
+        roots_key = _ROOTS_ENABLED_REFERENCES.get(reference) if isinstance(reference, str) else None
+        if roots_key is not None:
+            return bool(_resolve_roots_argv(atlas, roots_key))
         if not isinstance(reference, str) or not reference.startswith("kb_bridge."):
             raise ValueError("invalid MCP Atlas config reference")
         name = reference.removeprefix("kb_bridge.")
@@ -229,10 +359,22 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
         return bridge[name]
 
     resolved = dict(server_cfg)
-    resolved_argv = [
-        item.replace("{kb_bridge.path}", str(bridge["path"]))
-        for item in command
-    ]
+    resolved_argv: list[str] = []
+    roots_token_used = False
+    # Accumulated across ALL roots tokens in the argv: any single token
+    # resolving to zero directories disables the server, not just the last one.
+    roots_token_empty = False
+    for item in command:
+        roots_key = _ROOTS_ARGV_TOKENS.get(item)
+        if roots_key is not None:
+            roots_token_used = True
+            expanded = _resolve_roots_argv(atlas, roots_key)
+            roots_token_empty = roots_token_empty or not expanded
+            resolved_argv.extend(expanded)
+        else:
+            resolved_argv.append(item.replace("{kb_bridge.path}", str(bridge["path"])))
+    if not resolved_argv:
+        raise ValueError("invalid MCP command argv")
     resolved["command"] = resolved_argv[0]
     resolved["args"] = resolved_argv[1:]
     resolved["exact_environment"] = True
@@ -242,6 +384,22 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     enabled = setting(enabled_from)
     if not isinstance(enabled, bool):
         raise ValueError("invalid MCP enabled_from value")
+    if roots_token_used and roots_token_empty:
+        # Mirrors LocalFiles.__init__'s own `if not roots: raise ValueError`
+        # guard: never let this server spawn with a roots token
+        # ({file_roots} or {file_write_roots}) that
+        # resolved to zero real directories, even if enabled_from itself
+        # said True (e.g. a future config mistake that points enabled_from
+        # at an unrelated flag). Without this, the argv still contains
+        # [npx, -y, package] -- non-empty -- so the argv-empty check above
+        # never fires, and today's pinned server happening to refuse to
+        # start with zero directory args is not something Atlas may rely
+        # on across version bumps. A typo'd or unmounted file_roots entry
+        # must surface as not_configured, never as a healthy connect that
+        # then fails every call with "Access denied" (adversarial review,
+        # docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C2, finding F1).
+        enabled = False
+        resolved["disabled_reason"] = "config_entry_missing"
     resolved["enabled"] = enabled
     env_from = resolved.pop("env_from", {})
     if not isinstance(env_from, dict) or not all(
@@ -259,6 +417,20 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     return resolved
 
 
+# not_configured detail keys a resolved server_cfg's disabled_reason may pick
+# in place of the generic "disabled" -- a closed allowlist so an unexpected
+# or param-requiring key (e.g. "signed_missing") can never reach
+# render_status_detail and raise. See _resolve_command_config's
+# roots_token_used guard for the one producer of "config_entry_missing"
+# today.
+_NOT_CONFIGURED_DISABLED_REASONS = frozenset({"disabled", "config_file_missing", "config_entry_missing"})
+
+
+def _not_configured_detail_key(server_cfg: Any) -> str:
+    reason = server_cfg.get("disabled_reason") if isinstance(server_cfg, Mapping) else None
+    return reason if reason in _NOT_CONFIGURED_DISABLED_REASONS else "disabled"
+
+
 def _environment_value(value: Any) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -268,10 +440,46 @@ def _environment_value(value: Any) -> str:
 
 
 def policy_for(server_cfg: Mapping, defaults: Mapping, tool_name: str) -> Policy:
+    # Precedence: never_instant > instant > prefix heuristic. never_instant is
+    # a name-substring backstop that forces confirm even over an explicit
+    # instant: entry, so a mistaken or misleadingly-named mutation (e.g. a
+    # "get_" tool that actually shares/deletes) cannot become instant by
+    # config error. Matching is casefolded on both sides (pattern and tool
+    # name) so it survives camelCase remote tool names too. (instant_when
+    # sits above this too, but it is argument-conditional and applied later
+    # as an `escalate` hook, not here.)
+    normalized_name = tool_name.casefold()
+    if any(pattern in normalized_name for pattern in _never_instant_patterns(defaults)):
+        return "confirm"
     if "instant" in server_cfg:
         return "instant" if tool_name in server_cfg.get("instant", ()) else "confirm"
     prefixes = defaults.get("instant_prefixes", ())
     return "instant" if any(tool_name.startswith(prefix) for prefix in prefixes) else "confirm"
+
+
+def _never_instant_patterns(defaults: Mapping) -> tuple[str, ...]:
+    patterns = defaults.get("never_instant", _DEFAULT_NEVER_INSTANT)
+    if (
+        not isinstance(patterns, (list, tuple))
+        or not patterns  # an empty list would silently disable the backstop
+        or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+    ):
+        raise ValueError("invalid MCP never_instant pattern list")
+    return tuple(pattern.casefold() for pattern in patterns)
+
+
+def _args_override(value: Any) -> list[str]:
+    """Replace an entire ``from_claude_config``/``command`` argv with a
+    version Atlas alone spawns (plan Track C3: pin the google server to a
+    known-good ``workspace-mcp`` release so a `uv` cache eviction can't
+    silently jump Atlas to an untested newer version, without ever editing
+    the shared ``~/.claude.json`` entry Claude Code also uses).
+    """
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError("invalid MCP args_override")
+    return list(value)
 
 
 def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
@@ -281,6 +489,111 @@ def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
     ):
         raise ValueError("invalid MCP blocked tool list")
     return frozenset(blocked)
+
+
+def _exposed_tools(server_cfg: Mapping) -> frozenset[str] | None:
+    """Return the allowed remote tool names, or None to mirror all of them.
+
+    Absent `expose:` preserves today's behavior (mirror everything not
+    blocked). When present, only names in this list are ever mirrored;
+    combined with `blocked:` via AND, so blocked always wins on overlap.
+    """
+    if "expose" not in server_cfg:
+        return None
+    expose = server_cfg.get("expose")
+    if not isinstance(expose, (list, tuple)) or not all(
+        isinstance(name, str) and name for name in expose
+    ):
+        raise ValueError("invalid MCP expose tool list")
+    return frozenset(expose)
+
+
+_MISSING_EXPOSE_WARNING_LIMIT = 500
+
+
+def _missing_exposed_tools(exposed: frozenset[str] | None, listed_tools: Any) -> tuple[str, ...]:
+    """Names in expose: that the server did not actually offer this connect.
+
+    Surfaces upstream renames/typos (an expose: entry silently mirroring
+    nothing looks identical to an intentional cut otherwise).
+    """
+    if exposed is None:
+        return ()
+    listed_names = frozenset(getattr(tool, "name", None) for tool in listed_tools)
+    return tuple(sorted(exposed - listed_names))
+
+
+def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_description: str) -> str:
+    describe = server_cfg.get("describe", {})
+    if not isinstance(describe, Mapping):
+        raise ValueError("invalid MCP describe map")
+    if remote_tool_name in describe:
+        override = describe[remote_tool_name]
+        if not isinstance(override, str) or not override:
+            raise ValueError("invalid MCP describe value")
+        return override
+    return remote_description
+
+
+def _server_domain(server_cfg: Mapping) -> str | None:
+    domain = server_cfg.get("domain")
+    if domain is not None and (not isinstance(domain, str) or not domain):
+        raise ValueError("invalid MCP domain")
+    return domain
+
+
+def _compile_instant_when(server_cfg: Mapping, remote_tool_name: str) -> Callable[[Mapping], bool] | None:
+    """Compile instant_when rules for one tool into an escalate callable.
+
+    instant_when: {tool_name: {arg_name: [allowed values, ...]}} is an
+    ALLOWLIST, not a denylist: the call escalates instant -> confirm UNLESS
+    every listed arg's call-time value is a string that case/whitespace-
+    normalizes (``.strip().casefold()``) to one of its allowed values. A
+    missing arg or a non-string value (list, dict, number, None, ...) also
+    escalates -- fail closed rather than assuming the safe default applies.
+
+    An allowlist (rather than a denylist of dangerous values) is required
+    because the remote tool itself normalizes its argument the same way
+    (e.g. workspace-mcp's manage_event does ``action.lower().strip()``), so
+    a denylist of exact strings like "delete" would miss "Delete" or
+    " delete " and fail open. Comparing both sides after the same
+    normalization closes that gap regardless of what the disallowed values
+    turn out to be.
+
+    NOTE: no checked-in server configures instant_when today. Its one user
+    was google's manage_event (instant for action: create), removed in the
+    BB-wave review because an instant create can still carry attendees: and
+    send_updates: -- third-party email on a model assertion, which rule 5
+    forbids. That case needs an argument-PRESENCE predicate, which this
+    value allowlist cannot express; the machinery is kept, and kept tested,
+    for the next tool whose safe subset really is a set of argument values.
+    """
+    all_rules = server_cfg.get("instant_when", {})
+    if not isinstance(all_rules, Mapping):
+        raise ValueError("invalid MCP instant_when config")
+    rules = all_rules.get(remote_tool_name)
+    if rules is None:
+        return None
+    if not isinstance(rules, Mapping) or not rules:
+        raise ValueError("invalid MCP instant_when rule")
+    compiled: dict[str, frozenset[str]] = {}
+    for arg_name, values in rules.items():
+        if (
+            not isinstance(arg_name, str) or not arg_name
+            or not isinstance(values, (list, tuple)) or not values
+            or not all(isinstance(value, str) and value for value in values)
+        ):
+            raise ValueError("invalid MCP instant_when rule")
+        compiled[arg_name] = frozenset(value.strip().casefold() for value in values)
+
+    def escalate(arguments: Mapping) -> bool:
+        for arg_name, allowed in compiled.items():
+            value = arguments.get(arg_name)
+            if not isinstance(value, str) or value.strip().casefold() not in allowed:
+                return True
+        return False
+
+    return escalate
 
 
 @asynccontextmanager
@@ -316,6 +629,7 @@ class McpServers:
         account_values: Mapping[str, str] | None = None,
         killer: ProcessTreeKiller = kill_process_tree,
         wall_clock: Callable[[], float] = time.time,
+        sleep: SleepFn = asyncio.sleep,
     ):
         global _active_servers
         self._config = config
@@ -326,6 +640,7 @@ class McpServers:
         self._account_values = dict(account_values or {})
         self._killer = killer
         self._wall_clock = wall_clock
+        self._sleep = sleep
         self._stdio_enter_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
         self._sessions: dict[str, ClientSession] = {}
@@ -355,7 +670,7 @@ class McpServers:
                 "state": "not_configured" if disabled else "connecting",
                 "detail": render_status_detail(
                     "not_configured" if disabled else "connecting",
-                    "disabled" if disabled else "pending",
+                    _not_configured_detail_key(server_cfg) if disabled else "pending",
                 ),
             }
         if any(
@@ -446,31 +761,85 @@ class McpServers:
         ready: asyncio.Event,
         stop: asyncio.Event,
     ) -> None:
+        max_attempts = _connect_attempts(defaults)
+        backoffs = _connect_backoffs(defaults)
         stack = AsyncExitStack()
         session = None
         stage = "resolving"
         command = None
+        attempt = 1
         try:
-            async with asyncio.timeout(timeout_s):
-                spec = self._resolve_spec(server_cfg)
-                command = spec.command
-                stage = "starting"
-                session = await stack.enter_async_context(self._session_factory(name, spec))
-                async with self._session_lock:
-                    self._sessions[name] = session
-                    generation = self._session_generations.get(name, 0)
-                    await self._notify_held_session(name, session)
-                stage = "listing"
-                listed = await session.list_tools()
-                async with self._session_lock:
-                    if self._session_generations.get(name, 0) != generation:
-                        await self._notify_held_session(name, session)
-                blocked = _blocked_tools(server_cfg)
-                mirrored = [
-                    self._mirror_tool(name, server_cfg, defaults, session, tool)
-                    for tool in listed.tools
-                    if tool.name not in blocked
-                ]
+            while True:
+                try:
+                    async with asyncio.timeout(timeout_s):
+                        spec = self._resolve_spec(server_cfg)
+                        command = spec.command
+                        stage = "starting"
+                        session = await stack.enter_async_context(self._session_factory(name, spec))
+                        async with self._session_lock:
+                            self._sessions[name] = session
+                            generation = self._session_generations.get(name, 0)
+                            await self._notify_held_session(name, session)
+                        stage = "listing"
+                        listed = await session.list_tools()
+                        async with self._session_lock:
+                            if self._session_generations.get(name, 0) != generation:
+                                await self._notify_held_session(name, session)
+                        blocked = _blocked_tools(server_cfg)
+                        exposed = _exposed_tools(server_cfg)
+                        missing = _missing_exposed_tools(exposed, listed.tools)
+                        if missing:
+                            _LOGGER.warning(
+                                "MCP server %s expose: names not offered by the server: %s",
+                                name,
+                                ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
+                            )
+                        mirrored = [
+                            self._mirror_tool(name, server_cfg, defaults, session, tool)
+                            for tool in listed.tools
+                            if tool.name not in blocked and (exposed is None or tool.name in exposed)
+                        ]
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    error = type(exc).__name__
+                    state, detail = _failure_status(
+                        exc,
+                        stage=stage,
+                        command=command if command is not None else server_cfg.get("command"),
+                        timeout_s=timeout_s,
+                    )
+                    if attempt >= max_attempts or not _is_retryable_failure(state, detail):
+                        raise _ConnectExhausted(error, state, detail) from exc
+                    async with self._session_lock:
+                        if self._sessions.get(name) is session:
+                            self._sessions.pop(name, None)
+                    session = None
+                    with suppress(Exception):
+                        await stack.aclose()
+                    self._kill_server_tree(name)
+                    backoff = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                    self._set_status(
+                        name,
+                        state="connecting",
+                        detail=render_status_detail(
+                            "connecting", "retrying",
+                            attempt=attempt + 1, max_attempts=max_attempts,
+                        ),
+                        connected=False,
+                        tools=0,
+                        error=error,
+                    )
+                    _LOGGER.warning(
+                        "MCP server %s connect attempt %d/%d failed (%s) -- retrying in %gs",
+                        name, attempt, max_attempts, error, backoff,
+                    )
+                    await self._sleep(backoff)
+                    stack = AsyncExitStack()
+                    stage = "resolving"
+                    command = None
+                    attempt += 1
             self._call_settings[name] = (
                 server_cfg,
                 float(defaults.get("call_timeout_s", 8)),
@@ -491,13 +860,16 @@ class McpServers:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            error = type(exc).__name__
-            state, detail = _failure_status(
-                exc,
-                stage=stage,
-                command=command if command is not None else server_cfg.get("command"),
-                timeout_s=timeout_s,
-            )
+            if isinstance(exc, _ConnectExhausted):
+                error, state, detail = exc.error, exc.state, exc.detail
+            else:
+                error = type(exc).__name__
+                state, detail = _failure_status(
+                    exc,
+                    stage=stage,
+                    command=command if command is not None else server_cfg.get("command"),
+                    timeout_s=timeout_s,
+                )
             tools_changed = self._replace_server_tools(name, registry, [], None)
             self._set_status(
                 name,
@@ -641,10 +1013,13 @@ class McpServers:
             source = configured[config_name]
         if not isinstance(source, Mapping) or not isinstance(source.get("command"), str):
             raise ValueError("invalid MCP server config")
+        args = list(source.get("args", ()))
+        if "args_override" in server_cfg:
+            args = _args_override(server_cfg["args_override"])
         _, StdioServerParameters, _ = _load_mcp_transport()
         return StdioServerParameters(
             command=source["command"],
-            args=list(source.get("args", ())),
+            args=args,
             env=dict(source["env"]) if source.get("env") is not None else None,
         )
 
@@ -781,7 +1156,7 @@ class McpServers:
             remote_tool.inputSchema,
             server_cfg.get("account_param"),
         )
-        description = remote_tool.description or ""
+        description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
 
         async def run(arguments: dict) -> str:
             text = await self._call_session(
@@ -795,10 +1170,12 @@ class McpServers:
 
         return Tool(
             name=f"{server_name}__{remote_tool.name}",
-            description=description[:512],
+            description=description[:_DESCRIPTION_LIMIT],
             input_schema=schema,
             policy=policy_for(server_cfg, defaults, remote_tool.name),
             run=run,
+            domain=_server_domain(server_cfg),
+            escalate=_compile_instant_when(server_cfg, remote_tool.name),
         )
 
     async def call_raw(

@@ -723,11 +723,20 @@ def test_private_folder_launcher_uses_signed_explorer_profile(monkeypatch):
     assert calls == [("explorer.exe", "C:/allowed/folder")]
 
 
-def test_explorer_resolver_uses_signed_system32_executable(tmp_path, monkeypatch):
+def test_explorer_resolver_uses_the_signed_windows_directory_executable(
+    tmp_path,
+    monkeypatch,
+):
+    """This test used to build a System32/explorer.exe that Windows never has.
+
+    Pinning the fake tree to the wrong layout is what let the dead candidate
+    ship: the unit test passed while open_folder could not launch anything.
+    """
     windows = tmp_path / "windows"
-    candidate = windows / "System32/explorer.exe"
+    candidate = windows / "explorer.exe"
     candidate.parent.mkdir(parents=True)
     candidate.write_text("test executable", encoding="utf-8")
+    (windows / "System32").mkdir()
     calls = []
 
     monkeypatch.setattr(desktopapps.os, "name", "nt")
@@ -798,3 +807,54 @@ def test_authenticode_verification_uses_fixed_powershell_and_exact_publisher(
 
     Result.stdout = "CN=Not Google, O=Attacker"
     assert desktopapps._verify_authenticode_publisher(target, "Google LLC") is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="signed desktop profiles are Windows-only")
+@pytest.mark.parametrize(
+    "executable",
+    sorted(
+        {profile.executable for profile in desktopapps.DEFAULT_PROFILES.values()}
+        | {"explorer.exe"},
+    ),
+)
+def test_every_launchable_profile_resolves_to_a_real_image(executable, monkeypatch):
+    """Guard the whole candidate table, not one entry.
+
+    explorer.exe was listed at System32/explorer.exe -- a path that has never
+    existed on any NT release -- so open_folder could not launch anything and
+    nothing noticed, because every open_folder test injected a fake opener.
+    This walks the same set native_launcher can reach: the executables of the
+    signed profiles plus explorer.exe, which _launch_folder uses directly.
+    ("WindowsTerminal.exe" is deliberately absent -- it is the wt profile's
+    close_executable for taskkill and is never launched.)
+
+    Path resolution is real; only the Authenticode round trip is stubbed, and
+    the publisher it was asked for is asserted. Running the genuine check for
+    all six spawns six PowerShell processes under a 10s cap, which turns this
+    into a load-flaky test -- the real check is exercised end to end by
+    test_explorer_resolves_under_the_windows_directory_not_system32 and by
+    test_open_folder_by_handle_reaches_the_real_explorer_resolution.
+    """
+    asked = []
+    monkeypatch.setattr(
+        desktopapps,
+        "_verify_authenticode_publisher",
+        lambda path, publisher: asked.append((path, publisher)) or True,
+    )
+
+    resolved = desktopapps._resolve_executable(executable)
+
+    assert Path(resolved).is_file()
+    assert Path(resolved).name.casefold() == executable.casefold()
+    assert asked[-1] == (
+        Path(resolved),
+        desktopapps._EXPECTED_PUBLISHERS[executable],
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="signed desktop profiles are Windows-only")
+def test_explorer_resolves_under_the_windows_directory_not_system32():
+    resolved = Path(desktopapps._resolve_executable("explorer.exe"))
+
+    assert resolved == Path(desktopapps._windows_directory()) / "explorer.exe"
+    assert not (Path(desktopapps._windows_directory()) / "System32/explorer.exe").exists()

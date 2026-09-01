@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from dataclasses import dataclass
+import os
 import subprocess
 import sys
 import threading
@@ -251,14 +252,202 @@ def test_confirmation_readback_lists_all_arguments_and_truncates_each_value():
     assert registry.pending.summary in result.content
 
 
-def test_confirmation_refuses_serialized_arguments_over_readback_limit():
+def test_confirmation_condenses_oversized_arguments_instead_of_refusing():
+    """BB-wave review, finding 5. The old behavior refused any confirm-tier
+    call whose serialized arguments passed ~1,200 characters, advising the
+    model to "split it" -- advice that is actively wrong for an overwrite
+    tool like write_file, where two half-calls do not write one file, they
+    write the first half and then replace it with the second. A readback
+    exists so Daniel hears WHAT is going WHERE and HOW MUCH; it does not
+    have to be the payload itself."""
     registry = ToolRegistry()
     registry.register(_tool("send", policy="confirm"))
 
     result = _call(registry, "send", {"body": "x" * 1_201})
 
-    assert result == ToolResult("error", "too large to read back; split it")
-    assert registry.pending is None
+    assert result.status == "needs_confirmation"
+    assert "split it" not in result.content
+    # First 80 characters plus the full length -- bounded, and enough to
+    # say what is being sent.
+    assert "body: " + "x" * 80 + " ...(1201 chars total)" in result.content
+    assert registry.pending is not None
+    # The pending action still holds the EXACT arguments; only the spoken
+    # summary is condensed.
+    assert registry.pending.arguments == {"body": "x" * 1_201}
+
+
+def test_condensing_never_truncates_the_short_values_a_confirmation_turns_on():
+    """Final-review conditional fix: only the oversized value is condensed.
+    A short value like path carries the discriminating detail (the filename
+    tail of an overwrite target) and must be read back WHOLE even when a
+    sibling content value forced the condensed summary."""
+    registry = ToolRegistry()
+    registry.register(_tool("files__write_file", policy="confirm"))
+    path = (
+        "C:/Users/danie/Documents/Projects/2026/Atlas/handoffs/"
+        "2026-08-31-atlas-bb-wave-review.md"
+    )
+    assert len(path) > 80  # longer than the condensed cap, shorter than normal
+
+    result = _call(registry, "files__write_file", {"path": path, "content": "y" * 5_000})
+
+    assert result.status == "needs_confirmation"
+    assert f"path: {path};" in result.content  # whole, filename tail intact
+    assert "...(5000 chars total)" in result.content  # content still condensed
+
+
+def test_a_large_write_file_confirms_with_a_bounded_summary_and_executes_in_full():
+    """The finding-5 scenario end to end: a 5KB write_file (an MCP-mirrored
+    confirm-tier tool) must reach needs_confirmation with a summary bounded
+    to path + size + a prefix, and the later confirm must write the WHOLE
+    5KB -- not the summarized version of it."""
+    written = []
+    content = "".join(f"line {index}\n" for index in range(700))
+    assert len(content) > 5_000
+
+    async def run(arguments):
+        written.append(dict(arguments))
+        return {"ok": True}
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="files__write_file",
+        description="d",
+        input_schema={"type": "object", "properties": {}},
+        run=run,
+        policy="confirm",
+    ))
+
+    proposed = _call(
+        registry, "files__write_file",
+        {"path": "C:/Users/danie/Documents/notes.md", "content": content},
+    )
+
+    assert proposed.status == "needs_confirmation"
+    assert written == []
+    assert "C:/Users/danie/Documents/notes.md" in proposed.content
+    # Newlines are control characters and are stripped from every readback
+    # before it is measured, so the stated size is the cleaned length.
+    assert f"...({len(content.replace(chr(10), ''))} chars total)" in proposed.content
+    assert len(proposed.content) < 400
+    assert "split it" not in proposed.content
+
+    confirmed = asyncio.run(registry.confirm(proposed.confirm_id))
+
+    assert confirmed.status == "ok"
+    assert written == [{
+        "path": "C:/Users/danie/Documents/notes.md",
+        "content": content,
+    }]
+
+
+def test_pending_action_also_blocks_a_tool_that_escalates_to_confirm():
+    """Regression for the pending-clobber bug: an outstanding declared-confirm
+    pending action (A) must also block a second call whose "instant" policy
+    escalates to confirm (B) -- not just a second call that is declared
+    confirm outright. Before the fix, B's own self._pending = pending write
+    silently replaced A, and confirm(A) then failed with "nothing to
+    confirm" even though Daniel never got to answer A."""
+    calls = []
+    registry = ToolRegistry()
+    registry.register(_tool(
+        "first", run=lambda args: _return(calls.append(("first", args))), policy="confirm",
+    ))
+    registry.register(Tool(
+        name="second", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("second", args))),
+        policy="instant", escalate=lambda _args: True,
+    ))
+
+    pending_first = _call(registry, "first", {"n": 1})
+    blocked = _call(registry, "second", {"n": 2})
+
+    assert blocked == ToolResult(
+        "error",
+        "a previous action is still awaiting Daniel's yes or no",
+    )
+    assert registry.pending is not None
+    assert registry.pending.confirm_id == pending_first.confirm_id
+    assert registry.pending.name == "first"
+    assert calls == []
+    assert asyncio.run(registry.confirm(pending_first.confirm_id)).status == "ok"
+    assert calls == [("first", {"n": 1})]
+
+
+def test_escalate_moves_instant_to_confirm_but_never_the_reverse():
+    """Directional property: escalate can turn an instant call into a confirm
+    (readback, no execution) for this call, and a False/absent escalate
+    leaves an instant tool executing immediately -- it never manufactures an
+    instant result out of a confirm-policy tool (see the reflection-style
+    test below for that half of the guarantee)."""
+    calls = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="always_escalate", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("always_escalate", args)) or "ran"),
+        policy="instant", escalate=lambda _args: True,
+    ))
+    registry.register(Tool(
+        name="never_escalate", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda args: _return(calls.append(("never_escalate", args)) or "ran"),
+        policy="instant", escalate=lambda _args: False,
+    ))
+
+    escalated = _call(registry, "always_escalate", {"x": 1})
+    assert escalated.status == "needs_confirmation"
+    assert calls == []
+    assert asyncio.run(registry.confirm(escalated.confirm_id)).status == "ok"
+    assert calls == [("always_escalate", {"x": 1})]
+
+    kept_instant = _call(registry, "never_escalate", {"y": 2})
+    assert kept_instant.status == "ok"
+    assert calls[-1] == ("never_escalate", {"y": 2})
+
+
+def test_escalate_raising_is_treated_as_escalation_fail_closed():
+    registry = ToolRegistry()
+
+    def broken(_args):
+        raise RuntimeError("rule blew up")
+
+    registry.register(Tool(
+        name="risky", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"),
+        policy="instant", escalate=broken,
+    ))
+
+    result = _call(registry, "risky", {})
+
+    assert result.status == "needs_confirmation"
+
+
+def test_escalate_is_structurally_ignored_once_policy_is_already_confirm():
+    """Reflection-style guard: a confirm-policy tool must never consult
+    escalate at all, so even a poisoned escalate that raises AssertionError
+    on every call cannot surface -- proving there is no code path that lets
+    escalate run for (and thereby de-escalate) a confirm-policy tool."""
+    def must_not_be_called(_args):
+        raise AssertionError("escalate must not be consulted for a confirm-policy tool")
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="dangerous", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"),
+        policy="confirm", escalate=must_not_be_called,
+    ))
+
+    result = _call(registry, "dangerous", {})
+
+    assert result.status == "needs_confirmation"
+
+
+def test_tool_domain_field_is_optional_and_stored_for_later_use():
+    assert _tool("plain").domain is None
+    labeled = Tool(
+        name="labeled", description="d", input_schema={"type": "object", "properties": {}},
+        run=lambda _args: _return("ran"), domain="google",
+    )
+    assert labeled.domain == "google"
 
 
 def test_open_resolves_aliases_https_and_rejects_other_targets():
@@ -1006,10 +1195,13 @@ def test_tainted_turn_refuses_actions_that_can_change_state(name, arguments):
 
     result = _call(registry, name, arguments, tainted=True)
 
-    assert result == ToolResult(
-        "error",
-        "refused after external content; ask Daniel again next turn",
+    expected = (
+        "refused after external content; use a handle from an earlier find_file "
+        "result in this turn, or ask Daniel again next turn"
+        if name in {"open_file", "open_folder"}
+        else "refused after external content; ask Daniel again next turn"
     )
+    assert result == ToolResult("error", expected)
 
 
 def test_tainted_turn_still_allows_a_configured_open_alias():
@@ -1325,3 +1517,370 @@ def test_count_mail_rejects_a_next_token_after_a_partial_page():
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
     assert result == ToolResult("error", "unexpected mail search result")
+
+
+# --- C1: per-turn file handles -------------------------------------------
+#
+# The taint wall must keep holding: after external content, the model may not
+# name an action target. A handle is not a loophole -- it is a reference to a
+# path THIS host produced and validated earlier in the same turn.
+
+_HANDLE_TAINT_REFUSAL = ToolResult(
+    "error",
+    "refused after external content; use a handle from an earlier find_file "
+    "result in this turn, or ask Daniel again next turn",
+)
+
+
+def _handle_setup(tmp_path):
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "roots"
+    plans = root / "plans"
+    plans.mkdir(parents=True)
+    document = plans / "atlas-plan.md"
+    document.write_text("plan", encoding="utf-8")
+    opened: list[str] = []
+    launched: list[str] = []
+    files = LocalFiles([root], opener=opened.append, folder_opener=launched.append)
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=files)
+    return registry, document, plans, opened, launched
+
+
+def _handles(result):
+    return {item["path"]: item.get("handle") for item in json.loads(result.content)}
+
+
+def test_find_file_mints_a_handle_that_opens_under_taint(tmp_path):
+    registry, document, _plans, opened, _launched = _handle_setup(tmp_path)
+
+    found = _call(registry, "find_file", {"query": "atlas plan"})
+    minted = _handles(found)
+
+    assert minted == {str(document.resolve()): "f1"}
+    assert json.loads(found.content)[0]["kind"] == "file"
+    # The chain C1 exists for: host search -> an MCP call taints the turn ->
+    # the preexisting handle still acts.
+    result = _call(registry, "open_file", {"handle": "f1"}, tainted=True)
+    assert json.loads(result.content) == {"opened": str(document.resolve())}
+    assert opened == [str(document.resolve())]
+
+
+def test_tainted_open_file_still_refuses_a_real_in_roots_path(tmp_path):
+    registry, document, _plans, opened, _launched = _handle_setup(tmp_path)
+    _call(registry, "find_file", {"query": "atlas plan"})
+
+    refused = _call(registry, "open_file", {"path": str(document)}, tainted=True)
+    both = _call(
+        registry,
+        "open_file",
+        {"path": str(document), "handle": "f1"},
+        tainted=True,
+    )
+
+    assert refused == _HANDLE_TAINT_REFUSAL
+    # A handle may not launder a path that rides alongside it.
+    assert both == _HANDLE_TAINT_REFUSAL
+    assert opened == []
+
+
+def test_a_handle_from_an_earlier_turn_never_aliases_a_new_target(tmp_path):
+    """Positional ids aliased across turns; monotonic ids fail closed.
+
+    With per-turn numbering, turn 2's first mint reused "f1", so a stale id
+    the model still had in its history opened a DIFFERENT file with an ok
+    status. The second turn here mints too, which is exactly the case that
+    used to alias.
+    """
+    registry, document, plans, opened, _launched = _handle_setup(tmp_path)
+    other = plans / "atlas-plan-two.md"
+    other.write_text("second", encoding="utf-8")
+    first_turn = json.loads(
+        _call(registry, "find_file", {"query": "atlas plan two"}).content,
+    )
+    assert [item["path"] for item in first_turn] == [str(other.resolve())]
+    stale = first_turn[0]["handle"]
+
+    registry.begin_turn()
+    second_turn = json.loads(
+        _call(registry, "find_file", {"query": "atlas plan"}).content,
+    )
+
+    fresh = {item["handle"] for item in second_turn}
+    assert stale not in fresh
+    assert str(document.resolve()) in {item["path"] for item in second_turn}
+    assert _call(registry, "open_file", {"handle": stale}, tainted=True) == (
+        _HANDLE_TAINT_REFUSAL
+    )
+    assert _call(registry, "open_file", {"handle": stale}) == ToolResult(
+        "error",
+        "unknown handle; call find_file first and use a handle from its results",
+    )
+    assert opened == []
+
+
+@pytest.mark.parametrize("handle", ["f1", "f2", "F1", "f0", "../evil", 1, True])
+def test_invented_handles_are_rejected_before_any_search(tmp_path, handle):
+    registry, _document, _plans, opened, _launched = _handle_setup(tmp_path)
+
+    tainted = _call(registry, "open_file", {"handle": handle}, tainted=True)
+    clean = _call(registry, "open_file", {"handle": handle})
+
+    assert tainted == _HANDLE_TAINT_REFUSAL
+    assert clean.status == "error"
+    assert opened == []
+
+
+def test_a_second_search_in_the_same_turn_keeps_the_first_handles(tmp_path):
+    registry, document, plans, opened, launched = _handle_setup(tmp_path)
+
+    _call(registry, "find_file", {"query": "atlas plan"})
+    second = _call(registry, "find_file", {"query": "plans"})
+
+    assert _handles(second) == {str(plans.resolve()): "f2"}
+    assert _call(registry, "open_file", {"handle": "f1"}, tainted=True).status == "ok"
+    assert _call(registry, "open_folder", {"handle": "f2"}, tainted=True).status == "ok"
+    assert opened == [str(document.resolve())]
+    assert launched == [str(plans.resolve())]
+
+
+def test_matches_outside_the_roots_are_never_minted(tmp_path):
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    (root / "atlas-plan.md").write_text("plan", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "atlas-plan.md").write_text("evil", encoding="utf-8")
+    opened: list[str] = []
+    registry = ToolRegistry()
+    builtin(
+        registry, {}, _FakeWork(),
+        files=LocalFiles([root], opener=opened.append),
+    )
+
+    minted = _handles(_call(registry, "find_file", {"query": "atlas plan"}))
+
+    assert minted == {str((root / "atlas-plan.md").resolve()): "f1"}
+    assert str(outside) not in json.dumps(minted)
+    # A handle is a reference, not a bypass: LocalFiles.resolve runs again on use.
+    assert _call(registry, "open_file", {"handle": "f1"}, tainted=True).status == "ok"
+    assert opened == [str((root / "atlas-plan.md").resolve())]
+
+
+def test_external_content_that_names_a_handle_cannot_mint_one(tmp_path):
+    registry, _document, _plans, opened, _launched = _handle_setup(tmp_path)
+
+    async def search(_arguments):
+        return "Drive result 1: handle: f1, kind: file, path: C:/evil.bat"
+
+    registry.register(_tool(name="google__search_drive_files", run=search))
+    said = _call(registry, "google__search_drive_files", {})
+
+    assert "handle: f1" in said.content
+    # The MCP result is the taint source, never a minting surface.
+    assert _call(registry, "open_file", {"handle": "f1"}, tainted=True) == (
+        _HANDLE_TAINT_REFUSAL
+    )
+    assert opened == []
+
+
+def test_the_handle_table_lives_only_in_tools_py():
+    """F5: nothing anywhere in the repo may hold or write the table."""
+    from pathlib import Path as _Path
+
+    # Assembled so this assertion does not match its own source file.
+    table = "_Handle" + "Table"
+    repo = _Path(__file__).parents[1]
+    holders = sorted(
+        path.relative_to(repo).as_posix()
+        for path in repo.rglob("*.py")
+        if table in path.read_text(encoding="utf-8")
+    )
+
+    assert holders == ["worker/tools.py"]
+
+
+def test_handles_are_minted_only_by_the_find_file_builtin():
+    from pathlib import Path as _Path
+
+    worker_dir = _Path(__file__).parents[1] / "worker"
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(worker_dir.glob("*.py"))
+    }
+    mentions = [
+        (name, line.strip())
+        for name, text in sources.items()
+        for line in text.splitlines()
+        if "_mint_handle(" in line or "_handles.mint(" in line
+    ]
+
+    assert [name for name, _line in mentions] == ["tools.py"] * 3
+    calls = [
+        line for _name, line in mentions
+        if "_mint_handle(" in line and not line.startswith("def ")
+    ]
+    assert calls == ['handle = registry._mint_handle(item["path"], kind)']
+    lines = sources["tools.py"].splitlines()
+    call_index = next(
+        index for index, line in enumerate(lines) if line.strip() == calls[0]
+    )
+    start = next(
+        index for index, line in enumerate(lines) if "async def find_file(" in line
+    )
+    end = next(index for index, line in enumerate(lines) if "def file_target(" in line)
+    assert start < call_index < end
+
+
+def test_a_file_handle_opens_its_folder_and_a_folder_handle_refuses_open_file(tmp_path):
+    registry, _document, plans, opened, launched = _handle_setup(tmp_path)
+    _call(registry, "find_file", {"query": "atlas plan"})
+    _call(registry, "find_file", {"query": "plans"})
+
+    folder = _call(registry, "open_folder", {"handle": "f1"}, tainted=True)
+    refused = _call(registry, "open_file", {"handle": "f2"}, tainted=True)
+
+    assert json.loads(folder.content) == {"opened": str(plans.resolve())}
+    assert launched == [str(plans.resolve())]
+    assert refused == ToolResult("error", "that handle is a folder; use open_folder")
+    assert opened == []
+
+
+def test_handle_tools_keep_path_calls_and_stay_api_compatible(tmp_path):
+    registry, document, _plans, opened, _launched = _handle_setup(tmp_path)
+
+    assert _call(registry, "open_file", {"path": str(document)}).status == "ok"
+    assert _call(registry, "open_file", {}) == ToolResult("error", "invalid path")
+    assert opened == [str(document.resolve())]
+    schemas = {schema["name"]: schema for schema in registry.schemas()}
+    for name in ("open_file", "open_folder"):
+        schema = schemas[name]["input_schema"]
+        assert set(schema["properties"]) == {"path", "handle"}
+        assert schema["required"] == []
+        assert schema["additionalProperties"] is False
+        assert "handle" in schemas[name]["description"]
+    assert "handle" in schemas["find_file"]["description"]
+    assert api_incompatible_tool_names(registry.schemas()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Explorer resolution is Windows-only")
+def test_open_folder_by_handle_reaches_the_real_explorer_resolution(tmp_path, monkeypatch):
+    """No fake folder_opener: the injected fakes hid a dead explorer path.
+
+    Everything here is real -- LocalFiles, _launch_folder, native_launcher,
+    _resolve_executable, the Authenticode publisher check -- except the final
+    process spawn, which is captured instead of started.
+    """
+    from pathlib import Path
+
+    from worker import desktopapps
+    from worker.localfiles import LocalFiles
+
+    spawned = []
+
+    class _Spawned:
+        pid = 4321
+
+    # Only the Explorer launch is intercepted: subprocess.run() reaches Popen
+    # through the same module attribute, so a blanket fake would silently
+    # disable the real Authenticode publisher check this test means to run.
+    real_popen = desktopapps.subprocess.Popen
+
+    def fake_popen(command, **kwargs):
+        if Path(command[0]).name.casefold() != "explorer.exe":
+            return real_popen(command, **kwargs)
+        spawned.append((command, kwargs))
+        return _Spawned()
+
+    monkeypatch.setattr(desktopapps.subprocess, "Popen", fake_popen)
+    root = tmp_path / "roots"
+    plans = root / "plans"
+    plans.mkdir(parents=True)
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), files=LocalFiles([root]))
+
+    found = json.loads(_call(registry, "find_file", {"query": "plans"}).content)
+    handle = found[0]["handle"]
+    result = _call(registry, "open_folder", {"handle": handle}, tainted=True)
+
+    assert json.loads(result.content) == {"opened": str(plans.resolve())}
+    command, kwargs = spawned[0]
+    assert Path(command[0]).is_file()
+    assert Path(command[0]).name.casefold() == "explorer.exe"
+    assert command[1] == str(plans.resolve())
+    assert kwargs["shell"] is False
+
+
+def test_the_handle_table_is_bounded_within_a_turn(tmp_path):
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    for index in range(20):
+        (root / f"atlas-plan-{index}.md").write_text("plan", encoding="utf-8")
+    registry = ToolRegistry()
+    builtin(
+        registry, {}, _FakeWork(),
+        files=LocalFiles([root], opener=lambda _path: None),
+    )
+
+    # Long temp paths can push a 20-result list past the 4096-char content
+    # bound, so this reads the table itself rather than the serialized JSON.
+    # find_file returns at most 20 (localfiles._MAX_RESULTS), so six calls
+    # exactly exhaust the 120-handle budget and the seventh gets nothing.
+    for _ in range(6):
+        _call(registry, "find_file", {"query": "atlas plan"})
+    seventh = _call(registry, "find_file", {"query": "atlas plan"})
+
+    assert registry._resolve_handle("f1") is not None
+    assert registry._resolve_handle("f120") is not None
+    assert registry._resolve_handle("f121") is None
+    assert '"handle"' not in seventh.content
+    assert _call(registry, "open_file", {"handle": "f121"}).content.startswith(
+        "unknown handle",
+    )
+
+
+def test_find_file_marks_results_it_could_not_mint_a_handle_for(tmp_path):
+    """BB-wave review, finding 6: past the per-turn budget the results kept
+    coming back with no handle and no explanation, so the model could only
+    guess why open_file suddenly had nothing to accept. Minting is still
+    partial -- as many as fit -- but every result that missed out says so."""
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    registry = ToolRegistry()
+    files = LocalFiles([root], opener=lambda _path: None)
+    # 28 matches per search, so the fifth search crosses the 120 budget
+    # PARTWAY THROUGH (4 x 28 = 112 minted, then 8 more, then 20 without) --
+    # deliberately not a number that divides the budget evenly, so the test
+    # covers a batch that is half-minted rather than all-or-nothing. Short
+    # synthetic paths keep a batch inside the 4096-char content bound, so
+    # the note is asserted on the JSON the model actually receives.
+    matches = [
+        {"path": f"C:/r/p{index:02d}.md", "name": f"p{index:02d}.md"}
+        for index in range(28)
+    ]
+    files.find = lambda query, *args, **kwargs: list(matches)
+    builtin(registry, {}, _FakeWork(), files=files)
+
+    results = [
+        json.loads(_call(registry, "find_file", {"query": "atlas plan"}).content)
+        for _ in range(5)
+    ]
+
+    minted = [item for batch in results for item in batch if "handle" in item]
+    noted = [item for batch in results for item in batch if "handle" not in item]
+    assert len(minted) == 120  # as many as the budget allowed, not zero
+    assert len(noted) == 5 * 28 - 120  # the shortfall is visible, not silent
+    assert all(item["note"] == "handle budget reached" for item in noted)
+    # The fifth search is the one that crosses the line: it must still carry
+    # a usable signal rather than looking like an empty capability.
+    fifth = results[4]
+    assert any("handle" in item for item in fifth)
+    assert any(item.get("note") == "handle budget reached" for item in fifth)
+    assert registry._resolve_handle(minted[-1]["handle"]) is not None

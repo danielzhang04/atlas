@@ -172,6 +172,14 @@ class TurnOwnership:
             raise RuntimeError("voice turn has no asyncio task")
         previous = self._task
         if previous is not None and previous is not task and not previous.done():
+            # cancel() only REQUESTS cancellation and is not awaited, so the
+            # outgoing turn can still be unwinding while this one starts: the
+            # two overlap on shared registry state (the per-turn file-handle
+            # table, cleared by brain.respond -> registry.begin_turn). That
+            # overlap is fail-closed by construction rather than by timing --
+            # handle ids are monotonic for the life of the registry, so an id
+            # the cancelled turn minted can never be re-minted here and a
+            # stale reference resolves to nothing instead of to a new target.
             previous.cancel()
         self._task = task
         try:
@@ -548,12 +556,16 @@ def _sleep_session(
     return True
 
 
-def _record_tool(
-    publisher: state.StatePublisher,
-    name: str,
-    result: tools_mod.ToolResult,
-) -> None:
-    publisher.add_line("tool", f"{name}: {result.status}")
+def _record_tool(name: str, result: tools_mod.ToolResult) -> None:
+    # Tool calls used to be mirrored into the transcript ring as a "tool"
+    # role line; that cluttered the chat with rows Daniel didn't want to see.
+    # worker/tools.py already records every tool call into the traces DB
+    # independently (traces_mod.record_current_tool_call), so nothing here
+    # needs to publish a line. Kept as the on_tool callback target (wired at
+    # the bottom of this module) in case a future non-transcript cue (e.g. a
+    # UI ping) needs the hook -- it takes only what the on_tool contract
+    # gives it; the StatePublisher parameter went with the transcript line.
+    return None
 
 
 def _terminal_line(job) -> str:
@@ -624,18 +636,31 @@ def _engage_wake(
 
 
 async def _connect_mcp_and_settle(mcp, registry, brain: brain_mod.Brain) -> None:
-    """Coalesce initial MCP arrivals into one prompt snapshot rebuild."""
-    settled = False
+    """Refresh the prompt snapshot as each MCP server arrives, then settle.
+
+    connect() returns only once EVERY server has either connected or been
+    declared terminally errored, and one sick server now retries to
+    exhaustion (3 attempts x 60s + backoff = up to ~190s, see
+    config/mcp.yaml defaults). Holding the snapshot until then made every
+    healthy server's tools invisible to the model for that whole window --
+    Atlas would say it cannot read files while the files server had been
+    connected for three minutes (BB-wave review, finding 4). Each arrival
+    rebuilds instead: refresh_tools() is a no-op unless the capability text
+    actually changed, so this costs nothing when nothing changed.
+
+    The settle boundary still matters and is unchanged: begin/mark bracket
+    the MCP state-transition churn (refresh_capabilities stays coalesced),
+    and mark_tools_settled is what first ARMS the cache-floor check, so no
+    floor check runs against a half-connected surface.
+    """
     begin_settle = getattr(brain, "begin_capability_settle", None)
     if begin_settle is not None:
         begin_settle()
 
     def _on_server(_name: str, _registry) -> None:
-        if settled:
-            brain.refresh_tools()
+        brain.refresh_tools()
 
     await mcp.connect(registry, on_server=_on_server)
-    settled = True
     brain.refresh_tools()
     brain.mark_tools_settled()
 
@@ -873,7 +898,7 @@ async def entrypoint(ctx: JobContext) -> None:
             daemon=True,
         ).start()
 
-        services.brain.on_tool = lambda name, result: _record_tool(publisher, name, result)
+        services.brain.on_tool = _record_tool
         pending_terminal = []
 
         def _deliver_terminal(job) -> None:

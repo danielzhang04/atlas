@@ -43,6 +43,16 @@ wake_threshold: 0.5
 wake_patience: 3
 tts_output_device: follow
 
+# Read scope: the built-in LocalFiles tools (find_file, read_file, open_file,
+# open_folder) are confined to these.
 file_roots: [known:Desktop, known:Documents, known:Downloads, C:/Users/danie/kb]
+# Write scope: the ONLY directories the files MCP server is started with, so
+# the only ones its write_file/edit_file/create_directory/move_file (all
+# confirm-gated) can ever touch. Deliberately a subset of file_roots without
+# kb: the kb checkout is read-only to Atlas, and kb changes go through the kb
+# bridge's own mutations gate. Adding a root here is a deliberate widening of
+# what Atlas may write -- Daniel's decision, not a side effect of adding a
+# read root (see config/mcp.yaml, files:).
+file_write_roots: [known:Desktop, known:Documents, known:Downloads]
 
 kb_bridge: {enabled: true, mutations: true, path: "C:/Users/danie/kb-worktrees/atlas-bridge/dashboard/atlas-bridge", origin: "http://127.0.0.1:5317"}
