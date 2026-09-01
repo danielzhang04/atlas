@@ -722,6 +722,12 @@ def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
     defaults = config["defaults"]
 
     assert server["domain"] == "google"
+    # Pins the Track C3 version pin itself: a version bump or a --tools
+    # typo in the checked-in config fails this test rather than silently
+    # spawning a different workspace-mcp release or tool set.
+    assert server["args_override"] == [
+        "workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar",
+    ]
     assert set(server["expose"]) == {
         "search_gmail_messages", "get_gmail_message_content", "get_gmail_thread_content",
         "list_gmail_labels", "get_events", "list_calendars", "query_freebusy",
@@ -947,7 +953,9 @@ def test_one_factory_failure_is_class_only_and_does_not_block_other_server(caplo
                     "broken": {"command": "bad"},
                     "google": {"command": "unused", "instant": ["get_events"]},
                 },
-                "defaults": {"connect_timeout_s": 1},
+                # connect_retries: 1: this test is about a single broken
+                # server not blocking a healthy one, not about retry.
+                "defaults": {"connect_timeout_s": 1, "connect_retries": 1},
             },
             session_factory=factory,
         )
@@ -1030,7 +1038,10 @@ def test_connect_timeout_is_reported_by_class_name():
         servers = McpServers(
             {
                 "servers": {"slow": {"command": "unused"}},
-                "defaults": {"connect_timeout_s": 0.01},
+                # connect_retries: 1 isolates the single-attempt timeout
+                # classification this test is about from the retry-with-
+                # backoff behavior covered by its own tests.
+                "defaults": {"connect_timeout_s": 0.01, "connect_retries": 1},
             },
             session_factory=factory,
         )
@@ -1095,7 +1106,12 @@ def test_connection_failures_have_closed_bounded_details(failure, expected_error
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"broken": {"command": "C:/private/path/missing.exe?token=secret"}}},
+            {
+                "servers": {"broken": {"command": "C:/private/path/missing.exe?token=secret"}},
+                # connect_retries: 1: this test is about single-attempt
+                # detail classification (spawn_failed is otherwise retried).
+                "defaults": {"connect_retries": 1},
+            },
             session_factory=factory,
         )
         await servers.connect(FakeRegistry())
@@ -1234,6 +1250,7 @@ def test_status_detail_vocabulary_rejects_unknown_pairs():
 
     expected = {
         ("connecting", "connection pending"),
+        ("connecting", "retrying (attempt 2 of 3)"),
         ("connected", "ready"),
         ("configured", "signed executable found"),
         ("not_configured", "disabled by configuration"),
@@ -1280,7 +1297,10 @@ def test_tool_listing_failure_is_reported_without_exception_text():
     }]
 
 
-def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
+def test_status_transition_hook_ignores_polls_and_reconnect_replaces_detail():
+    """A fresh top-level connect() call (e.g. a future manual "reconnect")
+    is a different thing from the automatic per-attempt retry-with-backoff
+    covered elsewhere -- connect_retries: 1 isolates that here."""
     attempts = [OSError("first private failure"), FileNotFoundError("second private failure")]
     transitions = []
 
@@ -1289,7 +1309,10 @@ def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"google": {"command": "C:/private/tool.exe"}}},
+            {
+                "servers": {"google": {"command": "C:/private/tool.exe"}},
+                "defaults": {"connect_retries": 1},
+            },
             session_factory=factory,
             on_state=lambda name, state, snapshot: transitions.append((name, state, snapshot)),
         )
@@ -1311,6 +1334,357 @@ def test_status_transition_hook_ignores_polls_and_retry_replaces_detail():
         ("google", "connecting"),
         ("google", "error"),
     ]
+
+
+# --- connect retry-with-backoff (plan Track C3): -------------------------
+
+def test_connect_retries_timeout_then_succeeds_with_observed_backoff():
+    calls = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    good_factory = _memory_factory(_server())
+
+    @asynccontextmanager
+    async def factory(server_name, spec):
+        calls.append(server_name)
+        if len(calls) <= 2:
+            raise TimeoutError("simulated cold-cache resolution")
+        async with good_factory(server_name, spec) as session:
+            yield session
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": True, "tools": 3, "error": None,
+        "state": "connected", "detail": "ready",
+    }]
+    assert len(calls) == 3
+    assert sleeps == [2.0, 8.0]
+
+
+def test_connect_retries_spawn_failure_then_succeeds_with_observed_backoff():
+    """Mirrors the timeout retry test above but for the other retryable
+    class -- a generic exception with no special-cased FileNotFoundError/
+    TimeoutError/McpError shape, which the real _failure_status pipeline
+    falls through to classifying as "spawn failed". Exercises retry
+    end-to-end through the actual classifier and renderer (not a hardcoded
+    "spawn failed" literal) so a change to that fallback path or to the
+    vocabulary's wording is caught here if it stops being retried."""
+    calls = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    good_factory = _memory_factory(_server())
+
+    @asynccontextmanager
+    async def factory(server_name, spec):
+        calls.append(server_name)
+        if len(calls) <= 2:
+            raise RuntimeError("simulated spawn failure")
+        async with good_factory(server_name, spec) as session:
+            yield session
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": True, "tools": 3, "error": None,
+        "state": "connected", "detail": "ready",
+    }]
+    assert len(calls) == 3
+    assert sleeps == [2.0, 8.0]
+
+
+def test_retry_exhausts_after_configured_attempts_and_state_is_visible_between_attempts():
+    observed = []
+    holder: dict = {}
+
+    async def fake_sleep(_seconds):
+        observed.append(holder["servers"].status()[0])
+
+    def factory(_server_name, _spec):
+        raise TimeoutError("simulated cold-cache resolution")
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1, "connect_retries": 2},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        holder["servers"] = servers
+        await servers.connect(FakeRegistry())
+        final = servers.status()
+        await servers.close()
+        return final
+
+    final = asyncio.run(scenario())
+
+    # After attempt 1/2 fails, state stays "connecting" (visible via status())
+    # with a "retrying" detail naming the *next* attempt about to run --
+    # the on_state hook does not fire for this because state didn't change.
+    assert observed == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "TimeoutError", "state": "connecting",
+        "detail": "retrying (attempt 2 of 2)",
+    }]
+    assert final == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "TimeoutError", "state": "error",
+        "detail": "handshake timeout after 1s",
+    }]
+
+
+def test_config_entry_missing_does_not_retry(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text('{"mcpServers": {}}', encoding="utf-8")
+    calls = []
+
+    def factory(_server_name, _spec):
+        calls.append(True)
+        raise AssertionError("session_factory must not run for a config error")
+
+    async def fake_sleep(_seconds):
+        raise AssertionError("must not back off / retry a config error")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+            session_factory=factory,
+            sleep=fake_sleep,
+        )
+        await servers.connect(FakeRegistry())
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": False, "tools": 0, "error": "KeyError",
+        "state": "not_configured", "detail": "config entry missing",
+    }]
+    assert calls == []
+
+
+def test_config_malformed_does_not_retry(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text("{malformed", encoding="utf-8")
+
+    async def fake_sleep(_seconds):
+        raise AssertionError("must not back off / retry a config error")
+
+    async def scenario():
+        servers = McpServers(
+            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            claude_config_path=claude_config,
+            sleep=fake_sleep,
+        )
+        await servers.connect(FakeRegistry())
+        status = servers.status()
+        await servers.close()
+        return status
+
+    status = asyncio.run(scenario())
+
+    assert status == [{
+        "name": "google", "connected": False, "tools": 0,
+        "error": "JSONDecodeError", "state": "error",
+        "detail": "config malformed",
+    }]
+
+
+def test_connect_attempts_and_backoffs_default_when_unconfigured():
+    assert mcp_client._connect_attempts({}) == 3
+    assert mcp_client._connect_backoffs({}) == (2.0, 8.0)
+
+
+def test_connect_retries_rejects_invalid_values():
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": 0})
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": True})
+    with pytest.raises(ValueError, match="connect_retries"):
+        mcp_client._connect_attempts({"connect_retries": "3"})
+
+
+def test_connect_retry_backoff_rejects_invalid_values():
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": []})
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": [2, -1]})
+    with pytest.raises(ValueError, match="connect_retry_backoff_s"):
+        mcp_client._connect_backoffs({"connect_retry_backoff_s": "2,8"})
+
+
+def test_is_retryable_failure_matches_only_timeout_and_spawn_failed():
+    assert mcp_client._is_retryable_failure("error", "spawn failed") is True
+    assert mcp_client._is_retryable_failure("error", "handshake timeout after 60s") is True
+    assert mcp_client._is_retryable_failure("error", "config malformed") is False
+    assert mcp_client._is_retryable_failure("error", "config entry missing") is False
+    assert mcp_client._is_retryable_failure("error", "executable not found: tool.exe") is False
+    assert mcp_client._is_retryable_failure("not_configured", "config entry missing") is False
+
+
+def test_is_retryable_failure_is_derived_from_the_real_vocabulary_renderers():
+    """_is_retryable_failure must not hardcode a copy of the rendered text
+    -- it is checked here against worker.statusdetail's own render function,
+    not a literal, so a future rewording of the "timeout"/"spawn_failed"
+    detail strings cannot silently desync the retry set from the
+    vocabulary (the failure mode the C3 review flagged)."""
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "spawn_failed"),
+    ) is True
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "timeout", timeout_s=42),
+    ) is True
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "config_malformed"),
+    ) is False
+    assert mcp_client._is_retryable_failure(
+        "error", mcp_client.render_status_detail("error", "executable_missing", executable="x.exe"),
+    ) is False
+
+
+# --- args_override / package pin (plan Track C3): -------------------------
+
+def test_args_override_replaces_from_claude_config_argv_without_spawning(tmp_path):
+    claude_config = tmp_path / "claude.json"
+    claude_config.write_text(
+        json.dumps({
+            "mcpServers": {
+                "google-workspace": {
+                    "command": "uvx",
+                    "args": ["workspace-mcp", "--tools", "gmail", "drive", "calendar"],
+                    "env": {"USER_GOOGLE_EMAIL": "daniel.zhang.t1@gmail.com"},
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    seen = []
+
+    def factory(_server_name, spec):
+        seen.append(spec)
+        raise LookupError("must stop before any real spawn")
+
+    async def scenario():
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "from_claude_config": "google-workspace",
+                        "args_override": [
+                            "workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar",
+                        ],
+                    },
+                },
+                "defaults": {"connect_retries": 1},
+            },
+            claude_config_path=claude_config,
+            session_factory=factory,
+        )
+        await servers.connect(FakeRegistry())
+        await servers.close()
+
+    asyncio.run(scenario())
+
+    assert seen[0].command == "uvx"
+    assert seen[0].args == ["workspace-mcp==1.25.2", "--tools", "gmail", "drive", "calendar"]
+    assert seen[0].env == {"USER_GOOGLE_EMAIL": "daniel.zhang.t1@gmail.com"}
+
+
+def test_args_override_rejects_a_malformed_list():
+    with pytest.raises(ValueError, match="args_override"):
+        mcp_client._args_override(["ok", 7])
+    with pytest.raises(ValueError, match="args_override"):
+        mcp_client._args_override("not-a-list")
+
+
+def test_cancellation_during_backoff_kills_tree_and_exits_cleanly():
+    """The existing connect-cancellation test below covers cancellation
+    while suspended entering stdio; this covers the other suspension point
+    the retry loop introduces -- ``await self._sleep(backoff)`` between
+    attempts. A pid is set right at the point of cancellation (simulating a
+    still-tracked child at that suspension point) so the assertion proves
+    the unconditional `finally` cleanup runs, not just the per-attempt
+    cleanup that already ran before the backoff await."""
+    events = []
+    entered_backoff = asyncio.Event()
+
+    def factory(_server_name, _spec):
+        raise TimeoutError("simulated cold-cache resolution")
+
+    async def fake_sleep(_seconds):
+        events.append("backoff entered")
+        entered_backoff.set()
+        await asyncio.Event().wait()  # never set -- must be cancelled to resume
+
+    async def scenario():
+        kills = []
+        servers = McpServers(
+            {
+                "servers": {"google": {"command": "unused"}},
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=factory,
+            sleep=fake_sleep,
+            killer=lambda pid, **kwargs: kills.append((pid, kwargs)),
+        )
+        task = asyncio.create_task(servers.connect(FakeRegistry()))
+        await entered_backoff.wait()
+        servers._server_pids["google"] = 4242
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # A subsequent close() must not raise and must not find an orphan
+        # task still tracked.
+        await servers.close()
+        return kills, task.done(), dict(servers._server_tasks)
+
+    kills, done, remaining_tasks = asyncio.run(scenario())
+
+    assert kills == [(4242, {"check": False})]
+    assert events == ["backoff entered"]
+    assert done is True
+    assert remaining_tasks == {}
 
 
 def test_cancelled_connection_kills_recorded_tree_and_closes_transport():
@@ -1407,7 +1781,12 @@ def test_claude_config_resolves_child_spec_without_leaking_env(tmp_path, caplog)
 
     async def scenario():
         servers = McpServers(
-            {"servers": {"google": {"from_claude_config": "google-workspace"}}},
+            {
+                "servers": {"google": {"from_claude_config": "google-workspace"}},
+                # connect_retries: 1: this test is about the resolved spec
+                # and env leak-safety, not about retry.
+                "defaults": {"connect_retries": 1},
+            },
             claude_config_path=claude_config,
             session_factory=factory,
         )
@@ -1481,7 +1860,9 @@ def test_failed_server_task_ends_and_retains_disconnected_status():
             raise LookupError("unavailable")
 
         servers = McpServers(
-            {"servers": {"broken": {"command": "bad"}}},
+            # connect_retries: 1: this test is about the server task ending
+            # and retaining disconnected status, not about retry.
+            {"servers": {"broken": {"command": "bad"}}, "defaults": {"connect_retries": 1}},
             session_factory=factory,
         )
         await servers.connect(FakeRegistry())

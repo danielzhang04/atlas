@@ -791,8 +791,25 @@ def _capability_system_text(
         and isinstance(item.get("name"), str)
         and item.get("state") in {"connecting", "connected", "not_configured", "error"}
     )
+    # detail is looked up separately (not folded into the sort key) so a
+    # snapshot missing "detail" (older callers, tests) sorts fine instead of
+    # raising when Python compares None against a str tie-breaker.
+    details = {
+        item.get("name"): item.get("detail")
+        for item in mcp_status
+        if isinstance(item, dict)
+    }
     for name, state in states:
-        lines.append(f"{name}: {state}")
+        detail = details.get(name)
+        # Only "error" gets the detail appended: it is the terminal case
+        # where the model needs to say something more specific than "down"
+        # (e.g. "the connector failed to start, I'll retry next launch" for
+        # a spawn/timeout failure vs. a reauth prompt for session_required)
+        # instead of a blanket "access is down". detail always comes from
+        # the closed statusdetail vocabulary, so it is safe to surface
+        # verbatim here.
+        suffix = f" ({detail})" if state == "error" and isinstance(detail, str) and detail else ""
+        lines.append(f"{name}: {state}{suffix}")
         state_count += 1
     if state_count == 0:
         lines.append("none")
