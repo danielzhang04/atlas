@@ -2887,6 +2887,174 @@ def test_describe_rejects_a_non_string_empty_or_malformed_map():
         mcp_client._tool_description({"describe": ["not", "a", "map"]}, "widget", "remote")
 
 
+# --- transform: -------------------------------------------------------
+
+def test_transform_absent_returns_none():
+    assert mcp_client._tool_transform({}, "widget") is None
+
+
+def test_transform_resolves_a_known_name_to_the_named_transformer():
+    assert (
+        mcp_client._tool_transform({"transform": {"widget": "local_time"}}, "widget")
+        is mcp_client._local_time_transform
+    )
+    # A tool not named in the map is untouched even when transform: is present.
+    assert mcp_client._tool_transform({"transform": {"other": "local_time"}}, "widget") is None
+
+
+def test_transform_rejects_an_unknown_transformer_name():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": {"widget": "not_a_real_transformer"}}, "widget")
+
+
+def test_transform_rejects_a_non_string_value():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": {"widget": 7}}, "widget")
+
+
+def test_transform_rejects_a_non_mapping_top_level_config():
+    with pytest.raises(ValueError, match="transform"):
+        mcp_client._tool_transform({"transform": ["not", "a", "map"]}, "widget")
+
+
+def test_transform_is_applied_on_the_mirrored_run_before_bounded_text():
+    class FakeSession:
+        async def call_tool(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(
+                    type="text",
+                    text="Subject: hi\nDate: Mon, 31 Aug 2026 16:55:00 -0700\nFrom: a@b.test",
+                )],
+                isError=False,
+            )
+
+    servers = McpServers({"servers": {}})
+    tool = servers._mirror_tool(
+        "google",
+        {"transform": {"widget": "local_time"}},
+        {},
+        FakeSession(),
+        SimpleNamespace(
+            name="widget", description="d",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    )
+
+    result = asyncio.run(tool.run({}))
+
+    assert "-0700" not in result
+    assert "Date: Mon, 31 Aug 2026" in result
+    assert "Subject: hi" in result
+    assert "From: a@b.test" in result
+
+
+def _date_server() -> FastMCP:
+    server = FastMCP("test-date")
+
+    @server.tool(description="Search Gmail messages.")
+    def search_gmail_messages(query: str) -> str:
+        return f"Found 1 messages matching '{query}':\nDate: Mon, 31 Aug 2026 16:55:00 -0700"
+
+    return server
+
+
+def test_transform_applies_only_on_the_mirrored_path_call_raw_stays_untouched():
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(
+            {
+                "servers": {
+                    "google": {
+                        "command": "unused",
+                        "instant": ["search_gmail_messages"],
+                        "transform": {"search_gmail_messages": "local_time"},
+                    },
+                },
+                "defaults": {"connect_timeout_s": 1},
+            },
+            session_factory=_memory_factory(_date_server()),
+        )
+        await servers.connect(registry)
+        tool = registry.tools[0]
+        mirrored = await tool.run({"query": "x"})
+        raw = await servers.call_raw("google", "search_gmail_messages", {"query": "x"})
+        await servers.close()
+        return mirrored, raw
+
+    mirrored, raw = asyncio.run(scenario())
+
+    assert raw == "Found 1 messages matching 'x':\nDate: Mon, 31 Aug 2026 16:55:00 -0700"
+    assert "-0700" not in mirrored
+    assert mirrored != raw
+
+
+def test_local_time_transform_rewrites_a_foreign_offset_date_line_to_local():
+    from email.utils import parsedate_to_datetime
+
+    raw_date = "Mon, 31 Aug 2026 16:55:00 -0700"
+    expected_local = parsedate_to_datetime(raw_date).astimezone().strftime("%a, %d %b %Y %I:%M %p")
+    text = f"Subject: hi\nDate: {raw_date}\nFrom: a@b.test\n"
+
+    result = mcp_client._local_time_transform(text)
+
+    assert f"Date: {expected_local} " in result
+    assert raw_date not in result
+    assert "Subject: hi" in result
+    assert "From: a@b.test" in result
+
+
+def test_local_time_transform_passes_unparseable_date_lines_through_byte_identical():
+    text = "Date: not a real date at all\nOther-Header: kept\n"
+    assert mcp_client._local_time_transform(text) == text
+
+
+def test_local_time_transform_leaves_a_date_with_no_offset_unchanged():
+    # No numeric/named offset to convert from -- ambiguous, so left as-is.
+    text = "Date: Mon, 31 Aug 2026 16:55:00\n"
+    assert mcp_client._local_time_transform(text) == text
+
+
+def test_local_time_transform_is_idempotent():
+    text = "Date: Mon, 31 Aug 2026 16:55:00 -0700\n"
+    once = mcp_client._local_time_transform(text)
+    twice = mcp_client._local_time_transform(once)
+    assert twice == once
+
+
+def test_local_time_transform_rewrites_every_date_line_in_a_multi_message_thread_dump():
+    # get_gmail_thread_content's real shape (gmail/gmail_tools.py:_format_
+    # thread_content) repeats "=== Message N ===\nFrom: ...\nDate: ..." once
+    # per message in the thread -- every Date: line must be rewritten, not
+    # just the first one a naive .sub(count=1) or non-global replace would
+    # catch.
+    from email.utils import parsedate_to_datetime
+
+    raw_dates = [
+        "Mon, 31 Aug 2026 16:55:00 -0700",
+        "Tue, 01 Sep 2026 09:10:00 +0900",
+        "Tue, 01 Sep 2026 03:00:00 +0000",
+    ]
+    expected = [
+        parsedate_to_datetime(raw).astimezone().strftime("%a, %d %b %Y %I:%M %p")
+        for raw in raw_dates
+    ]
+    text = "Thread ID: t1\nSubject: hi\nMessages: 3\n\n" + "\n\n".join(
+        f"=== Message {i} ===\nFrom: sender{i}@example.com\nDate: {raw}\nTo: daniel@example.com"
+        for i, raw in enumerate(raw_dates, 1)
+    )
+
+    result = mcp_client._local_time_transform(text)
+
+    for raw, exp in zip(raw_dates, expected):
+        assert raw not in result
+        assert f"Date: {exp} " in result
+    # Message count and structure around the Date: lines are untouched.
+    assert result.count("=== Message") == 3
+    assert "From: sender1@example.com" in result
+    assert "From: sender2@example.com" in result
+    assert "From: sender3@example.com" in result
+
+
 # --- domain: ---------------------------------------------------------------
 
 def test_domain_is_stored_on_mirrored_tools_when_configured():

@@ -1369,12 +1369,76 @@ def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
     assert launched == [str(root.resolve()), str(allowed.resolve())]
 
 
-def test_count_mail_sums_pages_and_accepts_both_token_shapes():
+# count_mail counts DISTINCT Gmail thread ids (conversations), matching what
+# Daniel's Gmail UI shows -- not message lines. These fixtures mirror the
+# real search_gmail_messages text shape (workspace-mcp 1.25.2,
+# gmail/gmail_tools.py:_format_gmail_results_plain): a "📧 MESSAGES:" section
+# with one "  N. Message ID: ..." block per message, each carrying its own
+# "     Thread ID: <id>" line, plus a trailing pagination line.
+#
+# The pagination line matters: the REAL server (gmail_tools.py:1583-1587)
+# emits the token mid-sentence -- "...call search_gmail_messages again with
+# page_token='<token>'" -- not a line-anchored "page_token: <token>". An
+# earlier version of these fixtures used only the line-anchored shape, which
+# _NEXT_PAGE_TOKEN never actually saw from the real server: bounded_count
+# silently stopped after page 1 for every >500-message query and reported
+# exact:true (adversarial review, finding 2). token_style="real" (the
+# default) is what every multi-page test below now exercises; the two
+# line-anchored styles are kept only to prove the regex's legacy alternates
+# still work (see test_count_mail_sums_pages_and_accepts_both_token_shapes).
+def _gmail_search_page(
+    query: str,
+    thread_ids: list[str],
+    *,
+    next_token: str | None = None,
+    token_style: str = "real",
+) -> str:
+    lines = [f"Found {len(thread_ids)} messages matching '{query}':", "", "\U0001F4E7 MESSAGES:"]
+    for i, thread_id in enumerate(thread_ids, 1):
+        message_id = f"msg-{thread_id}-{i}"
+        lines.extend([
+            f"  {i}. Message ID: {message_id}",
+            "     Subject: Test subject",
+            "     From: sender@example.com",
+            "     Date: Mon, 31 Aug 2026 16:55:00 -0700",
+            f"     Web Link: https://mail.google.com/mail/u/0/#inbox/{message_id}",
+            f"     Thread ID: {thread_id}",
+            f"     Thread Link: https://mail.google.com/mail/u/0/#inbox/{thread_id}",
+            "",
+        ])
+    lines.extend([
+        "\U0001F4A1 USAGE:",
+        "  • Pass the Message IDs as a list to get_gmail_messages_content_batch()",
+    ])
+    if next_token:
+        lines.append("")
+        if token_style == "real":
+            lines.append(
+                "\U0001F4C4 PAGINATION: To get the next page, call search_gmail_messages "
+                f"again with page_token='{next_token}'"
+            )
+        else:
+            prefix = "Next page token" if token_style == "next_page_token" else "page_token"
+            lines.append(f"{prefix}: {next_token}")
+    return "\n".join(lines)
+
+
+def test_count_mail_sums_pages_and_accepts_the_real_and_legacy_token_shapes():
+    # Page 1 uses the real workspace-mcp 1.25.2 pagination line (mid-sentence
+    # page_token='...'); page 2 uses one of the line-anchored legacy shapes
+    # the regex keeps as an alternate. Both must be parsed for the walk to
+    # reach page 3.
     calls = []
     responses = [
-        "Found 500 messages matching 'label:archive':\n1. first\nNext page token: token-2",
-        "Found 500 messages matching 'label:archive':\n1. next\npage_token: token-3",
-        "Found 17 messages matching 'label:archive':\n1. last",
+        _gmail_search_page(
+            "label:archive", [f"p1-{i}" for i in range(500)],
+            next_token="token-2", token_style="real",
+        ),
+        _gmail_search_page(
+            "label:archive", [f"p2-{i}" for i in range(500)],
+            next_token="token-3", token_style="page_token",
+        ),
+        _gmail_search_page("label:archive", [f"p3-{i}" for i in range(17)]),
     ]
 
     async def search(arguments):
@@ -1386,7 +1450,9 @@ def test_count_mail_sums_pages_and_accepts_both_token_shapes():
 
     result = _call(registry, "count_mail", {"query": "label:archive"})
 
-    assert json.loads(result.content) == {"query": "label:archive", "count": 1017, "exact": True}
+    assert json.loads(result.content) == {
+        "query": "label:archive", "conversations": 1017, "exact": True,
+    }
     assert calls == [
         {
             "query": "label:archive",
@@ -1411,8 +1477,8 @@ def test_count_mail_sums_pages_and_accepts_both_token_shapes():
 def test_count_mail_reports_inbox_and_primary_with_two_bounded_searches():
     calls = []
     responses = [
-        "Found 61 messages matching 'in:inbox':\n1. first",
-        "Found 14 messages matching 'in:inbox category:primary':\n1. first",
+        _gmail_search_page("in:inbox", [f"inbox-{i}" for i in range(61)]),
+        _gmail_search_page("in:inbox category:primary", [f"primary-{i}" for i in range(14)]),
     ]
 
     async def search(arguments):
@@ -1424,7 +1490,7 @@ def test_count_mail_reports_inbox_and_primary_with_two_bounded_searches():
 
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
-    assert result == ToolResult("ok", "61 in your inbox, 14 in Primary")
+    assert result == ToolResult("ok", "61 conversations in your inbox, 14 in Primary")
     assert [call["query"] for call in calls] == [
         "in:inbox",
         "in:inbox category:primary",
@@ -1438,10 +1504,11 @@ def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
 
     async def search(arguments):
         calls.append(arguments)
-        token = len(calls) + 1
-        return (
-            f"Found 500 messages matching 'label:archive':\n"
-            f"Next page token: token-{token}"
+        page = len(calls)
+        return _gmail_search_page(
+            "label:archive",
+            [f"p{page}-{i}" for i in range(500)],
+            next_token=f"token-{page + 1}",
         )
 
     registry = ToolRegistry()
@@ -1449,7 +1516,9 @@ def test_count_mail_stops_after_four_pages_and_marks_the_lower_bound():
 
     result = _call(registry, "count_mail", {"query": "label:archive"})
 
-    assert json.loads(result.content) == {"query": "label:archive", "count": 2000, "exact": False}
+    assert json.loads(result.content) == {
+        "query": "label:archive", "conversations": 2000, "exact": False,
+    }
     assert len(calls) == 4
 
 
@@ -1486,11 +1555,14 @@ def test_count_mail_reports_when_google_is_not_connected():
     )
 
 
-def test_count_mail_stops_inexactly_when_a_page_token_repeats():
-    responses = [
-        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
-        "Found 500 messages matching 'label:archive':\nNext page token: repeated",
-    ]
+def test_count_mail_stops_inexactly_when_a_page_token_repeats_and_dedupes_the_repeated_page():
+    # A repeated page_token means the same page was handed back twice --
+    # since the same 500 thread ids appear on both "pages", the distinct
+    # count must not double-count them (500, not 1000).
+    page = _gmail_search_page(
+        "label:archive", [f"dup-{i}" for i in range(500)], next_token="repeated",
+    )
+    responses = [page, page]
 
     async def search(_arguments):
         return responses.pop(0)
@@ -1502,14 +1574,46 @@ def test_count_mail_stops_inexactly_when_a_page_token_repeats():
 
     assert json.loads(result.content) == {
         "query": "label:archive",
-        "count": 1000,
+        "conversations": 500,
         "exact": False,
+    }
+
+
+def test_count_mail_accumulates_distinct_threads_that_span_pages_without_double_counting():
+    # A conversation's messages can land on either side of a search page
+    # boundary; the same thread id showing up on page 1 and page 2 must
+    # still count as one conversation.
+    page1 = _gmail_search_page(
+        "label:archive",
+        ["shared"] + [f"p1-{i}" for i in range(499)],
+        next_token="token-2",
+    )
+    page2 = _gmail_search_page(
+        "label:archive", ["shared"] + [f"p2-{i}" for i in range(16)],
+    )
+    responses = [page1, page2]
+
+    async def search(_arguments):
+        return responses.pop(0)
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:archive"})
+
+    # 500 distinct on page 1 + 16 new on page 2 (the 17th, "shared", already counted).
+    assert json.loads(result.content) == {
+        "query": "label:archive",
+        "conversations": 516,
+        "exact": True,
     }
 
 
 def test_count_mail_rejects_a_next_token_after_a_partial_page():
     async def search(_arguments):
-        return "Found 17 messages matching 'in:inbox':\nNext page token: invalid"
+        return _gmail_search_page(
+            "in:inbox", [f"t{i}" for i in range(17)], next_token="invalid",
+        )
 
     registry = ToolRegistry()
     register_count_mail(registry, search)
@@ -1517,6 +1621,35 @@ def test_count_mail_rejects_a_next_token_after_a_partial_page():
     result = _call(registry, "count_mail", {"query": "in:inbox"})
 
     assert result == ToolResult("error", "unexpected mail search result")
+
+
+def test_count_mail_fails_closed_when_a_page_has_messages_but_no_thread_id_lines():
+    async def search(_arguments):
+        # Message count present, but the response has no "Thread ID:" line
+        # for any message -- not the shape count_mail is built against, so
+        # it must refuse rather than silently fall back to a message count.
+        return "Found 3 messages matching 'in:inbox':\n\n(malformed: no message details)"
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "in:inbox"})
+
+    assert result == ToolResult("error", "unexpected mail search result")
+
+
+def test_count_mail_does_not_fail_closed_on_a_genuinely_empty_result():
+    async def search(_arguments):
+        return "Found 0 messages matching 'label:nonexistent':"
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:nonexistent"})
+
+    assert json.loads(result.content) == {
+        "query": "label:nonexistent", "conversations": 0, "exact": True,
+    }
 
 
 # --- C1: per-turn file handles -------------------------------------------

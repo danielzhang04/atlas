@@ -150,11 +150,16 @@ def test_real_settle_path_preserves_google_hook_for_count_mail(monkeypatch, tmp_
 
         async def call_tool(self, _tool, *, arguments, read_timeout_seconds):
             del read_timeout_seconds
-            count = 61 if arguments["query"] == "in:inbox" else 14
+            is_inbox = arguments["query"] == "in:inbox"
+            count = 61 if is_inbox else 14
+            label = "inbox" if is_inbox else "primary"
+            thread_lines = "\n".join(
+                f"     Thread ID: {label}-{i}" for i in range(count)
+            )
             return SimpleNamespace(
                 content=[SimpleNamespace(
                     type="text",
-                    text=f"Found {count} messages matching query",
+                    text=f"Found {count} messages matching query\n{thread_lines}",
                 )],
                 isError=False,
             )
@@ -179,7 +184,7 @@ def test_real_settle_path_preserves_google_hook_for_count_mail(monkeypatch, tmp_
 
     try:
         result = asyncio.run(scenario())
-        assert result.content == "61 in your inbox, 14 in Primary"
+        assert result.content == "61 conversations in your inbox, 14 in Primary"
     finally:
         built.store.close()
 
@@ -371,9 +376,11 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
             self.on_state = kwargs["on_state"]
             self.account_values = kwargs["account_values"]
             self.calls = []
+            inbox_threads = "\n".join(f"     Thread ID: inbox-{i}" for i in range(61))
+            primary_threads = "\n".join(f"     Thread ID: primary-{i}" for i in range(14))
             self.responses = [
-                "Found 61 messages matching 'in:inbox':\n1. first",
-                "Found 14 messages matching 'in:inbox category:primary':\n1. first",
+                f"Found 61 messages matching 'in:inbox':\n1. first\n{inbox_threads}",
+                f"Found 14 messages matching 'in:inbox category:primary':\n1. first\n{primary_threads}",
             ]
 
         def status(self):
@@ -409,7 +416,7 @@ def test_build_registers_count_mail_before_google_connects_and_swaps_in_raw_sear
         }])
         result = asyncio.run(built.registry.call("count_mail", {"query": "in:inbox"}))
 
-        assert result.content == "61 in your inbox, 14 in Primary"
+        assert result.content == "61 conversations in your inbox, 14 in Primary"
         assert built.mcp.calls == [
             (
                 "google",

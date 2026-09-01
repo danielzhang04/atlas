@@ -5,10 +5,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 from typing import Any, AsyncContextManager, TYPE_CHECKING
@@ -533,6 +535,91 @@ def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_descrip
             raise ValueError("invalid MCP describe value")
         return override
     return remote_description
+
+
+_DATE_LINE = re.compile(r"^([ \t]*Date:[ \t]*)(.+)$", re.MULTILINE)
+# Windows has no stdlib IANA tz database (zoneinfo needs the optional tzdata
+# package there), so Python's own tzname() returns Windows' full display
+# name ("Eastern Daylight Time") rather than a short code. This is a small,
+# closed map for the continental-US zones Atlas actually runs in; an unlisted
+# name falls back to itself unabbreviated rather than guessing.
+_TZ_ABBREVIATIONS = {
+    "Eastern Standard Time": "EST",
+    "Eastern Daylight Time": "EDT",
+    "Central Standard Time": "CST",
+    "Central Daylight Time": "CDT",
+    "Mountain Standard Time": "MST",
+    "Mountain Daylight Time": "MDT",
+    "Pacific Standard Time": "PST",
+    "Pacific Daylight Time": "PDT",
+    "Alaskan Standard Time": "AKST",
+    "Alaskan Daylight Time": "AKDT",
+    "Hawaiian-Aleutian Standard Time": "HST",
+    "Hawaiian-Aleutian Daylight Time": "HDT",
+    "UTC": "UTC",
+}
+
+
+def _date_line_to_local(match: re.Match) -> str:
+    prefix, raw = match.group(1), match.group(2)
+    try:
+        parsed = parsedate_to_datetime(raw.strip())
+    except Exception:
+        # Date: is a sender-controlled header (any Gmail sender can put
+        # anything here) -- catch broadly rather than naming stdlib
+        # exception types the parser happens to raise today, so malformed
+        # or adversarial input can never crash the turn; just pass the
+        # original line through untouched.
+        return match.group(0)
+    if parsed.tzinfo is None:
+        # No numeric/named offset to convert from -- leave it rather than
+        # guess which timezone the sender meant (also makes a second pass
+        # over an already-converted line a no-op: astimezone() never
+        # attaches a naive result, so a naive re-parse always lands here).
+        return match.group(0)
+    local = parsed.astimezone()
+    tzname = local.tzname() or ""
+    tzname = _TZ_ABBREVIATIONS.get(tzname, tzname)
+    rendered = local.strftime("%a, %d %b %Y %I:%M %p")
+    return f"{prefix}{rendered} {tzname}".rstrip()
+
+
+def _local_time_transform(text: str) -> str:
+    """Rewrite ``Date: <rfc2822>`` lines to Daniel's local time.
+
+    The Gmail read tools (search/get message/get thread) only ever surface
+    the sender's raw RFC 2822 Date header, which is in the SENDER's
+    timezone, not Daniel's -- timezone conversion was otherwise left to the
+    model, which then spoke foreign timezones back to him. Applied
+    mirror-only (see _mirror_tool.run), before _bounded_text. Any line that
+    doesn't parse as an RFC 2822 date passes through byte-identical.
+
+    Not header-scoped: this matches any column-0 ``Date:`` line, including
+    one that happens to sit inside a quoted/forwarded email body in the
+    message text (sender-controlled, up to the ~20k char message content
+    these tools return). Reviewed as harmless -- a quoted date getting
+    localized too is not a taint or accuracy problem here -- but it means
+    "header" is a simplification of what actually gets rewritten.
+    """
+    return _DATE_LINE.sub(_date_line_to_local, text)
+
+
+# Named, host-side transformers only -- config never supplies code (rule 3).
+_TRANSFORMERS: dict[str, Callable[[str], str]] = {
+    "local_time": _local_time_transform,
+}
+
+
+def _tool_transform(server_cfg: Mapping, remote_tool_name: str) -> Callable[[str], str] | None:
+    transform = server_cfg.get("transform", {})
+    if not isinstance(transform, Mapping):
+        raise ValueError("invalid MCP transform map")
+    if remote_tool_name not in transform:
+        return None
+    name = transform[remote_tool_name]
+    if not isinstance(name, str) or name not in _TRANSFORMERS:
+        raise ValueError("invalid MCP transform value")
+    return _TRANSFORMERS[name]
 
 
 def _server_domain(server_cfg: Mapping) -> str | None:
@@ -1157,6 +1244,7 @@ class McpServers:
             server_cfg.get("account_param"),
         )
         description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
+        transform = _tool_transform(server_cfg, remote_tool.name)
 
         async def run(arguments: dict) -> str:
             text = await self._call_session(
@@ -1166,6 +1254,11 @@ class McpServers:
                 remote_tool.name,
                 arguments,
             )
+            # Mirror-only: call_raw/_call_session keep returning the
+            # untouched remote text for count_mail's own parser, which
+            # matches on the raw "Found N messages"/"Thread ID:" shape.
+            if transform is not None:
+                text = transform(text)
             return _bounded_text(text)
 
         return Tool(
