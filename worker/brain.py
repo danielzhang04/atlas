@@ -133,6 +133,15 @@ class _Registry(Protocol):
     def begin_turn(self) -> None:
         ...
 
+    def content_bearing(self, name: str) -> bool | None:
+        """Declared taint classification, or None when undeclared.
+
+        Declared here so a registry implementation that silently drops it --
+        which would degrade every tool back to the name-shape fallback -- is a
+        type error rather than a quiet loss of the config-driven answer.
+        """
+        ...
+
     async def call(
         self,
         name: str,
@@ -721,7 +730,7 @@ class Brain:
                         })
                         if self.on_tool is not None:
                             self.on_tool(name, result)
-                        if _content_bearing_tool(name):
+                        if _content_bearing_tool(self.registry, name):
                             tainted = True
                     messages.extend((
                         {"role": "assistant", "content": [_block_dict(block) for block in content]},
@@ -835,7 +844,26 @@ def _capability_system_text(
     return "\n".join(lines)
 
 
-def _content_bearing_tool(name: str) -> bool:
+def _content_bearing_tool(registry: Any, name: str) -> bool:
+    """Does this tool's result taint the rest of the turn?
+
+    The registry is the authority: every tool declares it, host tools from
+    _HOST_CONTENT_BEARING and MCP tools from config/mcp.yaml's per-server
+    `content_bearing:` map (default true, fail closed).
+
+    This used to be decided by the tool's NAME alone -- "__" in name -- which
+    is a fine default but a bad rule. It tainted files__list_allowed_directories,
+    whose response is nothing but the CLI allowlist this host handed the
+    server, so merely asking "which folders can you reach?" made every
+    path-bearing tool refuse for the rest of the turn: one orientation call
+    and Atlas went silent instead of opening the folder. The name shape stays
+    as the fallback for a name the registry does not know, so an unregistered
+    or dynamically-renamed tool is still assumed to bear content.
+    """
+    lookup = getattr(registry, "content_bearing", None)
+    declared = lookup(name) if callable(lookup) else None
+    if declared is not None:
+        return declared
     return "__" in name or name == "read_file"
 
 

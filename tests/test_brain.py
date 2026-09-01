@@ -2146,3 +2146,126 @@ def test_split_spoken_uses_sentence_newline_and_length_boundaries():
     assert len(chunks[0]) <= 160
     assert chunks[0].endswith(" ")
     assert remainder
+
+
+# --- taint classified from config, not from the tool's name (CC3) -----------
+
+def _files_brain(tmp_path, first_tool, *, content_bearing):
+    """A real registry over one named root, plus one MCP-shaped tool.
+
+    The model reads that tool, then tries to open the root BOTH ways: by name
+    and by path. What each attempt does is the whole question this unit turns
+    from an accident of the tool's name into a declared fact.
+    """
+    from worker.localfiles import LocalFiles
+
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    launched: list[str] = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name=first_tool,
+        description="Test tool.",
+        input_schema={"type": "object", "properties": {}},
+        run=lambda _arguments: return_value("C:/Users/danie/Downloads"),
+        content_bearing=content_bearing,
+    ))
+    builtin(registry, {}, BrainWork(), files=LocalFiles(
+        [{"path": str(downloads), "name": "downloads"}],
+        folder_opener=launched.append,
+    ))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name=first_tool)], stop_reason="tool_use"),
+        FakeStream(
+            content=[
+                tool_block(
+                    call_id="by_root", name="open_folder", arguments={"root": "downloads"},
+                ),
+                tool_block(
+                    call_id="by_path", name="open_folder",
+                    arguments={"path": str(downloads)},
+                ),
+            ],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Opened."], content=[text_block("Opened.")]),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "Which folders can you reach? Open downloads")) == [
+        "Opened.",
+    ]
+    by_root, by_path = client.messages.calls[2]["messages"][-1]["content"]
+    return by_root, by_path, launched, downloads
+
+
+def test_a_host_authored_mcp_result_does_not_taint_the_turn(tmp_path):
+    """The regression this unit exists for.
+
+    files__list_allowed_directories returns nothing but the CLI allowlist this
+    host handed the server. Under the old name-shape rule the "__" made it
+    content-bearing, so merely asking Atlas which folders it could reach
+    refused every later path -- the misstep that turned into silence.
+    """
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "files__list_allowed_directories", content_bearing=False,
+    )
+
+    assert by_root["is_error"] is False
+    # Nothing tainted the turn, so a plain path works again too.
+    assert by_path["is_error"] is False
+    assert json.loads(by_path["content"]) == {"opened": str(downloads.resolve())}
+    assert launched == [str(downloads.resolve()), str(downloads.resolve())]
+
+
+def test_a_genuinely_content_bearing_result_still_refuses_paths_but_not_roots(tmp_path):
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "google__search_gmail_messages", content_bearing=True,
+    )
+
+    # The wall still stands where it matters: a model-authored path dies.
+    assert by_path["is_error"] is True
+    assert by_path["content"] == (
+        "refused after external content; use a handle from an earlier find_file "
+        "result in this turn, or ask Daniel again next turn"
+    )
+    # A root is one of N host-authored constants, so it survives -- which is
+    # what keeps "open my downloads" answerable after reading mail.
+    assert by_root["is_error"] is False
+    assert json.loads(by_root["content"]) == {"opened": str(downloads.resolve())}
+    assert launched == [str(downloads.resolve())]
+
+
+def test_an_undeclared_mcp_tool_still_taints_by_name_shape(tmp_path):
+    """The fallback stays fail-closed.
+
+    A tool that declares nothing -- an unconfigured server, a Tool built
+    outside the mirror -- must not be assumed harmless just because the
+    registry has no answer for it.
+    """
+    by_root, by_path, launched, downloads = _files_brain(
+        tmp_path, "notion__query_database", content_bearing=None,
+    )
+
+    assert by_path["is_error"] is True
+    assert by_root["is_error"] is False
+    assert launched == [str(downloads.resolve())]
+
+
+def test_content_bearing_lookup_prefers_the_registry_over_the_name_shape():
+    class Declaring:
+        def content_bearing(self, name):
+            return {"quiet__tool": False, "loud_tool": True}.get(name)
+
+    registry = Declaring()
+
+    # Declared values win in both directions...
+    assert brain_mod._content_bearing_tool(registry, "quiet__tool") is False
+    assert brain_mod._content_bearing_tool(registry, "loud_tool") is True
+    # ...and anything undeclared falls back to the old, fail-closed shape.
+    assert brain_mod._content_bearing_tool(registry, "google__read") is True
+    assert brain_mod._content_bearing_tool(registry, "read_file") is True
+    assert brain_mod._content_bearing_tool(registry, "find_file") is False
+    # A registry that cannot answer at all (an older double) is not a crash.
+    assert brain_mod._content_bearing_tool(object(), "google__read") is True
+    assert brain_mod._content_bearing_tool(None, "find_file") is False

@@ -45,7 +45,58 @@ tts_output_device: follow
 
 # Read scope: the built-in LocalFiles tools (find_file, read_file, open_file,
 # open_folder) are confined to these.
-file_roots: [known:Desktop, known:Documents, known:Downloads, C:/Users/danie/kb]
+#
+# Each entry is also a NAME the model can pass as open_folder's `root` (and as
+# find_file's optional `root` scope): a known: entry is named by its folder
+# name, a bare path by its basename, and the {path:, name:} form names a root
+# explicitly. Those names become a closed enum in the tool schemas, which is
+# both how the model learns the roots exist and why a root survives the taint
+# wall -- it is one of N host-authored constants, not a model-authored path.
+# Names here: desktop, documents, downloads, kb, home.
+#
+# The four narrow roots are kept alongside home deliberately, even though home
+# contains three of them: they keep the enum ergonomic ("open my downloads")
+# and keep those searches sharp. Overlap is handled -- find dedupes both the
+# results and the directories it walks -- and confinement is unaffected, since
+# every path is checked against the roots either way.
+#
+# home is wide, so searches under it are bounded rather than exhaustive: the
+# scan keeps the depth-6 / 2s budget it has always had, which means a home-wide
+# find_file can be PARTIAL. In practice every search now costs the FULL 2s --
+# there is enough tree to exhaust the budget, so the old "finishes early on a
+# small root" case is gone and 2s is a floor, not a ceiling. Prefer a root:
+# scope when the folder is known; it is the same 2s, spent in one place.
+#
+# ORDER HERE DOES NOT DECIDE WHAT GETS SEARCHED. Each root is given a fair
+# share of the remaining budget (worker/localfiles.py find), so the last entry
+# cannot be starved by the ones above it -- which is what happened when home
+# was added under a single shared deadline: the four narrow roots spent the
+# whole 2s and files sitting directly in ~ were unfindable while the search
+# reported nothing found. Order is therefore left in narrowest-to-widest
+# reading order rather than tuned.
+#
+# One deliberate loss from the hidden-component rule: dot directories inside the
+# NARROW roots are no longer readable either -- kb/.claude and kb/.github used to
+# be. Credential exposure is not separable per root by filename, so the rule is
+# uniform; if those files are wanted back, that is a scoped decision to make
+# explicitly rather than a side effect of widening to home.
+#
+# Credentials are not in scope at any width, for THESE tools: worker/localfiles.py
+# refuses AppData, every hidden dot component (.ssh, .aws, .claude, .mcp.json,
+# .git-credentials, ...), and credential-stemmed names (credentials.*, token.*,
+# client_secret*, secrets.*, id_rsa*) at the single resolve() choke point --
+# checked both lexically and on the resolved path, so 8.3 short names and
+# trailing dots cannot walk past it. A root may not itself sit inside a hidden
+# directory. So constitution rule 1 holds structurally here, not by the accident
+# of a narrow root. Note the scope of that claim: it covers find_file, read_file,
+# open_file and open_folder. launch_work is NOT bounded by it -- it hands a brief
+# to a background claude --bg with its own filesystem access.
+file_roots:
+  - known:Desktop
+  - known:Documents
+  - known:Downloads
+  - C:/Users/danie/kb
+  - {path: C:/Users/danie, name: home}
 # Write scope: the ONLY directories the files MCP server is started with, so
 # the only ones its write_file/edit_file/create_directory/move_file (all
 # confirm-gated) can ever touch. Deliberately a subset of file_roots without

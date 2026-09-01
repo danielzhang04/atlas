@@ -294,15 +294,17 @@ _ROOTS_ENABLED_REFERENCES = {
 }
 
 
-def _validated_roots(atlas: Mapping, key: str) -> tuple[str, ...]:
+def _validated_roots(atlas: Mapping, key: str) -> tuple[Any, ...]:
     """The exact validation worker/runtime.py applies to file_roots before
     building the built-in LocalFiles tools -- reused here, for either roots
     key, so a malformed entry fails the same way for every consumer of it."""
+    from .localfiles import valid_file_root
+
     raw_roots = atlas.get(key, ())
     if (
         isinstance(raw_roots, (str, bytes))
         or not isinstance(raw_roots, (list, tuple))
-        or not all(isinstance(root, str) and root.strip() for root in raw_roots)
+        or not all(valid_file_root(root) for root in raw_roots)
     ):
         raise ValueError(f"invalid Atlas configuration: {key}")
     return tuple(raw_roots)
@@ -533,6 +535,28 @@ def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_descrip
             raise ValueError("invalid MCP describe value")
         return override
     return remote_description
+
+
+def _tool_content_bearing(server_cfg: Mapping, remote_tool_name: str) -> bool:
+    """Whether this remote tool's output can taint the turn.
+
+    Defaults TRUE for every MCP tool, and stays true for anything absent from
+    the map -- fail closed. An unconfigured remote tool is assumed to return
+    text Atlas did not author, which is the whole premise of the taint wall.
+    Marking one false is a deliberate, reviewed statement that its output is
+    host-authored: today the only such entry is the files server's
+    list_allowed_directories, whose entire response is the CLI allowlist this
+    host passed it on the command line.
+    """
+    configured = server_cfg.get("content_bearing", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP content_bearing map")
+    if remote_tool_name not in configured:
+        return True
+    value = configured[remote_tool_name]
+    if not isinstance(value, bool):
+        raise ValueError("invalid MCP content_bearing value")
+    return value
 
 
 def _server_domain(server_cfg: Mapping) -> str | None:
@@ -1175,6 +1199,7 @@ class McpServers:
             policy=policy_for(server_cfg, defaults, remote_tool.name),
             run=run,
             domain=_server_domain(server_cfg),
+            content_bearing=_tool_content_bearing(server_cfg, remote_tool.name),
             escalate=_compile_instant_when(server_cfg, remote_tool.name),
         )
 
