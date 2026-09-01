@@ -30,16 +30,19 @@ class FakeBrain:
 
 
 class FakeSnapshotBrain:
-    def __init__(self) -> None:
+    def __init__(self, log: list[str] | None = None) -> None:
         self.refreshes = 0
         self.settles = 0
+        self.log = log if log is not None else []
 
     def refresh_tools(self) -> bool:
         self.refreshes += 1
+        self.log.append("refresh")
         return True
 
     def mark_tools_settled(self) -> None:
         self.settles += 1
+        self.log.append("settle")
 
 
 class FakeSession:
@@ -256,8 +259,14 @@ def test_submit_voice_turn_streams_into_say_and_mirrors_the_exchange():
     ]
 
 
-def test_mcp_prompt_snapshot_settles_once_after_two_staggered_servers():
+def test_mcp_prompt_snapshot_refreshes_on_each_arrival_not_only_at_settle():
+    """A server that retries to exhaustion holds connect() for up to ~190s
+    (config/mcp.yaml: 3 attempts x 60s + backoff). The tools of servers that
+    already arrived must be in the prompt before that, not after it, or
+    Atlas denies capabilities it has had for minutes (BB-wave review,
+    finding 4). The settle boundary still runs exactly once, last."""
     delays = []
+    log = []
 
     async def fake_sleep(delay):
         delays.append(delay)
@@ -266,15 +275,23 @@ def test_mcp_prompt_snapshot_settles_once_after_two_staggered_servers():
     class FakeMcp:
         async def connect(self, registry, *, on_server):
             registry.append("one")
+            log.append("arrived one")
             on_server("one", registry)
+            # Stands in for the second server still retrying.
             await fake_sleep(1)
             registry.append("two")
+            log.append("arrived two")
             on_server("two", registry)
 
-    brain = FakeSnapshotBrain()
+    brain = FakeSnapshotBrain(log)
     asyncio.run(app._connect_mcp_and_settle(FakeMcp(), [], brain))
 
-    assert brain.refreshes == 1
+    # The first server's refresh lands BEFORE the second one arrives.
+    assert log == [
+        "arrived one", "refresh",
+        "arrived two", "refresh",
+        "refresh", "settle",
+    ]
     assert brain.settles == 1
     assert delays == [1]
 
@@ -372,8 +389,10 @@ def test_tool_events_no_longer_reach_the_transcript_and_terminal_jobs_are_mirror
     # _record_tool is the on_tool callback wired to services.brain.on_tool; it
     # used to mirror a "tool" role line into the transcript ring, but that
     # cluttered the chat -- tool calls are already recorded in the traces DB
-    # independently (worker/tools.py). It must be a no-op on the transcript.
-    app._record_tool(publisher, "open", SimpleNamespace(status="ok"))
+    # independently (worker/tools.py). It must be a no-op on the transcript,
+    # and it takes exactly the on_tool signature (name, result): the
+    # publisher parameter went away with the transcript line it published.
+    app._record_tool("open", SimpleNamespace(status="ok"))
     succeeded = SimpleNamespace(state=JobState.SUCCEEDED, summary="  Draft   verified.  ")
     app._announce_terminal(succeeded, publisher, session, engagement)
     engagement.dismiss()

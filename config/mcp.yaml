@@ -5,12 +5,17 @@
 # handoffs/2026-08-27-atlas-xwave.md /health line -- server counts drift
 # upstream over time, which is exactly what the missing-exposed-tools
 # connect-time warning in mcp_client.py is for), 2-3x the ~30-50
-# model-accuracy threshold once combined with kb (32) and the ~19 built-in
+# model-accuracy threshold once combined with kb (32) and the 19 built-in
 # host tools. Curating the surface, not adding new servers, is the point
 # (see docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0). C0 curated
-# total: kb 32 + google 14 + chrome-devtools 7 + ~19 built-in = 72 (was
-# 116). Track C2 then adds the files server's 13 tools on top: 72 + 13 =
-# 85, back over the ~30-50 (and even the looser 72) accuracy budget C0 set.
+# total, recounted exactly (BB-wave review nit): kb 32 (the bridge's whole
+# offered set -- no expose: here, it is curated server-side) + google 14
+# (expose: below) + chrome-devtools 7 (expose: below) + 19 built-in host
+# tools model-visible from the registry (14 desktop/work/open tools, 4
+# localfiles tools, count_mail; confirm/cancel_pending are host-only and
+# never in schemas()) = 72 (was 116). Track C2 then adds the files
+# server's 12 exposed tools on top: 72 + 12 = 84, back over the ~30-50
+# (and even the looser 72) accuracy budget C0 set.
 # The plan (Track C, C2 row) prioritizes the files domain over holding that
 # number this wave; flagged here for the per-turn tool-projection follow-up
 # C0's budget work implied (e.g. only project domains relevant to the
@@ -26,10 +31,18 @@ servers:
       ATLAS_KB_BRIDGE_ENABLED: kb_bridge.enabled
       ATLAS_KB_MUTATIONS_ENABLED: kb_bridge.mutations
       ATLAS_KB_ORIGIN: kb_bridge.origin
+    # Reads only. kb_deployment_inspect and kb_asset_pull_inspect were
+    # listed here but do not exist on the bridge (BB-wave review, finding
+    # 10) -- an instant: name the server never offers is silently inert, so
+    # they are removed rather than left as decoration; kb_grades, a real
+    # read the bridge does offer, was missing and is added. Everything not
+    # named here (kb_*_create/update/launch/control/dispatch,
+    # kb_human_respond, the schedule mutations) falls through policy_for to
+    # confirm.
     instant: [kb_capabilities, kb_agents_list, kb_agent_get,
               kb_workflows_list, kb_workflow_get, kb_runs_list, kb_run_get,
               kb_run_events, kb_run_watch, kb_inbox_list, kb_schedules_list,
-              kb_deployment_inspect, kb_asset_pull_inspect, kb_repo_tree,
+              kb_grades, kb_repo_tree,
               kb_repo_file, kb_repo_history, kb_repo_search,
               kb_analytics_snapshot, kb_trace_list, kb_trace_get,
               kb_terminal_list]
@@ -53,14 +66,21 @@ servers:
     # the two tiered mutations named in the plan. get_drive_shareable_link
     # stays out of instant: its name reads like a read but it creates a
     # sharing grant (never_instant's "share" pattern also backstops this if
-    # it is ever added to instant: by mistake). manage_event is instant for
-    # everyday scheduling but instant_when escalates everything except
-    # action: create -- an ALLOWLIST, not a denylist of dangerous actions,
-    # because upstream workspace-mcp normalizes action via
-    # `.lower().strip()` (gcalendar/calendar_tools.py) before comparing, so
-    # a denylist of exact strings like "delete" would fail open on "Delete"
-    # or " delete "; instant_when normalizes both sides the same way and
-    # requires an explicit match to stay instant instead.
+    # it is ever added to instant: by mistake). manage_event is NOT instant
+    # either, for any action (BB-wave review, blocker 1): an instant
+    # action: create still accepts attendees: and send_updates:, so a single
+    # model assertion would send real invitation emails to third parties --
+    # exactly the class of thing rule 5 says cannot execute without Daniel's
+    # yes. EVERY calendar mutation confirms; there is no instant_when entry
+    # for manage_event any more.
+    #
+    # Future extension, if instant calendar creates are ever wanted: this
+    # needs an argument-PRESENCE predicate ("instant only when action is
+    # create AND attendees/send_updates are absent"), not the argument-VALUE
+    # allowlist instant_when compiles today. The instant_when machinery is
+    # kept (tested, general, and still the right shape for the next tool
+    # whose safe subset is a set of argument values) -- it just has no
+    # rules configured right now.
     expose: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
              list_gmail_labels, get_events, list_calendars, query_freebusy,
              search_drive_files, list_drive_items, get_drive_file_content,
@@ -68,15 +88,12 @@ servers:
              get_drive_shareable_link, manage_event]
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
-              search_drive_files, list_drive_items, get_drive_file_content,
-              manage_event]
-    instant_when:
-      manage_event: {action: [create]}
+              search_drive_files, list_drive_items, get_drive_file_content]
   chrome-devtools:
     from_claude_config: chrome-devtools
     domain: browser
     blocked: [get_network_request, list_network_requests]
-    # ~8 actually-useful tools (plan Track C0); network tools stay blocked
+    # 7 actually-useful tools (plan Track C0); network tools stay blocked
     # even though they are already excluded by expose (defense in depth for
     # call_raw and any future config edit that widens expose).
     expose: [navigate_page, take_snapshot, click, fill, take_screenshot,
@@ -85,12 +102,27 @@ servers:
   files:
     # Official @modelcontextprotocol/server-filesystem (npm, stdio via
     # npx), version-pinned (not @latest -- see
-    # docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C2). "{file_roots}"
-    # is expanded by mcp_client._resolve_command_config into the SAME
-    # file_roots list (below in this file: atlas.yaml, known: aliases
-    # resolved) that worker/runtime.py hands to the built-in LocalFiles
-    # tools -- one place grants filesystem access, not two independently
-    # configured allowlists.
+    # docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C2).
+    #
+    # READ SCOPE vs WRITE SCOPE, stated plainly (BB-wave review, blocker 2):
+    #   * Atlas READS cover config/atlas.yaml's file_roots, which includes
+    #     C:/Users/danie/kb -- through the built-in LocalFiles tools
+    #     (find_file / read_file / open_file / open_folder), unchanged.
+    #   * This server, which is where every file WRITE lives (write_file,
+    #     edit_file, create_directory, move_file), is confined to
+    #     config/atlas.yaml's file_write_roots: Desktop, Documents,
+    #     Downloads. NOT kb.
+    # The server takes one CLI allowlist for reads and writes alike, so
+    # handing it file_roots would have silently promoted the kb checkout
+    # from read-only to confirm-gated writable, around the kb bridge's own
+    # ATLAS_KB_MUTATIONS_ENABLED gate. "{file_write_roots}" is expanded by
+    # mcp_client._resolve_command_config through the SAME resolver
+    # (worker/localfiles.py resolve_file_roots, known: aliases included)
+    # that file_roots goes through, with the same refusal when it resolves
+    # to zero real directories. Widening this list -- adding kb or anything
+    # else the model may write to -- is Daniel's explicit decision, made by
+    # editing file_write_roots in config/atlas.yaml, never a side effect of
+    # adding a read root.
     #
     # THE ROOTS TRAP (survey): the MCP roots protocol REPLACES this CLI
     # allowlist if the client advertises roots support. Atlas's
@@ -102,20 +134,24 @@ servers:
     # set from server args" on connect. No suppression code was needed;
     # verified for real by tests/test_mcp_filesystem_live.py, which spawns
     # the actual npx server and asserts list_allowed_directories returns
-    # exactly the resolved file_roots.
-    command: [npx, -y, "@modelcontextprotocol/server-filesystem@2026.8.31", "{file_roots}"]
-    enabled_from: file_roots.enabled
+    # exactly the resolved file_write_roots.
+    command: [npx, -y, "@modelcontextprotocol/server-filesystem@2026.8.31", "{file_write_roots}"]
+    enabled_from: file_write_roots.enabled
     domain: files
     # The real server ships 14 tools; read_file is a deprecated alias of
     # read_text_file from the same build and is left out of expose: to
-    # avoid registering a duplicate read tool (9 reads + 4 mutations = 13,
-    # matching the survey). NO delete tool exists on this server at all --
-    # that is a structural guardrail, not a policy choice made here.
-    expose: [read_text_file, read_media_file, read_multiple_files,
+    # avoid registering a duplicate read tool. read_media_file is dropped
+    # too (BB-wave review, finding 11): it returns base64 image/audio data
+    # through the same 4KB _MAX_CONTENT bound every MCP result gets, so it
+    # can only ever deliver a truncated, unusable fragment -- launch_work
+    # is the path for real media. 8 reads + 4 mutations = 12 exposed. NO
+    # delete tool exists on this server at all -- that is a structural
+    # guardrail, not a policy choice made here.
+    expose: [read_text_file, read_multiple_files,
              list_directory, list_directory_with_sizes, directory_tree,
              search_files, get_file_info, list_allowed_directories,
              write_file, edit_file, create_directory, move_file]
-    instant: [read_text_file, read_media_file, read_multiple_files,
+    instant: [read_text_file, read_multiple_files,
               list_directory, list_directory_with_sizes, directory_tree,
               search_files, get_file_info, list_allowed_directories]
     # write_/edit_/create_/move_ are not in instant_prefixes and are absent
@@ -123,6 +159,8 @@ servers:
     # policy_for) -- asserted directly in
     # test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation.
     describe:
+      read_text_file: "Read the text of a file under a writable folder (Desktop, Documents, Downloads). Only the first 4KB comes back; anything longer is truncated, so use launch_work for a whole large file. Daniel's other roots, including kb, are read with find_file and read_file instead."
+      search_files: "Find files by name pattern under a writable folder and return their paths as plain text. Prefer find_file for anything Daniel may want opened: it returns a handle open_file and open_folder accept, which this tool's plain paths are not."
       write_file: "Create a new file, or completely overwrite an existing one, with exact content under an allowed folder. The host will read back the exact path and content and wait for Daniel's yes before this runs."
       edit_file: "Apply exact line-based find/replace edits to an existing text file under an allowed folder. The host will read back the exact path and edits and wait for Daniel's yes before this runs."
       create_directory: "Create a new folder (and any missing parent folders) under an allowed folder. The host will read back the exact path and wait for Daniel's yes before this runs."
@@ -141,8 +179,12 @@ defaults:
   # connect_timeout_s is the budget for EACH connect attempt (spawn +
   # uvx/npx resolution + MCP handshake), not shared across attempts: 60s
   # covers the worst observed cold-cache uvx resolution (16.5s) with
-  # generous headroom. connect_retries x this timeout is the worst-case
-  # time before a server is declared terminally errored.
+  # generous headroom. Worst case before a server is declared terminally
+  # errored is connect_retries x this timeout PLUS the backoff waits
+  # between attempts: 3 x 60s + 2s + 8s = 190s. The brain's tool snapshot
+  # no longer waits on that window -- worker/app.py refreshes it on each
+  # server's own arrival, so a healthy files/kb server is visible to the
+  # model immediately while a sick one is still retrying.
   connect_timeout_s: 60
   # Retry-with-backoff (plan Track C3): a one-shot connect() with no retry
   # meant a transient cache-eviction-shaped failure was terminal until the

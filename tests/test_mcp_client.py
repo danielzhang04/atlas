@@ -741,13 +741,25 @@ def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
         "search_drive_files", "list_drive_items", "get_drive_file_content",
     ):
         assert policy_for(server, defaults, name) == "instant"
-    # Named in the plan as tiered mutations: a name-lying read (creates a
-    # sharing grant) stays confirm outright, and the multi-op calendar tool
-    # is instant except when its action argument requests anything other
-    # than create (instant_when is an allowlist, see _compile_instant_when).
+    # Named in the plan as tiered mutations, both now confirm. A name-lying
+    # read (get_drive_shareable_link creates a sharing grant) stays confirm
+    # outright. manage_event was instant for action: create via instant_when
+    # until the BB-wave review (blocker 1) pointed out that an instant create
+    # still accepts attendees:/send_updates:, i.e. sends real email to third
+    # parties on a model assertion -- rule 5. EVERY calendar mutation
+    # confirms now, and there is no instant_when rule for it at all; a
+    # future instant create needs an argument-PRESENCE predicate, which the
+    # value-allowlist instant_when compiles today cannot express.
     assert policy_for(server, defaults, "get_drive_shareable_link") == "confirm"
-    assert policy_for(server, defaults, "manage_event") == "instant"
-    assert server["instant_when"]["manage_event"] == {"action": ["create"]}
+    assert policy_for(server, defaults, "manage_event") == "confirm"
+    assert "manage_event" not in server["instant"]
+    assert "instant_when" not in server
+    # The escalate machinery itself stays in place and tested (it is general,
+    # and is the right shape for the next tool whose safe subset is a set of
+    # argument values) -- it just has no rules configured. Every instant
+    # google tool therefore compiles to no escalate hook.
+    for name in server["instant"]:
+        assert mcp_client._compile_instant_when(server, name) is None
     # Product decision: send_gmail_message/draft_gmail_message are exposed
     # (everyday send/draft is the point) but not in instant: -- and
     # never_instant's "send" pattern independently forces confirm on
@@ -759,7 +771,7 @@ def test_checked_in_google_config_curates_a_core_set_with_tiered_mutations():
 
 
 def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutation():
-    """Official @modelcontextprotocol/server-filesystem (Track C2): 9 reads
+    """Official @modelcontextprotocol/server-filesystem (Track C2): 8 reads
     instant, the 4 mutations (write_file, edit_file, create_directory,
     move_file) confirm by omission from instant: -- there is no delete tool
     on this server at all, a structural guardrail rather than a policy
@@ -771,13 +783,13 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
     assert server["domain"] == "files"
     # enabled_from is consumed during spec-resolution (see
     # _resolve_command_config); the checked-in atlas.yaml's non-empty
-    # file_roots resolves it to True here. The reference itself and its
-    # empty/malformed-file_roots behavior are covered directly by
+    # file_write_roots resolves it to True here. The reference itself and its
+    # empty/malformed-roots behavior are covered directly by
     # test_file_roots_enabled_reference_tracks_whether_file_roots_is_non_empty
     # and test_file_roots_reference_rejects_malformed_file_roots_config.
     assert server["enabled"] is True
     read_tools = {
-        "read_text_file", "read_media_file", "read_multiple_files",
+        "read_text_file", "read_multiple_files",
         "list_directory", "list_directory_with_sizes", "directory_tree",
         "search_files", "get_file_info", "list_allowed_directories",
     }
@@ -785,6 +797,10 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
     assert set(server["expose"]) == read_tools | mutation_tools
     assert set(server["instant"]) == read_tools
     assert "read_file" not in server["expose"]  # deprecated alias of read_text_file
+    # BB-wave review, finding 11: read_media_file returns base64 image/audio
+    # through the same 4096-char _MAX_CONTENT bound as every other MCP
+    # result, so it can only ever deliver a truncated, unusable fragment.
+    assert "read_media_file" not in server["expose"]
     assert "delete" not in {t.lower() for t in server["expose"]}
     for name in read_tools:
         assert policy_for(server, defaults, name) == "instant"
@@ -798,22 +814,56 @@ def test_checked_in_files_config_lists_every_read_tool_and_confirms_every_mutati
             name.startswith(prefix) for prefix in defaults["instant_prefixes"]
         )
         assert policy_for(server, defaults, name) == "confirm"
-    assert set(server["describe"]) == mutation_tools
-    for description in server["describe"].values():
-        assert "confirm" in description.lower() or "yes" in description.lower()
+    # Every mutation's description states the confirm gate; the two read
+    # overrides (BB-wave review, finding 11) state the limits that make a
+    # naive call useless -- read_text_file's 4KB truncation, and that
+    # search_files' plain paths are not the handles open_file/open_folder
+    # need after a tainting read.
+    assert set(server["describe"]) == mutation_tools | {"read_text_file", "search_files"}
+    for name in mutation_tools:
+        description = server["describe"][name].lower()
+        assert "confirm" in description or "yes" in description
+    assert "4kb" in server["describe"]["read_text_file"].lower()
+    assert "launch_work" in server["describe"]["read_text_file"]
+    assert "find_file" in server["describe"]["search_files"]
+    assert "handle" in server["describe"]["search_files"].lower()
+
+    # Blocker 2 (write scope): this server -- the only component with write
+    # tools -- is started with file_write_roots, NOT file_roots, so the kb
+    # checkout stays a read root reachable only through the built-in
+    # LocalFiles tools. The argv token and the enabled_from reference must
+    # both name the write list, or one of the two silently reintroduces kb.
+    raw = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "mcp.yaml").read_text(encoding="utf-8"),
+    )["servers"]["files"]
+    assert "{file_write_roots}" in raw["command"]
+    assert "{file_roots}" not in raw["command"]
+    assert raw["enabled_from"] == "file_write_roots.enabled"
+    atlas = yaml.safe_load(
+        (Path(__file__).parents[1] / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )
+    assert atlas["file_write_roots"] == ["known:Desktop", "known:Documents", "known:Downloads"]
+    # The write list is a strict subset of the read list, and kb is in the
+    # difference -- the whole point of the split.
+    assert set(atlas["file_write_roots"]) < set(atlas["file_roots"])
+    assert not any("kb" in root.casefold() for root in atlas["file_write_roots"])
+    assert any("kb" in root.casefold() for root in atlas["file_roots"])
+    # The resolved argv the server actually spawns with contains no kb path.
+    assert not any("kb" in argument.casefold() for argument in server["args"])
 
 
 def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path):
     """Net prompt surface: kb (32, a commented constant -- kb tools require a
     live bridge connection this test does not make; see
     handoffs/2026-08-27-atlas-xwave.md) + google (38->14) +
-    chrome-devtools (27->7) + files (13, Track C2) + built-in host tools
-    (constructed here via the real builtin()/register_count_mail()
-    registration path, not guessed) = 85. This is OVER the 72 C0 set
+    chrome-devtools (27->7) + files (12, Track C2 minus read_media_file --
+    BB-wave review finding 11) + built-in host tools (constructed here via
+    the real builtin()/register_count_mail() registration path, not
+    guessed) = 84. This is OVER the 72 C0 set
     (docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0), itself already
     2-3x the ~30-50 model-accuracy threshold the survey named -- the plan's
     Track C2 row prioritizes the files domain for this wave over holding
-    72, and flags 85 for a per-turn tool-projection follow-up (config/
+    72, and flags 84 for a per-turn tool-projection follow-up (config/
     mcp.yaml's top-of-file comment carries the same note). This test locks
     in the actual number so a future change to it is a deliberate, visible
     diff rather than a silent drift.
@@ -827,7 +877,7 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     files_expose = config["servers"]["files"]["expose"]
     assert len(google_expose) == 14
     assert len(chrome_expose) == 7
-    assert len(files_expose) == 13
+    assert len(files_expose) == 12
 
     class _FakeJob:
         job_id = "job"
@@ -863,9 +913,10 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
         KB_COUNT + len(google_expose) + len(chrome_expose)
         + len(files_expose) + builtin_count
     )
-    # Track C2 (files) pushes the curated total from 72 to 85 -- over the
+    # Track C2 (files) pushes the curated total from 72 to 84 -- over the
     # C0 budget, flagged rather than hidden; see this test's docstring.
-    assert total == 85
+    assert builtin_count == 19
+    assert total == 84
     assert total < 116  # still net negative against the pre-C0 baseline
 
 
@@ -2006,13 +2057,46 @@ def test_command_config_is_dormant_by_default_and_resolves_a_minimal_environment
 # --- files: {file_roots} spec-resolution (Track C2) ----------------------
 
 
-def _files_mcp_yaml() -> str:
+def _files_mcp_yaml(key: str = "file_roots") -> str:
+    """A minimal command: server using one of the two roots keys. Both go
+    through identical machinery (see _ROOTS_ARGV_TOKENS /
+    _ROOTS_ENABLED_REFERENCES), which is why every behavior below is
+    asserted for each key rather than for a hardcoded one."""
     return (
         "servers:\n"
         "  files:\n"
-        '    command: [npx, "-y", "pkg", "{file_roots}"]\n'
-        "    enabled_from: file_roots.enabled\n"
+        f'    command: [npx, "-y", "pkg", "{{{key}}}"]\n'
+        f"    enabled_from: {key}.enabled\n"
     )
+
+
+def test_any_empty_roots_token_disables_a_server_using_both_tokens(tmp_path):
+    """Final-review nit: the zero-resolved guard accumulates across ALL roots
+    tokens in one argv -- with two tokens, an empty first token must disable
+    the server even when the second resolves fine (and vice versa), not just
+    whichever token happened to be processed last."""
+    real = tmp_path / "real"
+    real.mkdir()
+    missing = tmp_path / "does_not_exist"
+    for first, second in (("file_roots", "file_write_roots"),
+                          ("file_write_roots", "file_roots")):
+        mcp_path = tmp_path / "mcp.yaml"
+        mcp_path.write_text(
+            "servers:\n"
+            "  files:\n"
+            f'    command: [npx, "-y", "pkg", "{{{first}}}", "{{{second}}}"]\n'
+            f"    enabled_from: {second}.enabled\n",
+            encoding="utf-8",
+        )
+        atlas_path = tmp_path / "atlas.yaml"
+        atlas_path.write_text(
+            f"{first}:\n  - {missing}\n{second}:\n  - {real}\n",
+            encoding="utf-8",
+        )
+        config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+        server = config["servers"]["files"]
+        assert server["enabled"] is False, f"empty {first} did not disable"
+        assert server["disabled_reason"] == "config_entry_missing"
 
 
 def test_file_roots_argv_token_expands_to_existing_directories_and_skips_missing_ones(
@@ -2161,6 +2245,108 @@ def test_file_roots_that_resolve_to_zero_directories_stay_not_configured(tmp_pat
         "state": "not_configured",
         "detail": "config entry missing",
     }]
+
+
+def test_file_write_roots_token_expands_only_the_write_list_never_the_read_list(tmp_path):
+    """Blocker 2: the files MCP server is the only component with write
+    tools, and the server takes ONE allowlist for reads and writes alike.
+    So its argv expands {file_write_roots}, and a directory that is a read
+    root only -- kb in production -- must not appear in it. Both keys are
+    configured here with different directories precisely so a regression
+    back to {file_roots} cannot pass."""
+    write_root = tmp_path / "documents"
+    write_root.mkdir()
+    read_only_root = tmp_path / "kb_stand_in"
+    read_only_root.mkdir()
+
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text(
+        f"file_roots: [{write_root}, {read_only_root}]\n"
+        f"file_write_roots: [{write_root}]\n",
+        encoding="utf-8",
+    )
+
+    server = load_mcp_config(mcp_path, atlas_path=atlas_path)["servers"]["files"]
+
+    assert server["args"] == ["-y", "pkg", str(write_root.resolve())]
+    assert str(read_only_root.resolve()) not in server["args"]
+    assert server["enabled"] is True
+
+
+def test_file_write_roots_that_resolve_to_zero_directories_stay_not_configured(tmp_path):
+    """The same zero-resolved refusal as {file_roots} (adversarial review
+    F1), for the write token: a typo'd or unmounted file_write_roots entry
+    is a non-empty raw list that resolves to nothing, and must surface as
+    not_configured rather than spawning a rootless server that fails every
+    call with "Access denied". A populated file_roots alongside it must not
+    rescue it -- that would be exactly the read/write conflation blocker 2
+    removed."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+    real = tmp_path / "real_read_root"
+    real.mkdir()
+    atlas_path = tmp_path / "atlas.yaml"
+    atlas_path.write_text(
+        f"file_roots: [{real}]\n"
+        f"file_write_roots: [{tmp_path / 'does_not_exist'}]\n",
+        encoding="utf-8",
+    )
+
+    config = load_mcp_config(mcp_path, atlas_path=atlas_path)
+    server = config["servers"]["files"]
+
+    assert server["enabled"] is False
+    assert server["disabled_reason"] == "config_entry_missing"
+    assert server["args"] == ["-y", "pkg"]  # zero roots in the argv
+
+    def factory(_name, _spec):
+        raise AssertionError("files server was spawned with zero resolved write roots")
+
+    async def scenario():
+        registry = FakeRegistry()
+        servers = McpServers(config, session_factory=factory)
+        await servers.connect(registry)
+        status = servers.status()
+        await servers.close()
+        return status
+
+    assert asyncio.run(scenario()) == [{
+        "name": "files",
+        "connected": False,
+        "tools": 0,
+        "error": None,
+        "state": "not_configured",
+        "detail": "config entry missing",
+    }]
+
+
+def test_file_write_roots_enabled_reference_and_malformed_config(tmp_path):
+    """enabled_from: file_write_roots.enabled behaves exactly like its
+    file_roots twin -- absent/empty disables, malformed raises with the
+    key's own name so the error says which list to fix."""
+    mcp_path = tmp_path / "mcp.yaml"
+    mcp_path.write_text(_files_mcp_yaml("file_write_roots"), encoding="utf-8")
+
+    # A perfectly good read list does not enable the write server.
+    read_only = tmp_path / "read_only"
+    read_only.mkdir()
+    reads_only_atlas = tmp_path / "reads_only.yaml"
+    reads_only_atlas.write_text(f"file_roots: [{read_only}]\n", encoding="utf-8")
+    disabled = load_mcp_config(mcp_path, atlas_path=reads_only_atlas)
+    assert disabled["servers"]["files"]["enabled"] is False
+
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    nonempty_atlas = tmp_path / "nonempty.yaml"
+    nonempty_atlas.write_text(f"file_write_roots: [{kept}]\n", encoding="utf-8")
+    assert load_mcp_config(mcp_path, atlas_path=nonempty_atlas)["servers"]["files"]["enabled"] is True
+
+    malformed_atlas = tmp_path / "malformed.yaml"
+    malformed_atlas.write_text("file_write_roots: not-a-list\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid Atlas configuration: file_write_roots"):
+        load_mcp_config(mcp_path, atlas_path=malformed_atlas)
 
 
 def test_file_roots_with_one_resolvable_root_spawns_with_exactly_that_root(tmp_path):
@@ -2415,11 +2601,15 @@ def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_too
     config = load_mcp_config(config_dir / "mcp.yaml")
     server = config["servers"]["kb"]
     defaults = config["defaults"]
+    # BB-wave review, finding 10: kb_deployment_inspect and
+    # kb_asset_pull_inspect were listed as instant reads but the bridge does
+    # not offer them (an instant: name the server never sends is inert
+    # decoration); kb_grades, a read it does offer, was missing.
     read_tools = {
         "kb_capabilities", "kb_agents_list", "kb_agent_get",
         "kb_workflows_list", "kb_workflow_get", "kb_runs_list", "kb_run_get",
         "kb_run_events", "kb_run_watch", "kb_inbox_list", "kb_schedules_list",
-        "kb_deployment_inspect", "kb_asset_pull_inspect", "kb_repo_tree",
+        "kb_grades", "kb_repo_tree",
         "kb_repo_file", "kb_repo_history", "kb_repo_search",
         "kb_analytics_snapshot", "kb_trace_list", "kb_trace_get",
         "kb_terminal_list",
@@ -2428,11 +2618,21 @@ def test_checked_in_kb_config_lists_every_read_tool_and_confirms_every_other_too
         "kb_agent_create", "kb_agent_update", "kb_workflow_create",
         "kb_workflow_update", "kb_workflow_launch", "kb_agent_launch",
         "kb_human_respond", "kb_review_dispatch", "kb_schedule_create",
-        "kb_schedule_set_armed", "kb_schedule_delete", "kb_deployment_action",
-        "kb_asset_pull_action", "kb_terminal_close", "kb_run_control",
+        "kb_schedule_set_armed", "kb_schedule_delete", "kb_run_control",
     }
 
     assert set(server["instant"]) == read_tools
+    assert not (read_tools & mutation_tools)
+    # Exactly the 32 tools the bridge offers (enumerated from the built
+    # atlas-bridge server on 2026-08-31; Atlas must not import or depend on
+    # a kb checkout, so the set is pinned here rather than read live). An
+    # instant: entry for a tool the server never sends is silently inert,
+    # which is how the two removed names survived -- kb_deployment_action,
+    # kb_asset_pull_action and kb_terminal_close, listed here before as
+    # mutations, do not exist either and are gone for the same reason.
+    assert len(read_tools | mutation_tools) == 32
+    assert "kb_deployment_inspect" not in server["instant"]
+    assert "kb_asset_pull_inspect" not in server["instant"]
     assert all(policy_for(server, defaults, name) == "instant" for name in read_tools)
     assert all(policy_for(server, defaults, name) == "confirm" for name in mutation_tools)
     assert policy_for(server, defaults, "kb_future_mutation") == "confirm"

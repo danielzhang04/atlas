@@ -252,14 +252,93 @@ def test_confirmation_readback_lists_all_arguments_and_truncates_each_value():
     assert registry.pending.summary in result.content
 
 
-def test_confirmation_refuses_serialized_arguments_over_readback_limit():
+def test_confirmation_condenses_oversized_arguments_instead_of_refusing():
+    """BB-wave review, finding 5. The old behavior refused any confirm-tier
+    call whose serialized arguments passed ~1,200 characters, advising the
+    model to "split it" -- advice that is actively wrong for an overwrite
+    tool like write_file, where two half-calls do not write one file, they
+    write the first half and then replace it with the second. A readback
+    exists so Daniel hears WHAT is going WHERE and HOW MUCH; it does not
+    have to be the payload itself."""
     registry = ToolRegistry()
     registry.register(_tool("send", policy="confirm"))
 
     result = _call(registry, "send", {"body": "x" * 1_201})
 
-    assert result == ToolResult("error", "too large to read back; split it")
-    assert registry.pending is None
+    assert result.status == "needs_confirmation"
+    assert "split it" not in result.content
+    # First 80 characters plus the full length -- bounded, and enough to
+    # say what is being sent.
+    assert "body: " + "x" * 80 + " ...(1201 chars total)" in result.content
+    assert registry.pending is not None
+    # The pending action still holds the EXACT arguments; only the spoken
+    # summary is condensed.
+    assert registry.pending.arguments == {"body": "x" * 1_201}
+
+
+def test_condensing_never_truncates_the_short_values_a_confirmation_turns_on():
+    """Final-review conditional fix: only the oversized value is condensed.
+    A short value like path carries the discriminating detail (the filename
+    tail of an overwrite target) and must be read back WHOLE even when a
+    sibling content value forced the condensed summary."""
+    registry = ToolRegistry()
+    registry.register(_tool("files__write_file", policy="confirm"))
+    path = (
+        "C:/Users/danie/Documents/Projects/2026/Atlas/handoffs/"
+        "2026-08-31-atlas-bb-wave-review.md"
+    )
+    assert len(path) > 80  # longer than the condensed cap, shorter than normal
+
+    result = _call(registry, "files__write_file", {"path": path, "content": "y" * 5_000})
+
+    assert result.status == "needs_confirmation"
+    assert f"path: {path};" in result.content  # whole, filename tail intact
+    assert "...(5000 chars total)" in result.content  # content still condensed
+
+
+def test_a_large_write_file_confirms_with_a_bounded_summary_and_executes_in_full():
+    """The finding-5 scenario end to end: a 5KB write_file (an MCP-mirrored
+    confirm-tier tool) must reach needs_confirmation with a summary bounded
+    to path + size + a prefix, and the later confirm must write the WHOLE
+    5KB -- not the summarized version of it."""
+    written = []
+    content = "".join(f"line {index}\n" for index in range(700))
+    assert len(content) > 5_000
+
+    async def run(arguments):
+        written.append(dict(arguments))
+        return {"ok": True}
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="files__write_file",
+        description="d",
+        input_schema={"type": "object", "properties": {}},
+        run=run,
+        policy="confirm",
+    ))
+
+    proposed = _call(
+        registry, "files__write_file",
+        {"path": "C:/Users/danie/Documents/notes.md", "content": content},
+    )
+
+    assert proposed.status == "needs_confirmation"
+    assert written == []
+    assert "C:/Users/danie/Documents/notes.md" in proposed.content
+    # Newlines are control characters and are stripped from every readback
+    # before it is measured, so the stated size is the cleaned length.
+    assert f"...({len(content.replace(chr(10), ''))} chars total)" in proposed.content
+    assert len(proposed.content) < 400
+    assert "split it" not in proposed.content
+
+    confirmed = asyncio.run(registry.confirm(proposed.confirm_id))
+
+    assert confirmed.status == "ok"
+    assert written == [{
+        "path": "C:/Users/danie/Documents/notes.md",
+        "content": content,
+    }]
 
 
 def test_pending_action_also_blocks_a_tool_that_escalates_to_confirm():
@@ -1750,14 +1829,58 @@ def test_the_handle_table_is_bounded_within_a_turn(tmp_path):
 
     # Long temp paths can push a 20-result list past the 4096-char content
     # bound, so this reads the table itself rather than the serialized JSON.
-    _call(registry, "find_file", {"query": "atlas plan"})
-    _call(registry, "find_file", {"query": "atlas plan"})
-    third = _call(registry, "find_file", {"query": "atlas plan"})
+    # find_file returns at most 20 (localfiles._MAX_RESULTS), so six calls
+    # exactly exhaust the 120-handle budget and the seventh gets nothing.
+    for _ in range(6):
+        _call(registry, "find_file", {"query": "atlas plan"})
+    seventh = _call(registry, "find_file", {"query": "atlas plan"})
 
     assert registry._resolve_handle("f1") is not None
-    assert registry._resolve_handle("f40") is not None
-    assert registry._resolve_handle("f41") is None
-    assert '"handle"' not in third.content
-    assert _call(registry, "open_file", {"handle": "f41"}).content.startswith(
+    assert registry._resolve_handle("f120") is not None
+    assert registry._resolve_handle("f121") is None
+    assert '"handle"' not in seventh.content
+    assert _call(registry, "open_file", {"handle": "f121"}).content.startswith(
         "unknown handle",
     )
+
+
+def test_find_file_marks_results_it_could_not_mint_a_handle_for(tmp_path):
+    """BB-wave review, finding 6: past the per-turn budget the results kept
+    coming back with no handle and no explanation, so the model could only
+    guess why open_file suddenly had nothing to accept. Minting is still
+    partial -- as many as fit -- but every result that missed out says so."""
+    from worker.localfiles import LocalFiles
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    registry = ToolRegistry()
+    files = LocalFiles([root], opener=lambda _path: None)
+    # 28 matches per search, so the fifth search crosses the 120 budget
+    # PARTWAY THROUGH (4 x 28 = 112 minted, then 8 more, then 20 without) --
+    # deliberately not a number that divides the budget evenly, so the test
+    # covers a batch that is half-minted rather than all-or-nothing. Short
+    # synthetic paths keep a batch inside the 4096-char content bound, so
+    # the note is asserted on the JSON the model actually receives.
+    matches = [
+        {"path": f"C:/r/p{index:02d}.md", "name": f"p{index:02d}.md"}
+        for index in range(28)
+    ]
+    files.find = lambda query, *args, **kwargs: list(matches)
+    builtin(registry, {}, _FakeWork(), files=files)
+
+    results = [
+        json.loads(_call(registry, "find_file", {"query": "atlas plan"}).content)
+        for _ in range(5)
+    ]
+
+    minted = [item for batch in results for item in batch if "handle" in item]
+    noted = [item for batch in results for item in batch if "handle" not in item]
+    assert len(minted) == 120  # as many as the budget allowed, not zero
+    assert len(noted) == 5 * 28 - 120  # the shortfall is visible, not silent
+    assert all(item["note"] == "handle budget reached" for item in noted)
+    # The fifth search is the one that crosses the line: it must still carry
+    # a usable signal rather than looking like an empty capability.
+    fifth = results[4]
+    assert any("handle" in item for item in fifth)
+    assert any(item.get("note") == "handle budget reached" for item in fifth)
+    assert registry._resolve_handle(minted[-1]["handle"]) is not None

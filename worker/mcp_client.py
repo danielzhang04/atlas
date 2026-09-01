@@ -276,34 +276,48 @@ def load_mcp_config(path: Path, *, atlas_path: Path | None = None) -> dict:
     return value
 
 
-_FILE_ROOTS_ARGV_TOKEN = "{file_roots}"
-_FILE_ROOTS_ENABLED_REFERENCE = "file_roots.enabled"
+# Atlas config keys a server's argv may expand, and the enabled_from
+# reference that gates the same server on that key resolving to at least one
+# real directory. Two scopes, deliberately separate (BB-wave review, blocker
+# 2): file_roots is Atlas's READ scope (what the built-in LocalFiles tools
+# cover, kb included), file_write_roots is the narrower WRITE scope the
+# files MCP server -- the only component with write tools -- is started
+# with. Same resolver, same validation, same zero-resolved refusal for both;
+# only the list differs.
+_ROOTS_ARGV_TOKENS = {
+    "{file_roots}": "file_roots",
+    "{file_write_roots}": "file_write_roots",
+}
+_ROOTS_ENABLED_REFERENCES = {
+    "file_roots.enabled": "file_roots",
+    "file_write_roots.enabled": "file_write_roots",
+}
 
 
-def _validated_file_roots(atlas: Mapping) -> tuple[str, ...]:
+def _validated_roots(atlas: Mapping, key: str) -> tuple[str, ...]:
     """The exact validation worker/runtime.py applies to file_roots before
-    building the built-in LocalFiles tools -- reused here so a malformed
-    file_roots entry fails the same way for both consumers of it."""
-    raw_file_roots = atlas.get("file_roots", ())
+    building the built-in LocalFiles tools -- reused here, for either roots
+    key, so a malformed entry fails the same way for every consumer of it."""
+    raw_roots = atlas.get(key, ())
     if (
-        isinstance(raw_file_roots, (str, bytes))
-        or not isinstance(raw_file_roots, (list, tuple))
-        or not all(isinstance(root, str) and root.strip() for root in raw_file_roots)
+        isinstance(raw_roots, (str, bytes))
+        or not isinstance(raw_roots, (list, tuple))
+        or not all(isinstance(root, str) and root.strip() for root in raw_roots)
     ):
-        raise ValueError("invalid Atlas configuration: file_roots")
-    return tuple(raw_file_roots)
+        raise ValueError(f"invalid Atlas configuration: {key}")
+    return tuple(raw_roots)
 
 
-def _resolve_file_roots_argv(atlas: Mapping) -> list[str]:
-    """Expand file_roots (config/atlas.yaml) into resolved, existing
-    directory paths for the files MCP server's argv, via the same resolver
+def _resolve_roots_argv(atlas: Mapping, key: str) -> list[str]:
+    """Expand a roots list (config/atlas.yaml) into resolved, existing
+    directory paths for an MCP server's argv, via the same resolver
     (worker/localfiles.py's resolve_file_roots, known: alias handling
     included) worker/runtime.py uses to build the built-in localfiles
-    tools -- one place turns file_roots into real filesystem access, not
-    two resolvers that could drift apart."""
+    tools -- one place turns a configured root into real filesystem access,
+    not two resolvers that could drift apart."""
     from .localfiles import resolve_file_roots
 
-    return [str(root) for root in resolve_file_roots(_validated_file_roots(atlas))]
+    return [str(root) for root in resolve_file_roots(_validated_roots(atlas, key))]
 
 
 def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
@@ -324,18 +338,19 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
         bridge.update(configured)
 
     def setting(reference: Any) -> Any:
-        # "file_roots.enabled" is a narrow special case, not a general
-        # namespace like kb_bridge.* -- the files MCP server (Track C2) is
-        # gated by the exact same signal worker/runtime.py already uses to
-        # decide whether the built-in LocalFiles tools exist at all
-        # (`if raw_roots else None`), so there is one place that grants
-        # filesystem access, not a second independent toggle. This checks
-        # the RESOLVED directory count, not just non-empty raw strings: a
-        # typo'd or unmounted root must read as disabled here too (see the
-        # file_roots_token_used guard below for the second, structural half
-        # of this fix).
-        if reference == _FILE_ROOTS_ENABLED_REFERENCE:
-            return bool(_resolve_file_roots_argv(atlas))
+        # "file_roots.enabled"/"file_write_roots.enabled" are narrow special
+        # cases, not a general namespace like kb_bridge.* -- the files MCP
+        # server (Track C2) is gated by the exact same signal
+        # worker/runtime.py already uses to decide whether the built-in
+        # LocalFiles tools exist at all (`if raw_roots else None`), so there
+        # is one place that grants filesystem access, not a second
+        # independent toggle. This checks the RESOLVED directory count, not
+        # just non-empty raw strings: a typo'd or unmounted root must read
+        # as disabled here too (see the roots_token_used guard below for the
+        # second, structural half of this fix).
+        roots_key = _ROOTS_ENABLED_REFERENCES.get(reference) if isinstance(reference, str) else None
+        if roots_key is not None:
+            return bool(_resolve_roots_argv(atlas, roots_key))
         if not isinstance(reference, str) or not reference.startswith("kb_bridge."):
             raise ValueError("invalid MCP Atlas config reference")
         name = reference.removeprefix("kb_bridge.")
@@ -345,13 +360,16 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
 
     resolved = dict(server_cfg)
     resolved_argv: list[str] = []
-    file_roots_token_used = False
-    resolved_file_root_count = 0
+    roots_token_used = False
+    # Accumulated across ALL roots tokens in the argv: any single token
+    # resolving to zero directories disables the server, not just the last one.
+    roots_token_empty = False
     for item in command:
-        if item == _FILE_ROOTS_ARGV_TOKEN:
-            file_roots_token_used = True
-            expanded = _resolve_file_roots_argv(atlas)
-            resolved_file_root_count = len(expanded)
+        roots_key = _ROOTS_ARGV_TOKENS.get(item)
+        if roots_key is not None:
+            roots_token_used = True
+            expanded = _resolve_roots_argv(atlas, roots_key)
+            roots_token_empty = roots_token_empty or not expanded
             resolved_argv.extend(expanded)
         else:
             resolved_argv.append(item.replace("{kb_bridge.path}", str(bridge["path"])))
@@ -366,9 +384,10 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
     enabled = setting(enabled_from)
     if not isinstance(enabled, bool):
         raise ValueError("invalid MCP enabled_from value")
-    if file_roots_token_used and resolved_file_root_count == 0:
+    if roots_token_used and roots_token_empty:
         # Mirrors LocalFiles.__init__'s own `if not roots: raise ValueError`
-        # guard: never let this server spawn with a {file_roots} token that
+        # guard: never let this server spawn with a roots token
+        # ({file_roots} or {file_write_roots}) that
         # resolved to zero real directories, even if enabled_from itself
         # said True (e.g. a future config mistake that points enabled_from
         # at an unrelated flag). Without this, the argv still contains
@@ -402,7 +421,7 @@ def _resolve_command_config(server_cfg: Any, atlas: Mapping) -> Any:
 # in place of the generic "disabled" -- a closed allowlist so an unexpected
 # or param-requiring key (e.g. "signed_missing") can never reach
 # render_status_detail and raise. See _resolve_command_config's
-# file_roots_token_used guard for the one producer of "config_entry_missing"
+# roots_token_used guard for the one producer of "config_entry_missing"
 # today.
 _NOT_CONFIGURED_DISABLED_REASONS = frozenset({"disabled", "config_file_missing", "config_entry_missing"})
 
@@ -540,6 +559,14 @@ def _compile_instant_when(server_cfg: Mapping, remote_tool_name: str) -> Callabl
     " delete " and fail open. Comparing both sides after the same
     normalization closes that gap regardless of what the disallowed values
     turn out to be.
+
+    NOTE: no checked-in server configures instant_when today. Its one user
+    was google's manage_event (instant for action: create), removed in the
+    BB-wave review because an instant create can still carry attendees: and
+    send_updates: -- third-party email on a model assertion, which rule 5
+    forbids. That case needs an argument-PRESENCE predicate, which this
+    value allowlist cannot express; the machinery is kept, and kept tested,
+    for the next tool whose safe subset really is a set of argument values.
     """
     all_rules = server_cfg.get("instant_when", {})
     if not isinstance(all_rules, Mapping):

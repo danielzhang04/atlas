@@ -765,6 +765,44 @@ def test_capability_prefix_changes_only_when_explicitly_refreshed():
     assert "google: connected" in prefixes[2]
 
 
+def test_outbound_tools_array_is_sorted_by_name_whatever_order_servers_arrive_in():
+    """The tools array is part of the cached prompt prefix, and MCP tools
+    register in whatever order their servers win the spawn race -- which
+    differs run to run. An unsorted array therefore misses the prompt cache
+    across restarts even when the tool SET is identical, and moves
+    cache_control onto "whichever server was slowest". Sorting by name in
+    the snapshot makes the array a pure function of the set."""
+    names = ["zeta", "alpha", "middle", "beta"]
+
+    class OrderedRegistry(FakeRegistry):
+        def __init__(self, order):
+            super().__init__()
+            self.order = order
+
+        def schemas(self):
+            return [
+                {
+                    "name": name,
+                    "description": f"{name} tool.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+                for name in self.order
+            ]
+
+    forward = Brain(FakeClient(FakeStream([])), OrderedRegistry(names), model="fast", persona="")
+    reversed_order = Brain(
+        FakeClient(FakeStream([])), OrderedRegistry(list(reversed(names))),
+        model="fast", persona="",
+    )
+
+    assert [tool["name"] for tool in forward._tools] == ["alpha", "beta", "middle", "zeta"]
+    assert forward._tools == reversed_order._tools
+    # cache_control lands on the same (alphabetically last) tool either way.
+    assert forward._tools[-1]["name"] == "zeta"
+    assert forward._tools[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert all("cache_control" not in tool for tool in forward._tools[:-1])
+
+
 def test_capability_text_is_stable_across_snapshot_permutations():
     schemas = [{"name": "zeta"}, {"name": "alpha"}, {"name": "middle"}]
     states = [

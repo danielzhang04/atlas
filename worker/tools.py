@@ -42,13 +42,25 @@ _Status = Literal["ok", "error", "needs_confirmation"]
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTENT_LIMIT = 4096
+# Above this serialized size the readback condenses (it never refuses; see
+# ToolRegistry.call) and every value is cut to
+# _READBACK_CONDENSED_VALUE_LIMIT.
 _READBACK_ARGUMENT_LIMIT = 1_200
 _READBACK_VALUE_LIMIT = 160
+_READBACK_CONDENSED_VALUE_LIMIT = 80
 _HOST_ONLY_TOOLS = frozenset({"confirm", "cancel_pending"})
 # Tools that accept a host-minted handle instead of a model-supplied path, and
 # so keep working after external content has tainted the turn.
 _HANDLE_TOOLS = frozenset({"open_file", "open_folder"})
-_HANDLE_LIMIT = 40
+# Per-turn handle budget. 40 was under two turns' worth of searching (a
+# find_file returns up to _MAX_RESULTS=20), so a third search in one turn
+# silently returned results with no handle at all -- and after a tainting
+# read, no handle means no way to open anything (BB-wave review, finding 6).
+# 120 is six full result sets; a call that still runs past it mints for as
+# many results as fit and marks the rest with _HANDLE_BUDGET_NOTE instead of
+# leaving the shortfall invisible.
+_HANDLE_LIMIT = 120
+_HANDLE_BUDGET_NOTE = "handle budget reached"
 _TAINT_REFUSAL = "refused after external content; ask Daniel again next turn"
 _TAINT_REFUSAL_HANDLE = (
     "refused after external content; use a handle from an earlier find_file "
@@ -348,9 +360,22 @@ class ToolRegistry:
                         "error",
                         "a previous action is still awaiting Daniel's yes or no",
                     )
+                # Large arguments CONDENSE the readback; they never refuse
+                # the call (BB-wave review, finding 5). The old refusal
+                # ("too large to read back; split it") was advice that
+                # cannot be followed for an overwrite tool: splitting a
+                # write_file into two calls does not write half a file, it
+                # writes the first half and then replaces it with the
+                # second. What confirmation actually needs is that Daniel
+                # hears WHAT is being written WHERE and how much of it --
+                # not the whole payload read aloud. So oversized arguments
+                # get a bounded per-value summary (first
+                # _READBACK_CONDENSED_VALUE_LIMIT characters plus the total
+                # length) while `copied` -- the exact, complete arguments --
+                # is what the pending action stores and what confirm()
+                # later executes.
                 serialized = json.dumps(copied, ensure_ascii=False)
-                if len(serialized) > _READBACK_ARGUMENT_LIMIT:
-                    return ToolResult("error", "too large to read back; split it")
+                condensed = len(serialized) > _READBACK_ARGUMENT_LIMIT
                 # Forward hazard (handles): a confirm-tier tool that stored a
                 # handle in these arguments would fail at confirm time --
                 # begin_turn clears the table at the START of the later turn,
@@ -366,7 +391,7 @@ class ToolRegistry:
                     confirm_id=secrets.token_urlsafe(8),
                     name=name,
                     arguments=copied,
-                    summary=_readback_summary(name, copied),
+                    summary=_readback_summary(name, copied, condensed=condensed),
                     expires=self._clock() + 120.0,
                     host_state=host_state,
                 )
@@ -641,8 +666,14 @@ def builtin(
         results = []
         for item, kind in found:
             handle = registry._mint_handle(item["path"], kind)
+            # Minting is per turn and bounded (_HANDLE_LIMIT). Past the
+            # bound the result is still returned -- it is a real, in-roots
+            # match -- but it carries note: "handle budget reached" so the
+            # model can see WHY that row has no handle and say so, instead
+            # of the shortfall being silent and the model concluding the
+            # file cannot be opened for some unstated reason.
             results.append(
-                {**item, "kind": kind} if handle is None
+                {**item, "kind": kind, "note": _HANDLE_BUDGET_NOTE} if handle is None
                 else {**item, "kind": kind, "handle": handle}
             )
         return results
@@ -1176,22 +1207,44 @@ def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _readback_summary(name: str, arguments: Mapping[str, Any]) -> str:
+def _readback_summary(
+    name: str,
+    arguments: Mapping[str, Any],
+    *,
+    condensed: bool = False,
+) -> str:
     if name == "press_delete":
+        # The delete chord is read back whole, always: it is short, and it
+        # is the one readback where every character matters.
         arguments = {key: arguments.get(key, "") for key in ("chord", "window", "pid")}
         maximum = None
+    elif condensed:
+        maximum = _READBACK_CONDENSED_VALUE_LIMIT
     else:
         maximum = _READBACK_VALUE_LIMIT
-    details = [
-        f"{key}: {_readback_value(value, maximum)}" for key, value in arguments.items()
-    ]
+    details = []
+    for key, value in arguments.items():
+        # Condensing exists to tame the one oversized value (usually content);
+        # short values like path carry the discriminating detail a confirmation
+        # turns on (e.g. the filename tail of an overwrite target) and are read
+        # back whole under the normal per-value limit instead.
+        value_maximum = maximum
+        squeeze = condensed
+        if condensed and len(_serialize(value)) <= _READBACK_VALUE_LIMIT:
+            value_maximum = _READBACK_VALUE_LIMIT
+            squeeze = False
+        details.append(f"{key}: {_readback_value(value, value_maximum, total=squeeze)}")
     return f"{name} - " + ("; ".join(details) if details else "no arguments")
 
 
-def _readback_value(value: Any, maximum: int | None) -> str:
+def _readback_value(value: Any, maximum: int | None, *, total: bool = False) -> str:
     cleaned = _CONTROL_CHARACTERS.sub("", _serialize(value))
     if maximum is None or len(cleaned) <= maximum:
         return cleaned
+    if total:
+        # Condensed form: the size is the point ("5,120 characters going to
+        # this path"), so state the whole length rather than the remainder.
+        return f"{cleaned[:maximum]} ...({len(cleaned)} chars total)"
     return f"{cleaned[:maximum]} ...(+{len(cleaned) - maximum} chars)"
 
 

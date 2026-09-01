@@ -3,16 +3,20 @@ spawns the actual npx-installed @modelcontextprotocol/server-filesystem
 package (no fakes, no in-memory FastMCP fixture) through Atlas's own
 worker.mcp_client spec-resolution and connect path, and proves:
 
-  * the 13 curated tools register, matching the checked-in config/mcp.yaml
+  * the 12 curated tools register, matching the checked-in config/mcp.yaml
     expose: list exactly;
   * a real read (read_text_file) against a seeded file under the resolved
-    file_roots returns real file content;
+    file_write_roots returns real file content;
   * THE ROOTS TRAP does not bite Atlas: list_allowed_directories reports
-    EXACTLY the resolved file_roots the host passed as CLI argv, not
+    EXACTLY the resolved file_write_roots the host passed as CLI argv, not
     something the server negotiated over the MCP roots protocol (which
     Atlas's ClientSession never advertises -- see the comment in
     config/mcp.yaml's files: entry and worker/mcp_client.py's
     _stdio_session);
+  * the write scope really is narrower than the read scope: a file_roots
+    entry that is NOT in file_write_roots is absent from the server's
+    allowlist and refused live (blocker 2 -- this is the kb checkout in
+    production);
   * a write_file call comes back needs_confirmation through the registry
     and is never confirmed or executed by this test -- the file it would
     have created does not exist afterward;
@@ -48,10 +52,16 @@ _ATLAS_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PACKAGE = "@modelcontextprotocol/server-filesystem@2026.8.31"
 _NPX = shutil.which("npx")
 _PREFETCH_TIMEOUT_S = 90
-_CONNECT_TIMEOUT_S = 60
+# Must outlast the config's own retry budget, not one attempt: connect()
+# resolves only after connect_retries x connect_timeout_s plus the backoff
+# waits (3 x 60 + 2 + 8 = 190s worst case, see config/mcp.yaml defaults).
+# At 60s this wrapper fired first and turned a server that was retrying
+# normally into a failed test instead of the skip/pass the retry would have
+# produced.
+_CONNECT_TIMEOUT_S = 200
 
 _READ_TOOLS = (
-    "read_text_file", "read_media_file", "read_multiple_files",
+    "read_text_file", "read_multiple_files",
     "list_directory", "list_directory_with_sizes", "directory_tree",
     "search_files", "get_file_info", "list_allowed_directories",
 )
@@ -60,10 +70,31 @@ _MUTATION_TOOLS = ("write_file", "edit_file", "create_directory", "move_file")
 pytestmark = pytest.mark.skipif(_NPX is None, reason="npx is not on PATH")
 
 
-def _prefetch_reason() -> str | None:
+# npm's own error codes, which npx surfaces verbatim on stderr, separate the
+# two failure shapes this prefetch can hit (BB-wave review, finding 12):
+#
+#   * NO NETWORK -- DNS/connect-level codes. Nothing is proved about Atlas
+#     or the pin; skip.
+#   * NETWORK, BUT THE PIN DOES NOT EXIST -- the registry answered and said
+#     no such version. That is a real defect in config/mcp.yaml (a bad or
+#     yanked pin), not an environment limitation, so it FAILS loudly instead
+#     of hiding as a skip on every offline-tolerant runner.
+#
+# Anything else (including a prefetch timeout, which is genuinely ambiguous:
+# a wedged registry connection and a very slow first fetch look identical
+# from here) stays a skip -- see _prefetch_outcome's fallthrough.
+_OFFLINE_MARKERS = (
+    "enotfound", "eai_again", "econnrefused", "econnreset", "etimedout",
+    "enetunreach", "getaddrinfo", "network socket disconnected",
+)
+_PIN_MISSING_MARKERS = ("no matching version", "notarget", "e404", "404 not found")
+
+
+def _prefetch_outcome() -> tuple[str, str] | None:
     """Spawn the pinned package once, briefly, so the real test below fails
     only on a real bug -- not a slow or absent first-time network fetch of
-    the npm package. Returns None once the server proves it can start."""
+    the npm package. Returns None once the server proves it can start, or
+    ("skip"|"fail", reason)."""
     try:
         proc = subprocess.run(
             [_NPX, "-y", _PINNED_PACKAGE, str(_ATLAS_ROOT)],
@@ -73,29 +104,51 @@ def _prefetch_reason() -> str | None:
             input="",
         )
     except FileNotFoundError:
-        return "npx executable disappeared"
+        return "skip", "npx executable disappeared"
     except subprocess.TimeoutExpired:
-        return "npx did not respond in time (no network for the first fetch?)"
-    if "Secure MCP Filesystem Server running on stdio" not in proc.stderr:
-        return f"filesystem server did not start cleanly: {proc.stderr[-500:]}"
-    return None
+        return "skip", "npx did not respond in time (no network for the first fetch?)"
+    if "Secure MCP Filesystem Server running on stdio" in proc.stderr:
+        return None
+    stderr = proc.stderr
+    lowered = stderr.casefold()
+    if any(marker in lowered for marker in _OFFLINE_MARKERS):
+        return "skip", f"no network for the npm fetch: {stderr[-500:]}"
+    if any(marker in lowered for marker in _PIN_MISSING_MARKERS):
+        return "fail", (
+            "the registry answered but does not have "
+            f"{_PINNED_PACKAGE}; config/mcp.yaml pins a version that no "
+            f"longer resolves: {stderr[-500:]}"
+        )
+    return "skip", f"filesystem server did not start cleanly: {stderr[-500:]}"
 
 
 @pytest.fixture(scope="module")
 def npx_prefetched():
-    reason = _prefetch_reason()
-    if reason is not None:
-        pytest.skip(reason)
+    outcome = _prefetch_outcome()
+    if outcome is None:
+        return
+    verdict, reason = outcome
+    if verdict == "fail":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def _write_files_only_config(tmp_path: Path, roots_dir: Path) -> tuple[Path, Path]:
     """Extract the real, checked-in files: server section from
     config/mcp.yaml (used unmodified -- this is production config, not a
     reimplementation) plus defaults, paired with a temp atlas.yaml whose
-    file_roots points only at this test's tmp_path. Restricting the config
+    roots point only at this test's tmp_path. Restricting the config
     to just the files: server keeps this test from also trying to connect
     kb/google/chrome-devtools, which need a live bridge or OAuth this test
-    environment does not have."""
+    environment does not have.
+
+    file_roots and file_write_roots are deliberately DIFFERENT here: the
+    read-only root stands in for the production file_roots entry that must
+    never reach this server (C:/Users/danie/kb). Because the checked-in
+    files: argv expands "{file_write_roots}", the server must come up
+    knowing only roots_dir -- and the live list_allowed_directories
+    assertion below proves it, which it could not if both lists were the
+    same directory."""
     real_config = yaml.safe_load(
         (_ATLAS_ROOT / "config" / "mcp.yaml").read_text(encoding="utf-8"),
     )
@@ -107,9 +160,14 @@ def _write_files_only_config(tmp_path: Path, roots_dir: Path) -> tuple[Path, Pat
         }),
         encoding="utf-8",
     )
+    read_only_dir = tmp_path / "read_only_root"
+    read_only_dir.mkdir(exist_ok=True)
     atlas_path = tmp_path / "atlas.yaml"
     atlas_path.write_text(
-        yaml.safe_dump({"file_roots": [str(roots_dir)]}),
+        yaml.safe_dump({
+            "file_roots": [str(roots_dir), str(read_only_dir)],
+            "file_write_roots": [str(roots_dir)],
+        }),
         encoding="utf-8",
     )
     return mcp_path, atlas_path
@@ -144,6 +202,9 @@ def test_files_server_end_to_end_against_the_real_npx_server(npx_prefetched, tmp
                 "files__read_text_file", {"path": str(seeded)},
             )
             allowed_result = await registry.call("files__list_allowed_directories", {})
+            read_only_result = await registry.call(
+                "files__list_directory", {"path": str(tmp_path / "read_only_root")},
+            )
             write_result = await registry.call(
                 "files__write_file",
                 {
@@ -151,32 +212,44 @@ def test_files_server_end_to_end_against_the_real_npx_server(npx_prefetched, tmp
                     "content": "nope",
                 },
             )
-            return names, read_result, allowed_result, write_result
+            return names, read_result, allowed_result, read_only_result, write_result
         finally:
             await servers.close()
 
-    names, read_result, allowed_result, write_result = asyncio.run(scenario())
+    names, read_result, allowed_result, read_only_result, write_result = asyncio.run(scenario())
 
-    # 1. Exactly the 13 curated tools registered (9 reads + 4 mutations),
+    # 1. Exactly the 12 curated tools registered (8 reads + 4 mutations),
     # matching config/mcp.yaml's expose: list.
     assert names == sorted(
         f"files__{name}" for name in (*_READ_TOOLS, *_MUTATION_TOOLS)
     )
+    assert "files__read_media_file" not in names
 
     # 2. A real read against a real file returns real content.
     assert read_result.status == "ok"
     assert read_result.content == "hello from atlas c2"
 
     # 3. THE ROOTS TRAP: the effective allowlist reported by the real
-    # server is EXACTLY the resolved file_roots the host passed as CLI
+    # server is EXACTLY the resolved file_write_roots the host passed as CLI
     # argv -- not something widened by the MCP roots protocol (which
     # Atlas's ClientSession never advertises; see config/mcp.yaml). One
-    # configured root -> exactly that path back (ToolRegistry._bound_content
-    # strips the server's newline as a control character before this
-    # content reaches a caller, so the comparison is newline-free too).
+    # configured write root -> exactly that path back
+    # (ToolRegistry._bound_content strips the server's newline as a control
+    # character before this content reaches a caller, so the comparison is
+    # newline-free too).
     assert allowed_result.status == "ok"
     resolved_root = str(roots_dir.resolve())
     assert allowed_result.content == f"Allowed directories:{resolved_root}"
+
+    # 3b. WRITE SCOPE (blocker 2): the second file_roots entry -- standing
+    # in for the kb checkout, which is a read root and must never become a
+    # write root -- is not in the allowlist above and is refused live by the
+    # real server. This is what proves the argv expanded
+    # "{file_write_roots}" and not "{file_roots}": were the old token still
+    # there, both directories would be allowed and this read would succeed.
+    assert str(tmp_path / "read_only_root") not in allowed_result.content
+    assert read_only_result.status == "error"
+    assert "Access denied" in read_only_result.content
 
     # 4. write_file is NOT EXECUTED: it stops at needs_confirmation, and
     # this test never sends the matching confirm.

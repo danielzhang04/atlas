@@ -28,8 +28,11 @@ logger = logging.getLogger("atlas.brain")
 MAX_TRANSCRIPT = 4_096
 MAX_TOOL_ROUNDS = 4
 # Minimum cacheable prefix is model-dependent: 4096 tokens on Haiku-class
-# models, 1024 on Sonnet/Opus-class. Measured prefix on the sonnet-5 lane is
-# ~3.8k, so the haiku floor would false-alarm on every run.
+# models, 1024 on Sonnet/Opus-class. The fully-settled BB-wave prefix measures
+# ~19K tokens (84 tool schemas + system text), comfortably over either floor;
+# the model table exists because a builtin-only snapshot (servers still
+# connecting) can dip toward ~4K, where the haiku floor would false-alarm on
+# the sonnet lane. The floor is a minimum-cacheability check, not a budget.
 _CACHE_FLOOR_BY_MODEL = {"claude-haiku-4-5": 4_096}
 CACHE_FLOOR_TOKENS_DEFAULT = 1_024
 CACHE_FLOOR_MAX_CHECKS = 3
@@ -351,7 +354,20 @@ class Brain:
                 "tool schema uses API-incompatible shape, excluded from model (tools=%s)",
                 ",".join(sorted(incompatible))[:300],
             )
-        tools = [dict(schema) for schema in usable_schemas]
+        # Sorted by name, always. The registry hands these back in
+        # registration order, and MCP tools register in whatever order their
+        # servers happen to arrive -- a race between npx/uvx spawns that
+        # differs run to run. The tools array is part of the cached prefix,
+        # so an order that shuffles across restarts silently misses the
+        # prompt cache every time even though the tool SET is identical.
+        # Sorting here (not in ToolRegistry.schemas(), which keeps
+        # registration order for its own callers) makes the outbound array a
+        # pure function of the tool set, and pins cache_control to a stable
+        # last element instead of "whichever server was slowest".
+        tools = [
+            dict(schema)
+            for schema in sorted(usable_schemas, key=lambda item: str(item.get("name") or ""))
+        ]
         if tools:
             tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         self._tool_names = self._schema_names(usable_schemas)
