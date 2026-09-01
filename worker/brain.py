@@ -109,7 +109,10 @@ Use find_file and read_file for quick questions about a file. Use launch_work fo
 analysis that needs code or produces artifacts.
 If read_file reports truncated, do not analyse the preview -- call launch_work with the exact path.
 For how many emails or messages, use count_mail with a Gmail query: in:inbox is:unread for unread and
-in:inbox for all; never count from a search page.
+in:inbox for all; it reports conversations, matching what Daniel's Gmail shows, not raw messages;
+never count from a search page.
+Mail times from Gmail tools are already in Daniel's local time; never convert or rename their
+timezones. Calendar events state their own timezone -- read it as written.
 Close closes every window of the requested app. If Daniel asks to close one of several windows, say
 that close will close every window of that app.
 A tool result of needs_confirmation means to read every summary field back in one sentence and ask
@@ -781,7 +784,7 @@ class Brain:
 
     def _now_system_text(self) -> str:
         now = self._clock().astimezone()
-        return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone."
+        return f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}), Daniel's local time."
 
 
 def _capability_system_text(

@@ -252,7 +252,7 @@ def test_plain_reply_streams_chunks_and_remembers_exchange():
     assert "Look something up." not in call["system"][0]["text"]
     assert call["system"][1] == {
         "type": "text",
-        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}). Daniel is in this timezone.",
+        "text": f"Now: {now.isoformat(timespec='minutes')} ({now.tzname()}), Daniel's local time.",
     }
     assert "cache_control" not in call["system"][1]
     assert call["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -2102,6 +2102,13 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
     assert "analysis that needs code or produces artifacts" in BASE_SYSTEM
     assert "count_mail" in BASE_SYSTEM
     assert "never count from a search page" in BASE_SYSTEM
+    assert (
+        "it reports conversations, matching what Daniel's Gmail shows, not raw messages"
+    ) in BASE_SYSTEM
+    assert (
+        "Mail times from Gmail tools are already in Daniel's local time; never convert or rename their\n"
+        "timezones. Calendar events state their own timezone -- read it as written."
+    ) in BASE_SYSTEM
     assert (
         "If read_file reports truncated, do not analyse the preview -- "
         "call launch_work with the exact path."

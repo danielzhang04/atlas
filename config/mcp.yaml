@@ -89,6 +89,16 @@ servers:
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
               search_drive_files, list_drive_items, get_drive_file_content]
+    # local_time rewrites Date: <rfc2822> header lines to Daniel's local
+    # wall-clock time (CC2 fixture verified) so the model never quotes a
+    # sender's foreign timezone back to him. Gmail read tools only -- the
+    # three tools whose text carries a Date: header. NOT calendar
+    # (get_events/query_freebusy): their date/time formatting is unverified
+    # against this transformer and stays untouched this wave.
+    transform:
+      search_gmail_messages: local_time
+      get_gmail_message_content: local_time
+      get_gmail_thread_content: local_time
   chrome-devtools:
     from_claude_config: chrome-devtools
     domain: browser

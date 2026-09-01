@@ -87,10 +87,27 @@ _WINDOW_PROPERTIES = {
     "pid": {"type": "integer", "minimum": 1},
 }
 _FOUND_MESSAGES = re.compile(r"^Found\s+(\d+)\s+messages?\s+matching\b", re.IGNORECASE)
+# workspace-mcp 1.25.2 (gmail/gmail_tools.py:1583-1587) actually emits the
+# next-page hint mid-sentence -- "...call search_gmail_messages again with
+# page_token='<token>'" -- not the line-anchored "page_token: <token>" the
+# original regex alone expected (that line shape never appears in the real
+# server's text, so bounded_count silently treated every >500-message query
+# as a single, already-complete page; adversarial review, finding 2). The
+# quoted-value alternate matches the real shape; the line-anchored
+# alternates are kept for robustness against other callers/formats.
 _NEXT_PAGE_TOKEN = re.compile(
-    r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$",
+    r"^[ \t]*(?:Next[ \t]+page[ \t]+token|page_token)[ \t]*:[ \t]*(\S+)[ \t]*$"
+    r"|page_token=['\"]([^'\"]+)['\"]",
     re.IGNORECASE | re.MULTILINE,
 )
+# Gmail search results are one line per MESSAGE, but Daniel's Gmail UI counts
+# CONVERSATIONS (threads) -- a 65-conversation inbox showed as "80" when
+# count_mail summed message lines (live-verified against the UI). Each
+# message block in the real search_gmail_messages/get_gmail_message_content/
+# get_gmail_thread_content text already carries a "Thread ID: <id>" line, so
+# counting DISTINCT thread ids across pages gets the UI-matching number
+# without a second API surface.
+_THREAD_ID = re.compile(r"^[ \t]*Thread ID[ \t]*:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 
 logger = logging.getLogger("atlas.tools")
 
@@ -941,7 +958,7 @@ def register_count_mail(
         query = _text_argument(arguments, "query", maximum=1024)
 
         async def bounded_count(target_query: str) -> tuple[int, bool] | ToolResult:
-            total = 0
+            threads: set[str] = set()
             page_token = None
             seen_tokens: set[str] = set()
             for _page in range(4):
@@ -964,17 +981,28 @@ def register_count_mail(
                 page_count = int(found.group(1))
                 if page_count > 500:
                     return ToolResult("error", "unexpected mail search result")
-                total += page_count
+                page_threads = _THREAD_ID.findall(content)
+                # Fail closed: a page that reports messages but carries no
+                # Thread ID lines is not the shape count_mail was built
+                # against (see the module-level _THREAD_ID comment) -- silently
+                # falling back to the message count would reintroduce the
+                # UI mismatch this rewrite exists to fix.
+                if page_count > 0 and not page_threads:
+                    return ToolResult("error", "unexpected mail search result")
+                threads.update(page_threads)
                 token_match = _NEXT_PAGE_TOKEN.search(content)
-                page_token = token_match.group(1) if token_match is not None else None
+                page_token = (
+                    (token_match.group(1) or token_match.group(2))
+                    if token_match is not None else None
+                )
                 if page_token is None:
-                    return total, True
+                    return len(threads), True
                 if page_count < 500:
                     return ToolResult("error", "unexpected mail search result")
                 if page_token in seen_tokens:
-                    return total, False
+                    return len(threads), False
                 seen_tokens.add(page_token)
-            return total, page_token is None
+            return len(threads), page_token is None
 
         inbox_count = await bounded_count(query)
         if isinstance(inbox_count, ToolResult):
@@ -992,17 +1020,19 @@ def register_count_mail(
             primary_text = str(primary_total) if primary_exact else f"at least {primary_total}"
             return ToolResult(
                 "ok",
-                f"{inbox_text} in your inbox, {primary_text} in Primary",
+                f"{inbox_text} conversations in your inbox, {primary_text} in Primary",
             )
         total, exact = inbox_count
-        return {"query": query, "count": total, "exact": exact}
+        return {"query": query, "conversations": total, "exact": exact}
 
     schema = {
         "type": "object", "properties": {"query": {"type": "string"}},
         "required": ["query"], "additionalProperties": False,
     }
     registry.register(Tool(
-        "count_mail", "Count Gmail messages exactly across bounded search pages.",
+        "count_mail",
+        "Count Gmail conversations exactly across bounded search pages, matching "
+        "the count Daniel's Gmail UI shows (not a raw message count).",
         schema, count_mail,
     ))
 
