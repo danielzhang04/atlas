@@ -11,7 +11,15 @@ from typing import Any
 import pytest
 
 from worker import brain as brain_mod
-from worker.brain import BASE_SYSTEM, PROVIDER_REPLY, TIMEOUT_REPLY, Brain, split_spoken
+from worker.brain import (
+    BASE_SYSTEM,
+    EMPTY_TURN_REPLY,
+    PROVIDER_REPLY,
+    TIMEOUT_REPLY,
+    TRUNCATED_REPLY,
+    Brain,
+    split_spoken,
+)
 from worker.claims import FAILED_ATTEMPT_REPLY, UNBACKED_ACTION_REPLY, ClaimGuard
 from worker.tools import AppEntry, PendingAction, Tool, ToolRegistry, builtin
 
@@ -976,6 +984,7 @@ def test_host_speech_constants_end_in_whitespace():
     # trailing word boundary.
     for constant in (
         TIMEOUT_REPLY, PROVIDER_REPLY, UNBACKED_ACTION_REPLY, FAILED_ATTEMPT_REPLY,
+        TRUNCATED_REPLY, EMPTY_TURN_REPLY,
     ):
         assert constant[-1].isspace(), constant
 
@@ -2146,3 +2155,169 @@ def test_split_spoken_uses_sentence_newline_and_length_boundaries():
     assert len(chunks[0]) <= 160
     assert chunks[0].endswith(" ")
     assert remainder
+
+
+# --- Unit CC1: Atlas must never be silent and never truncate unnoticed. -------
+
+
+def test_reply_cut_at_the_token_cap_offers_to_continue_and_warns(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    fragment = "I checked and the calendar shows that the "
+    client = FakeClient(FakeStream(
+        [fragment], content=[text_block(fragment)], stop_reason="max_tokens",
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "what is on today")) == [
+        fragment, TRUNCATED_REPLY,
+    ]
+    assert "conversation reply hit the token cap" in caplog.text
+    assert "stop_reason=max_tokens" in caplog.text
+    assert "round=0" in caplog.text
+
+
+def test_a_reply_that_finished_normally_is_never_given_the_continuation_offer(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    client = FakeClient(FakeStream(
+        ["All set. "], content=[text_block("All set. ")], stop_reason="end_turn",
+    ))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == ["All set. "]
+    assert TRUNCATED_REPLY not in "".join(caplog.messages)
+    assert "token cap" not in caplog.text
+
+
+def test_token_cap_inside_a_tool_call_speaks_a_host_line_instead_of_nothing(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    registry = FakeRegistry()
+    # The cap landed inside the tool_use block: no text was streamed and the
+    # tool call is unusable, so the whole turn used to end in total silence.
+    client = FakeClient(FakeStream(
+        [], content=[tool_block()], stop_reason="max_tokens",
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "look that up")) == [EMPTY_TURN_REPLY]
+    assert registry.calls == []
+    assert "conversation reply hit the token cap" in caplog.text
+
+
+def test_generate_turn_that_yields_no_text_at_all_still_speaks(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    client = FakeClient(FakeStream([], content=[], stop_reason="end_turn"))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "hello")) == [EMPTY_TURN_REPLY]
+    # The fallback is not the truncation path: no cap warning belongs here.
+    assert "token cap" not in caplog.text
+
+
+def test_timeout_flushes_backed_held_sentences_before_the_host_line(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    held = "I opened the folder. "
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        DelayedFinalStream(
+            [held], content=[text_block(held)], final_delay=0.5,
+        ),
+    )
+    brain = Brain(
+        client, registry, model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # The backed sentence survives the abort; the host line stays last.
+    assert asyncio.run(collect(brain, "open my downloads")) == [held, TIMEOUT_REPLY]
+    assert "held reply chunks flushed on timeout (held=1)" in caplog.text
+
+
+def test_timeout_still_rebuts_an_unbacked_held_sentence_it_flushes():
+    held = "I opened the folder. "
+    client = FakeClient(DelayedFinalStream(
+        [held], content=[text_block(held)], final_delay=0.5,
+    ))
+    brain = Brain(
+        client, FakeRegistry(), model="fast", persona="",
+        turn_timeout_s=0.05, turn_ceiling_s=1.0,
+    )
+
+    # Salvaging the tail must not smuggle an unbacked claim past the guard.
+    assert asyncio.run(collect(brain, "open my downloads")) == [
+        UNBACKED_ACTION_REPLY, TIMEOUT_REPLY,
+    ]
+
+
+def test_provider_failure_flushes_backed_held_sentences_before_the_host_line(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+
+    class ProviderFailure(RuntimeError):
+        status_code = 500
+
+    held = "I opened the folder. "
+    registry = FakeRegistry(ToolResult("ok", "opened"))
+    client = FakeClient(
+        # The held sentence is generated and backed, then the NEXT round's
+        # request dies at the provider -- the tail used to die with it.
+        FakeStream([held], content=[tool_block(name="open_folder")], stop_reason="tool_use"),
+        ProviderFailure("private token must not escape"),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "open my downloads")) == [held, PROVIDER_REPLY]
+    assert "held reply chunks flushed on provider error (held=1)" in caplog.text
+    assert "private token" not in caplog.text
+
+
+def test_confirmation_narration_cut_at_the_token_cap_offers_to_continue(caplog):
+    caplog.set_level("WARNING", logger="atlas.brain")
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "Send the draft?", confirm_id="cid-1"),
+        ToolResult("ok", "sent"),
+    )
+    fragment = "Okay, and the part you asked about is that the "
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Send the draft?"], content=[text_block("Send the draft?")]),
+        FakeStream([fragment], content=[text_block(fragment)], stop_reason="max_tokens"),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        first = await collect(brain, "Send the draft")
+        second = await collect(brain, "yes")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first == ["Send the draft?"]
+    # The narration lane spends the same cap and was the one flush that never
+    # read stop_reason.
+    assert second == [fragment, TRUNCATED_REPLY]
+    assert "confirmation narration hit the token cap" in caplog.text
+
+
+def test_truncated_narration_drops_the_offer_when_a_claim_is_rebutted():
+    registry = FakeRegistry(
+        ToolResult("needs_confirmation", "Send the draft?", confirm_id="cid-1"),
+        ToolResult("ok", "sent"),
+    )
+    client = FakeClient(
+        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(["Send the draft?"], content=[text_block("Send the draft?")]),
+        FakeStream(
+            ["I sent the draft. "],
+            content=[text_block("I sent the draft. ")],
+            stop_reason="max_tokens",
+        ),
+    )
+    brain = Brain(client, registry, model="fast", persona="")
+
+    async def scenario():
+        await collect(brain, "Send the draft")
+        return await collect(brain, "yes")
+
+    # The rebuttal keeps the last word: offering to continue a claim the host
+    # just retracted would undo the retraction.
+    assert asyncio.run(scenario()) == [UNBACKED_ACTION_REPLY]

@@ -35,6 +35,10 @@ FOLLOW_SENTINEL = devicewatch.FOLLOW_SENTINEL
 TEXT_MODE = "--text" in sys.argv
 DEFAULT_DISMISS = ["that's all", "go to sleep"]
 WAKE_LINE = "Hey boss. What can I do for you?"
+# Spoken when a reflex reaches no branch that says anything -- "repeat" with
+# nothing to repeat, or an intent this funnel does not route.
+REPEAT_FALLBACK = "I don't have anything to repeat yet. "
+REFLEX_FALLBACK = "I heard that, but I don't have a way to act on it. "
 SLEEP_LINE = "Okay, sleeping. Wake me when you need something."
 _BG_TASKS: set[asyncio.Task] = set()
 RESTART_EXIT_CODE = 21
@@ -206,6 +210,13 @@ async def _submit_voice_turn(
     context: str | None = None,
     source: str | None = None,
 ) -> str:
+    """Speak one brain turn and return WHAT THE MODEL SAID.
+
+    The return value is the model's own speech, so `""` means the model
+    produced nothing -- including on the guard above, which speaks nothing at
+    all. The host may still have spoken a fallback; callers derive the trace
+    outcome from this value precisely because it cannot drift from it.
+    """
     if not isinstance(text, str) or not text.strip():
         return ""
     publisher.add_line("user", text, source=source)
@@ -225,7 +236,18 @@ async def _submit_voice_turn(
     responded = False
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
-        responded = True
+        if spoken:
+            responded = True
+        else:
+            # Last funnel before the speaker: whatever went wrong upstream, an
+            # addressed turn never ends without Atlas saying something. Spoken
+            # INSIDE the instrumented window so the RESPOND leg times the audio
+            # Daniel actually heard, and left ok=False so the leg agrees with
+            # the turn's "empty" outcome instead of reporting a model reply.
+            logger.warning("voice turn produced no speech; speaking the host fallback")
+            respond_started = time.perf_counter()
+            await session.say(brain_mod.EMPTY_TURN_REPLY, add_to_chat_ctx=False)
+            publisher.add_line("atlas", brain_mod.EMPTY_TURN_REPLY)
     finally:
         from worker import traces as traces_mod
         traces_mod.record_current_respond(
@@ -279,6 +301,20 @@ async def _handle_reflex(
             cancel_turn()
     elif intent == "repeat" and repeated:
         await session.say(repeated, add_to_chat_ctx=False)
+        if on_spoken is not None:
+            on_spoken()
+    else:
+        # There was no terminal branch here: "say that again" with nothing to
+        # repeat returned True having said nothing at all. In practice this IS
+        # the repeat-only safety net -- every caller gates on dismiss, cancel,
+        # or repeat, and an intent this funnel does not route (unlock_kb) never
+        # arrives here, it goes to the brain through _respond. The branch is
+        # written generally so a future caller cannot fall through silently.
+        # `dismiss` and `cancel` stay silent on purpose and are handled above.
+        logger.warning("reflex intent produced no reply (intent=%s)", str(intent)[:32])
+        line = REPEAT_FALLBACK if intent == "repeat" else REFLEX_FALLBACK
+        await session.say(line, add_to_chat_ctx=False)
+        publisher.add_line("atlas", line)
         if on_spoken is not None:
             on_spoken()
     return True
@@ -385,6 +421,14 @@ async def _handle_audio_turn_inner(
     engagement.interacted()
     if lane == "reflex" and intent == "repeat":
         def _repeated() -> None:
+            # The reflex funnel always speaks now (its terminal else), so the
+            # outcome is stamped here instead of riding the error->responded
+            # promotion, which no longer fires for a turn that returns "".
+            _mark(
+                addressed=True,
+                wake_kind="reply" if reply_window else "wake",
+                outcome="responded",
+            )
             if engagement.state != engagement_mod.ENGAGED:
                 return
             engagement.interacted()
@@ -412,7 +456,20 @@ async def _handle_audio_turn_inner(
             context=context,
             source=line_source,
         )
-        if response and engagement.state == engagement_mod.ENGAGED:
+        # Derived from the answer itself, not signalled out of the funnel: an
+        # empty response IS the empty outcome, so the two cannot drift apart,
+        # and every path that returns "" -- including the funnel's own input
+        # guard -- is recorded honestly without knowing it is being watched.
+        _mark(
+            addressed=True,
+            wake_kind="reply" if reply_window else "wake",
+            outcome="responded" if response else "empty",
+        )
+        # The window used to be refreshed only `if response`, so a silent turn
+        # closed the addressing window and the next follow-up needed the wake
+        # word again -- silence compounding into more silence. The host spoke
+        # either way, so the window is refreshed either way.
+        if engagement.state == engagement_mod.ENGAGED:
             engagement.interacted()
             addressing.mark_activity()
         return response
@@ -468,7 +525,10 @@ async def _handle_audio_turn(
             _trace=(trace_recorder, turn),
             _trace_meta=metadata,
         )
-        if metadata["addressed"] and metadata["outcome"] == "error":
+        # Only promote on a turn that actually produced speech. This used to
+        # stamp "responded" on any addressed turn that did not raise, so a
+        # silent turn was recorded as a reply that never happened.
+        if metadata["addressed"] and metadata["outcome"] == "error" and response:
             metadata["outcome"] = "responded"
         return response
     except asyncio.CancelledError:

@@ -1193,3 +1193,231 @@ def test_cancelled_completion_is_bounded():
         state=JobState.SUCCEEDED, summary="x" * 500,
     ))
     assert len(line) == 320
+
+
+# --- Unit CC1: no addressed turn ends in silence, and traces say so. ---------
+
+
+def test_silent_brain_turn_speaks_a_fallback_and_records_an_empty_outcome(tmp_path):
+    from worker.traces import TraceRecorder
+
+    session = FakeSession()
+    publisher = StatePublisher()
+    engagement = Engagement(120)
+    engagement.wake()
+    addressing = Addressing(30, ("atlas",))
+    recorder = TraceRecorder(tmp_path / "traces.db")
+    assert app._address_window_open(addressing) is False
+
+    response = asyncio.run(app._handle_audio_turn(
+        "atlas what is the plan",
+        intents={},
+        brain=FakeBrain(chunks=()),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=addressing,
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    recorder.close()
+
+    fallback = app.brain_mod.EMPTY_TURN_REPLY
+    # The empty stream reached the speaker, then the host said something anyway.
+    assert session.spoken == [[], fallback]
+    # The return value is what the MODEL said, which is nothing -- that is the
+    # signal the outcome is derived from.
+    assert response == ""
+    atlas_lines = [
+        line["text"] for line in publisher.snapshot()["transcript"]
+        if line["role"] == "atlas"
+    ]
+    assert atlas_lines == [fallback]
+    # Item 3: the addressing window is refreshed on the fallback too, so the
+    # follow-up does not need the wake word again.
+    assert app._address_window_open(addressing) is True
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+        respond = connection.execute(
+            "SELECT ok FROM steps WHERE kind='RESPOND'"
+        ).fetchone()
+    assert outcome == "empty"
+    # The RESPOND leg must not claim a delivered model reply while the turn row
+    # says the turn was empty.
+    assert respond == (0,)
+
+
+def test_a_speaking_turn_is_still_recorded_as_responded(tmp_path):
+    from worker.traces import TraceRecorder
+
+    recorder = TraceRecorder(tmp_path / "traces.db")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    response = asyncio.run(app._handle_audio_turn(
+        "atlas what is the plan",
+        intents={},
+        brain=FakeBrain(chunks=("All good. ",)),
+        session=FakeSession(),
+        publisher=StatePublisher(),
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    recorder.close()
+
+    assert response == "All good. "
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+    assert outcome == "responded"
+
+
+def test_addressed_turn_with_no_speech_is_not_promoted_to_responded(tmp_path, monkeypatch):
+    from worker.traces import TraceRecorder
+
+    async def _silent(text, **kwargs):
+        kwargs["_trace_meta"].update(addressed=True, wake_kind="wake", outcome="error")
+        return ""
+
+    monkeypatch.setattr(app, "_handle_audio_turn_inner", _silent)
+    recorder = TraceRecorder(tmp_path / "traces.db")
+
+    asyncio.run(app._handle_audio_turn(
+        "atlas question",
+        intents={},
+        brain=FakeBrain(),
+        session=FakeSession(),
+        publisher=StatePublisher(),
+        engagement=Engagement(120),
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+    # The promotion used to stamp "responded" on any addressed turn that did
+    # not raise -- including one that said nothing.
+    assert outcome == "error"
+
+
+def test_repeat_with_nothing_to_repeat_speaks_instead_of_falling_through(caplog):
+    caplog.set_level("WARNING", logger="atlas.app")
+    session = FakeSession()
+    publisher = StatePublisher()
+    marks = []
+
+    handled = asyncio.run(app._handle_reflex(
+        "say that again",
+        intents={"repeat": {"phrases": ["say that again"]}},
+        session=session,
+        publisher=publisher,
+        dismiss=lambda: None,
+        on_spoken=lambda: marks.append("spoken"),
+    ))
+
+    assert handled is True
+    assert session.spoken == [app.REPEAT_FALLBACK]
+    assert marks == ["spoken"]
+    assert publisher.snapshot()["transcript"][-1]["text"] == app.REPEAT_FALLBACK
+    assert "reflex intent produced no reply (intent=repeat)" in caplog.text
+
+
+def test_reflex_funnel_cannot_return_handled_without_speaking(caplog):
+    # A DIRECT call with an intent no live caller routes here: unlock_kb goes
+    # to the brain through _respond, so this is not a live path -- it pins the
+    # terminal else as a general net, so a future caller cannot fall through.
+    caplog.set_level("WARNING", logger="atlas.app")
+    session = FakeSession()
+
+    handled = asyncio.run(app._handle_reflex(
+        "atlas, unlock kb",
+        intents={},
+        session=session,
+        publisher=StatePublisher(),
+        dismiss=lambda: None,
+    ))
+
+    assert router.route("atlas, unlock kb", {}) == ("reflex", "unlock_kb")
+    assert handled is True
+    assert session.spoken == [app.REFLEX_FALLBACK]
+    assert "reflex intent produced no reply (intent=unlock_kb)" in caplog.text
+
+
+def test_unlock_kb_reaches_the_brain_rather_than_the_reflex_funnel():
+    brain = FakeBrain(chunks=("Unlocking. ",))
+    session = FakeSession()
+    engagement = Engagement(120)
+    engagement.wake()
+
+    response = asyncio.run(app._handle_audio_turn(
+        "atlas, unlock kb",
+        intents={},
+        brain=brain,
+        session=session,
+        publisher=StatePublisher(),
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+    ))
+
+    # Pins the corrected comment on _handle_reflex's terminal else.
+    assert brain.calls == ["atlas, unlock kb"]
+    assert response == "Unlocking. "
+    assert app.REFLEX_FALLBACK not in str(session.spoken)
+
+
+def test_dismiss_and_cancel_reflexes_stay_silent():
+    session = FakeSession()
+    dismissed = []
+
+    asyncio.run(app._handle_reflex(
+        "go to sleep",
+        intents={"dismiss": {"phrases": ["go to sleep"]}},
+        session=session,
+        publisher=StatePublisher(),
+        dismiss=lambda: dismissed.append("dismiss"),
+    ))
+    asyncio.run(app._handle_reflex(
+        "stop",
+        intents={"cancel": {"phrases": ["stop"]}},
+        session=session,
+        publisher=StatePublisher(),
+        dismiss=lambda: None,
+    ))
+
+    # The terminal else must not turn the deliberately silent reflexes noisy.
+    assert dismissed == ["dismiss"]
+    assert session.spoken == []
+
+
+def test_repeat_reflex_that_speaks_records_a_responded_outcome(tmp_path):
+    from worker.traces import TraceRecorder
+
+    publisher = StatePublisher()
+    publisher.add_line("atlas", "The previous answer.")
+    session = FakeSession()
+    recorder = TraceRecorder(tmp_path / "traces.db")
+    engagement = Engagement(120)
+    engagement.wake()
+
+    asyncio.run(app._handle_audio_turn(
+        "atlas, say that again",
+        intents={"repeat": {"phrases": ["say that again"]}},
+        brain=FakeBrain(),
+        session=session,
+        publisher=publisher,
+        engagement=engagement,
+        addressing=Addressing(30, ("atlas",)),
+        sleep=lambda announce=True: None,
+        trace_recorder=recorder,
+    ))
+    recorder.close()
+
+    assert session.spoken == ["The previous answer."]
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        outcome = connection.execute("SELECT outcome FROM turns").fetchone()[0]
+    assert outcome == "responded"

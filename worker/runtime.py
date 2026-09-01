@@ -98,7 +98,7 @@ def build(
     model = _required_text(cfg, "fast_model")
     store_path = _required_text(cfg, "job_store_path")
     workspace_path = _required_text(cfg, "work_workspace_path")
-    max_tokens = cfg.get("max_tokens", 400)
+    max_tokens = cfg.get("max_tokens", 500)
     timeout_s = cfg.get("turn_timeout_s", 12.0)
     ceiling_s = cfg.get("turn_ceiling_s", 30.0)
     pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
