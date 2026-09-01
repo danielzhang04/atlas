@@ -30,6 +30,15 @@ servers:
     from_claude_config: google-workspace
     account_param: user_google_email
     domain: google
+    # args_override (plan Track C3): spawn a pinned workspace-mcp release
+    # instead of the unpinned "workspace-mcp" args in ~/.claude.json (never
+    # edited here -- that file is shared with Claude Code). A `uv` cache
+    # eviction otherwise means the next cold `uvx workspace-mcp` resolves
+    # whatever is newest upstream, untested by Atlas, on top of already
+    # being slow/flaky (the actual 2026-08-31 outage). Pin verified present
+    # in uv's local archive-v0 cache (workspace_mcp-1.25.2.dist-info) on
+    # 2026-08-31; bump deliberately, not by cache drift.
+    args_override: [workspace-mcp==1.25.2, --tools, gmail, drive, calendar]
     # Core 14-tool set (plan Track C0): the 10 existing instant reads below,
     # plus send_gmail_message/draft_gmail_message (product decision -- both
     # stay confirm: not in instant: below, and never_instant's "send"
@@ -77,4 +86,16 @@ defaults:
   # replacement list to narrow it.
   never_instant: [delete, remove, trash, send, purchase, revoke, permission, share]
   call_timeout_s: 8
+  # connect_timeout_s is the budget for EACH connect attempt (spawn +
+  # uvx/npx resolution + MCP handshake), not shared across attempts: 60s
+  # covers the worst observed cold-cache uvx resolution (16.5s) with
+  # generous headroom. connect_retries x this timeout is the worst-case
+  # time before a server is declared terminally errored.
   connect_timeout_s: 60
+  # Retry-with-backoff (plan Track C3): a one-shot connect() with no retry
+  # meant a transient cache-eviction-shaped failure was terminal until the
+  # next full app restart (the 2026-08-31 google outage). Only
+  # timeout/spawn-class failures are retried -- see
+  # _is_retryable_failure in mcp_client.py; config errors never retry.
+  connect_retries: 3
+  connect_retry_backoff_s: [2, 8]

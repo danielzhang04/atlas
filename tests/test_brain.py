@@ -773,6 +773,28 @@ def test_capability_text_is_stable_across_snapshot_permutations():
     assert brain_mod._capability_system_text(list(reversed(schemas)), states[1:] + states[:1]) == expected
 
 
+def test_capability_text_surfaces_actionable_detail_for_terminal_error():
+    # A terminal-error server (e.g. after retries are exhausted -- Track C3)
+    # must give the model more than "down": the closed statusdetail
+    # vocabulary already distinguishes a transient spawn/timeout failure
+    # (worth "I'll retry next launch") from an auth failure (worth "needs a
+    # reauth"), so it should flow into the capability text verbatim.
+    text = brain_mod._capability_system_text(
+        [],
+        [{"name": "google", "state": "error", "detail": "spawn failed"}],
+    )
+    assert "google: error (spawn failed)" in text
+
+
+def test_capability_text_omits_detail_for_non_error_states():
+    text = brain_mod._capability_system_text(
+        [],
+        [{"name": "google", "state": "connected", "detail": "ready"}],
+    )
+    assert "google: connected" in text
+    assert "(ready)" not in text
+
+
 def test_refusal_sentence_streams_through_undelayed_and_unchanged(caplog):
     # The host must NEVER fabricate "I can do that with X - shall I?" (item 1):
     # the capability-refusal substitution is gone, so a refusal-shaped

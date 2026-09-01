@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -18,7 +18,7 @@ import weakref
 import yaml
 
 from .jobobject import kill_process_tree
-from .statusdetail import render_status_detail, status_detail_allowed
+from .statusdetail import STATUS_DETAIL_RENDERERS, render_status_detail, status_detail_allowed
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -46,6 +46,34 @@ _DEFAULT_NEVER_INSTANT = (
     "delete", "remove", "trash", "send", "purchase", "revoke", "permission", "share",
 )
 _DESCRIPTION_LIMIT = 512
+# Retry-with-backoff for the per-server connect attempt (plan Track C3): the
+# google outage was a uv cache eviction making cold `uvx workspace-mcp`
+# resolution take 16.5s or wedge entirely, losing the race against the
+# connect timeout -- with no retry, one bad attempt was terminal until the
+# next full app restart. 3 attempts, ~2s/8s backoff between them, each
+# attempt getting the *full* connect_timeout_s budget (not a shrinking
+# remainder) so a slow-but-not-hung cold start still gets a fair shot on
+# every attempt.
+_DEFAULT_CONNECT_ATTEMPTS = 3
+_DEFAULT_CONNECT_BACKOFF_S = (2.0, 8.0)
+# Only timeout/spawn-class failures are retried -- the transient, process-
+# level shapes behind the outage. Config-shaped failures (config_malformed,
+# config_entry_missing, config_file_missing, config_unreadable,
+# transport_unavailable, executable_missing, session_required, ...) are
+# permanent for the life of this process; retrying them just spends the same
+# backoff budget for the same outcome. Matched against the rendered detail
+# text (the closed statusdetail vocabulary) rather than exception types,
+# since that is the one place the retry/no-retry line is already drawn.
+#
+# The retryable set is derived from STATUS_DETAIL_RENDERERS' own compiled
+# patterns at import time (not a hardcoded literal like "spawn failed"): a
+# future rewording of the "timeout"/"spawn_failed" detail text moves this
+# set with it automatically, so it can never silently desync from the
+# vocabulary and stop retrying the very failure shapes the outage was.
+_RETRYABLE_ERROR_DETAIL_KEYS = ("timeout", "spawn_failed")
+_RETRYABLE_ERROR_PATTERNS = tuple(
+    STATUS_DETAIL_RENDERERS["error"][key].pattern for key in _RETRYABLE_ERROR_DETAIL_KEYS
+)
 
 
 SessionFactory = Callable[
@@ -54,11 +82,52 @@ SessionFactory = Callable[
 ServerHook = Callable[[str, "ToolRegistry"], None]
 StateHook = Callable[[str, str, list[dict]], None]
 ProcessTreeKiller = Callable[..., subprocess.CompletedProcess]
+SleepFn = Callable[[float], Awaitable[None]]
 _active_servers: weakref.ReferenceType | None = None
 
 
 class McpSessionError(ValueError):
     """A short-lived MCP session was rejected before retention."""
+
+
+class _ConnectExhausted(Exception):
+    """Carries an already-classified terminal connect failure out of the
+    per-server retry loop, so the outer handler doesn't have to reclassify
+    it (and so a genuinely new exception raised after connection, e.g. from
+    ``stop.wait()``, is never mistaken for a connect-phase failure)."""
+
+    def __init__(self, error: str, state: str, detail: str) -> None:
+        super().__init__(detail)
+        self.error = error
+        self.state = state
+        self.detail = detail
+
+
+def _connect_attempts(defaults: Mapping) -> int:
+    value = defaults.get("connect_retries", _DEFAULT_CONNECT_ATTEMPTS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("invalid MCP connect_retries")
+    return value
+
+
+def _connect_backoffs(defaults: Mapping) -> tuple[float, ...]:
+    value = defaults.get("connect_retry_backoff_s", _DEFAULT_CONNECT_BACKOFF_S)
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or not all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) and item >= 0
+            for item in value
+        )
+    ):
+        raise ValueError("invalid MCP connect_retry_backoff_s")
+    return tuple(float(item) for item in value)
+
+
+def _is_retryable_failure(state: str, detail: str) -> bool:
+    if state != "error":
+        return False
+    return any(pattern.fullmatch(detail) for pattern in _RETRYABLE_ERROR_PATTERNS)
 
 
 def _exception_leaves(exc: BaseException) -> list[BaseException]:
@@ -300,6 +369,20 @@ def _never_instant_patterns(defaults: Mapping) -> tuple[str, ...]:
     return tuple(pattern.casefold() for pattern in patterns)
 
 
+def _args_override(value: Any) -> list[str]:
+    """Replace an entire ``from_claude_config``/``command`` argv with a
+    version Atlas alone spawns (plan Track C3: pin the google server to a
+    known-good ``workspace-mcp`` release so a `uv` cache eviction can't
+    silently jump Atlas to an untested newer version, without ever editing
+    the shared ``~/.claude.json`` entry Claude Code also uses).
+    """
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError("invalid MCP args_override")
+    return list(value)
+
+
 def _blocked_tools(server_cfg: Mapping) -> frozenset[str]:
     blocked = server_cfg.get("blocked", ())
     if not isinstance(blocked, (list, tuple)) or not all(
@@ -439,6 +522,7 @@ class McpServers:
         account_values: Mapping[str, str] | None = None,
         killer: ProcessTreeKiller = kill_process_tree,
         wall_clock: Callable[[], float] = time.time,
+        sleep: SleepFn = asyncio.sleep,
     ):
         global _active_servers
         self._config = config
@@ -449,6 +533,7 @@ class McpServers:
         self._account_values = dict(account_values or {})
         self._killer = killer
         self._wall_clock = wall_clock
+        self._sleep = sleep
         self._stdio_enter_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
         self._sessions: dict[str, ClientSession] = {}
@@ -569,39 +654,85 @@ class McpServers:
         ready: asyncio.Event,
         stop: asyncio.Event,
     ) -> None:
+        max_attempts = _connect_attempts(defaults)
+        backoffs = _connect_backoffs(defaults)
         stack = AsyncExitStack()
         session = None
         stage = "resolving"
         command = None
+        attempt = 1
         try:
-            async with asyncio.timeout(timeout_s):
-                spec = self._resolve_spec(server_cfg)
-                command = spec.command
-                stage = "starting"
-                session = await stack.enter_async_context(self._session_factory(name, spec))
-                async with self._session_lock:
-                    self._sessions[name] = session
-                    generation = self._session_generations.get(name, 0)
-                    await self._notify_held_session(name, session)
-                stage = "listing"
-                listed = await session.list_tools()
-                async with self._session_lock:
-                    if self._session_generations.get(name, 0) != generation:
-                        await self._notify_held_session(name, session)
-                blocked = _blocked_tools(server_cfg)
-                exposed = _exposed_tools(server_cfg)
-                missing = _missing_exposed_tools(exposed, listed.tools)
-                if missing:
-                    _LOGGER.warning(
-                        "MCP server %s expose: names not offered by the server: %s",
-                        name,
-                        ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
+            while True:
+                try:
+                    async with asyncio.timeout(timeout_s):
+                        spec = self._resolve_spec(server_cfg)
+                        command = spec.command
+                        stage = "starting"
+                        session = await stack.enter_async_context(self._session_factory(name, spec))
+                        async with self._session_lock:
+                            self._sessions[name] = session
+                            generation = self._session_generations.get(name, 0)
+                            await self._notify_held_session(name, session)
+                        stage = "listing"
+                        listed = await session.list_tools()
+                        async with self._session_lock:
+                            if self._session_generations.get(name, 0) != generation:
+                                await self._notify_held_session(name, session)
+                        blocked = _blocked_tools(server_cfg)
+                        exposed = _exposed_tools(server_cfg)
+                        missing = _missing_exposed_tools(exposed, listed.tools)
+                        if missing:
+                            _LOGGER.warning(
+                                "MCP server %s expose: names not offered by the server: %s",
+                                name,
+                                ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
+                            )
+                        mirrored = [
+                            self._mirror_tool(name, server_cfg, defaults, session, tool)
+                            for tool in listed.tools
+                            if tool.name not in blocked and (exposed is None or tool.name in exposed)
+                        ]
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    error = type(exc).__name__
+                    state, detail = _failure_status(
+                        exc,
+                        stage=stage,
+                        command=command if command is not None else server_cfg.get("command"),
+                        timeout_s=timeout_s,
                     )
-                mirrored = [
-                    self._mirror_tool(name, server_cfg, defaults, session, tool)
-                    for tool in listed.tools
-                    if tool.name not in blocked and (exposed is None or tool.name in exposed)
-                ]
+                    if attempt >= max_attempts or not _is_retryable_failure(state, detail):
+                        raise _ConnectExhausted(error, state, detail) from exc
+                    async with self._session_lock:
+                        if self._sessions.get(name) is session:
+                            self._sessions.pop(name, None)
+                    session = None
+                    with suppress(Exception):
+                        await stack.aclose()
+                    self._kill_server_tree(name)
+                    backoff = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                    self._set_status(
+                        name,
+                        state="connecting",
+                        detail=render_status_detail(
+                            "connecting", "retrying",
+                            attempt=attempt + 1, max_attempts=max_attempts,
+                        ),
+                        connected=False,
+                        tools=0,
+                        error=error,
+                    )
+                    _LOGGER.warning(
+                        "MCP server %s connect attempt %d/%d failed (%s) -- retrying in %gs",
+                        name, attempt, max_attempts, error, backoff,
+                    )
+                    await self._sleep(backoff)
+                    stack = AsyncExitStack()
+                    stage = "resolving"
+                    command = None
+                    attempt += 1
             self._call_settings[name] = (
                 server_cfg,
                 float(defaults.get("call_timeout_s", 8)),
@@ -622,13 +753,16 @@ class McpServers:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            error = type(exc).__name__
-            state, detail = _failure_status(
-                exc,
-                stage=stage,
-                command=command if command is not None else server_cfg.get("command"),
-                timeout_s=timeout_s,
-            )
+            if isinstance(exc, _ConnectExhausted):
+                error, state, detail = exc.error, exc.state, exc.detail
+            else:
+                error = type(exc).__name__
+                state, detail = _failure_status(
+                    exc,
+                    stage=stage,
+                    command=command if command is not None else server_cfg.get("command"),
+                    timeout_s=timeout_s,
+                )
             tools_changed = self._replace_server_tools(name, registry, [], None)
             self._set_status(
                 name,
@@ -772,10 +906,13 @@ class McpServers:
             source = configured[config_name]
         if not isinstance(source, Mapping) or not isinstance(source.get("command"), str):
             raise ValueError("invalid MCP server config")
+        args = list(source.get("args", ()))
+        if "args_override" in server_cfg:
+            args = _args_override(server_cfg["args_override"])
         _, StdioServerParameters, _ = _load_mcp_transport()
         return StdioServerParameters(
             command=source["command"],
-            args=list(source.get("args", ())),
+            args=args,
             env=dict(source["env"]) if source.get("env") is not None else None,
         )
 
