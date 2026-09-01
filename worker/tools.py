@@ -87,6 +87,11 @@ class Tool:
     policy: Policy = "instant"
     prepare: Callable[[dict], dict | _PreparedAction] | None = None
     execute_prepared: Callable[[dict, Any], Awaitable[Any]] | None = None
+    domain: str | None = None
+    # Consulted only when policy == "instant" (see ToolRegistry.call); this is
+    # what makes "escalate can only move instant -> confirm" structurally true
+    # rather than a convention callers must remember.
+    escalate: Callable[[Mapping], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +245,29 @@ class ToolRegistry:
                 if not isinstance(transcript, str) or not transcript.strip():
                     return ToolResult("error", "missing turn transcript")
                 copied["brief"] = f"{transcript}{_TAINTED_BRIEF_SUFFIX}"
-            if tool.policy == "confirm":
+            # escalate may only turn an instant tool into a confirm for this
+            # call; a tool whose declared policy is already "confirm" never
+            # reaches this branch's condition, so escalate is structurally
+            # ignored for it (never a de-escalation path).
+            effective_policy = tool.policy
+            if effective_policy == "instant" and tool.escalate is not None:
+                try:
+                    escalated = bool(tool.escalate(copied))
+                except Exception:
+                    escalated = True  # fail closed: a broken rule still confirms
+                if escalated:
+                    effective_policy = "confirm"
+            if effective_policy == "confirm":
+                # Mirrors the declared-confirm guard above: an escalated
+                # instant tool reaches this branch too, and must not clobber
+                # an already-pending action just because its own policy was
+                # "instant" going in (rule 5: one expiring, single-use
+                # pending action).
+                if self.pending is not None:
+                    return ToolResult(
+                        "error",
+                        "a previous action is still awaiting Daniel's yes or no",
+                    )
                 serialized = json.dumps(copied, ensure_ascii=False)
                 if len(serialized) > _READBACK_ARGUMENT_LIMIT:
                     return ToolResult("error", "too large to read back; split it")
