@@ -1653,7 +1653,9 @@ def test_a_host_minted_handle_survives_an_mcp_call_and_dies_with_the_turn(tmp_pa
     ]
     results = client.messages.calls[3]["messages"][-1]["content"]
     assert results[0]["is_error"] is False
-    assert json.loads(results[0]["content"]) == {"opened": str(document.resolve())}
+    assert json.loads(results[0]["content"]) == {
+        "opened": str(document.resolve()), "focused": False,
+    }
     for refused in results[1:]:
         assert refused["is_error"] is True
         assert refused["content"] == (
@@ -2475,7 +2477,9 @@ def test_a_host_authored_mcp_result_does_not_taint_the_turn(tmp_path):
     assert by_root["is_error"] is False
     # Nothing tainted the turn, so a plain path works again too.
     assert by_path["is_error"] is False
-    assert json.loads(by_path["content"]) == {"opened": str(downloads.resolve())}
+    assert json.loads(by_path["content"]) == {
+            "opened": str(downloads.resolve()), "focused": False,
+        }
     assert launched == [str(downloads.resolve()), str(downloads.resolve())]
 
 
@@ -2493,7 +2497,9 @@ def test_a_genuinely_content_bearing_result_still_refuses_paths_but_not_roots(tm
     # A root is one of N host-authored constants, so it survives -- which is
     # what keeps "open my downloads" answerable after reading mail.
     assert by_root["is_error"] is False
-    assert json.loads(by_root["content"]) == {"opened": str(downloads.resolve())}
+    assert json.loads(by_root["content"]) == {
+            "opened": str(downloads.resolve()), "focused": False,
+        }
     assert launched == [str(downloads.resolve())]
 
 

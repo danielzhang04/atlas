@@ -55,17 +55,35 @@ _HANDLE_TOOLS = frozenset({"open_file", "open_folder"})
 # find_file's `root` narrows the search to one configured root; `query` is
 # still required, so this tool cannot use the _HANDLE_TOOLS "nothing is
 # required" rule.
-_OPTIONAL_PROPERTIES = {"find_file": frozenset({"root"})}
-_HANDLE_TARGETS = ("path", "handle", "root")
+# `open` joins this map for the same reason find_file did: it now takes
+# exactly one of target/link and neither is required, so the schema must not
+# demand either. It deliberately stays OUT of _HANDLE_TOOLS -- that set means
+# "nothing is required AND a handle is the only thing that survives taint",
+# and open's taint rule is its own (aliases and link handles pass, free-text
+# targets do not).
+_OPTIONAL_PROPERTIES = {
+    "find_file": frozenset({"root"}),
+    "open": frozenset({"target", "link"}),
+}
+# Per tool, the mutually exclusive ways to name what to act on. Every one of
+# these is settled by _handle_target_conflict before the taint gate runs.
+_HANDLE_TARGETS = {
+    "open_file": ("path", "handle", "root"),
+    "open_folder": ("path", "handle", "root"),
+    "open": ("target", "link"),
+}
 
 
 def _handle_target_conflict(name: str, arguments: Mapping[str, Any]) -> str | None:
-    """The exactly-one(path/handle/root) rule, as one reusable sentence."""
-    if name not in _HANDLE_TOOLS:
+    """The exactly-one-target rule, as one reusable sentence per tool."""
+    keys = _HANDLE_TARGETS.get(name)
+    if keys is None:
         return None
-    supplied = [key for key in _HANDLE_TARGETS if arguments.get(key) is not None]
+    supplied = [key for key in keys if arguments.get(key) is not None]
     if len(supplied) <= 1:
         return None
+    if name == "open":
+        return "provide either target or link, not both"
     if set(supplied) == {"path", "handle"}:
         # Kept verbatim: this is the wording the pre-root registry returned,
         # and it is pinned by tests that predate this unit.
@@ -100,6 +118,14 @@ _TAINT_REFUSAL_HANDLE = (
 _UNKNOWN_HANDLE = (
     "unknown handle; call find_file first and use a handle from its results"
 )
+_UNKNOWN_LINK_HANDLE = (
+    "unknown link handle; use one a tool result printed this turn"
+)
+_LINK_NOT_ALLOWED = "that link is not an openable https URL"
+# How long a "what did I just open" record stays answerable. Long enough to
+# cover a real conversation ("...actually, bring that back"), short enough
+# that it never resurrects something from a different sitting.
+_LAST_OPENED_TTL_S = 600.0
 _TAINTED_BRIEF_SUFFIX = "\n\n(Atlas: content read during this turn was not forwarded.)"
 _TRUNCATED = "...[truncated]"
 _DESKTOP_DELETE_CHORDS = ("delete", "ctrl+d", "ctrl+x", "shift+delete")
@@ -224,10 +250,19 @@ def _pending_collision(pending: PendingAction) -> str:
     )
 
 
+_HandleKind = Literal["file", "folder", "link"]
+# Id prefixes, per kind. Nothing depends on the letter -- resolve() looks the
+# id up whole and every caller checks `kind` itself -- but a link id that
+# reads like "u7" and a file id that reads like "f7" keep the transcript
+# legible, and keep a model that guesses from shape guessing wrong rather
+# than plausibly.
+_HANDLE_PREFIXES: dict[str, str] = {"file": "f", "folder": "f", "link": "u"}
+
+
 @dataclass(frozen=True, slots=True)
 class Handle:
-    path: str
-    kind: Literal["file", "folder"]
+    kind: _HandleKind
+    value: str
 
 
 class _HandleTable:
@@ -237,11 +272,19 @@ class _HandleTable:
     into an action target. Handles keep that true while still allowing
     search-then-act: the only writer is `ToolRegistry._mint_handle`, called by
     the `find_file` builtin with paths `LocalFiles` already resolved inside the
-    configured roots. Nothing a model says -- and nothing an MCP server
-    returns, including text that looks like "handle: f1" -- can add an entry,
-    so a resolvable handle always names a path this host produced this turn.
+    configured roots, and by the MCP mirror with URLs it validated against a
+    configured host allowlist. Nothing a model says -- and nothing an MCP
+    server returns, including text that looks like "handle: f1" -- can add an
+    entry, so a resolvable handle always names a target this host produced and
+    checked this turn.
     Ids are not secrets: every entry is already host-validated, so guessing one
-    only ever reaches another of this turn's own in-roots search results.
+    only ever reaches another of this turn's own in-roots search results, or
+    one of this turn's own allowlisted links.
+
+    Targets are TAGGED, not bare paths: a "link" handle can never be spent as
+    a file path (file_target checks kind) and a "file" handle can never be
+    spent as a URL (open_target checks kind), so widening the table to URLs
+    did not widen what open_file/open_folder will act on.
 
     Ids are minted from a counter that `clear()` deliberately does NOT reset.
     Positional per-turn ids aliased: turn 1's "f1" named one file, turn 2's
@@ -260,15 +303,18 @@ class _HandleTable:
         # Entries only. _next survives for the life of the registry.
         self._entries.clear()
 
-    def mint(self, path: str, kind: str) -> str | None:
-        if not isinstance(path, str) or not path or kind not in ("file", "folder"):
+    def mint(self, value: str, kind: str) -> str | None:
+        if not isinstance(value, str) or not value or kind not in _HANDLE_PREFIXES:
             raise ValueError("invalid handle target")
-        # The bound is per turn: _entries is what clear() empties.
+        # The bound is per turn and SHARED across kinds: _entries is what
+        # clear() empties, and one budget means a page full of links cannot
+        # crowd out the file handles a later find_file in the same turn needs
+        # (or the reverse) without the shortfall being noted at both sites.
         if len(self._entries) >= _HANDLE_LIMIT:
             return None
-        handle = f"f{self._next}"
+        handle = f"{_HANDLE_PREFIXES[kind]}{self._next}"
         self._next += 1
-        self._entries[handle] = Handle(path, kind)
+        self._entries[handle] = Handle(kind, value)
         return handle
 
     def resolve(self, handle: Any) -> Handle | None:
@@ -282,6 +328,26 @@ class AppEntry:
     words: tuple[str, ...]
     url: str | None = None
     exe: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenedRecord:
+    """What the host last put on Daniel's screen, for focus_last_opened.
+
+    Every field is written by host code from a real open that returned ok.
+    `_handle` is a native HWND and stays private for the same reason every
+    other handle in Atlas does (rule 12): it is never serialized into a tool
+    result, never reaches the model, and is only ever spent by
+    desktopcontrol.focus_resolved_window inside this process.
+    """
+
+    kind: str
+    label: str
+    at: float
+    title: str | None = None
+    pid: int | None = None
+    process_path: str | None = None
+    _handle: int | None = None
 
 
 class _JobLike(Protocol):
@@ -317,14 +383,78 @@ class ToolRegistry:
         self._executions: dict[object, dict[str, str]] = {}
         self._execution_observer: Callable[[dict[str, str] | None], None] | None = None
         self._handles = _HandleTable()
+        self._link_hosts: frozenset[str] = frozenset()
+        self._last_opened: _OpenedRecord | None = None
 
     def begin_turn(self) -> None:
-        """Reset per-turn host state. Handles live for exactly one turn."""
+        """Reset per-turn host state. Handles live for exactly one turn.
+
+        _last_opened deliberately SURVIVES: "bring back what you just opened"
+        is asked on the turn AFTER the open, so a per-turn record would be
+        empty exactly when it is needed. It is bounded by time instead
+        (_LAST_OPENED_TTL_S) and holds one record, never a history.
+        """
         self._handles.clear()
 
-    def _mint_handle(self, path: str, kind: str) -> str | None:
+    def _mint_handle(self, value: str, kind: str) -> str | None:
         """Host-only: record a target this host validated, return its id."""
-        return self._handles.mint(path, kind)
+        return self._handles.mint(value, kind)
+
+    def _configure_link_hosts(self, hosts: Any) -> None:
+        """Host-only: the closed host vocabulary openable link handles rest on.
+
+        Accumulated (not replaced) because each MCP server contributes its own
+        `link_hosts:` list as it connects. Minting already checked the URL
+        against the ONE server's list that produced it; this union is what the
+        second, open-time check re-validates against, so a link handle can
+        still only ever name a host Daniel configured somewhere.
+        """
+        names = frozenset(
+            host.strip().casefold()
+            for host in hosts
+            if isinstance(host, str) and host.strip()
+        )
+        self._link_hosts |= names
+
+    def _link_host_allowed(self, url: Any) -> bool:
+        """https, no userinfo, and a configured host -- checked at both ends."""
+        if not isinstance(url, str) or not url or not _direct_https(url):
+            return False
+        hostname = urlsplit(url).hostname
+        return hostname is not None and hostname.casefold() in self._link_hosts
+
+    def _note_opened(self, record: Mapping[str, Any]) -> None:
+        """Host-only: remember the one thing this host most recently opened.
+
+        Called by host code on the success path of a real open, never by a
+        tool argument and never from anything a model or an MCP server said.
+        """
+        kind = record.get("kind")
+        # Bounded and scrubbed like every other stored field: `label` is the
+        # one part of this record that is later spoken back inside a tool
+        # result, so it goes through the same treatment as a window title
+        # even though today's writers only ever pass host-shaped strings.
+        label = _optional_text(record.get("label"))
+        if not isinstance(kind, str) or label is None:
+            return
+        self._last_opened = _OpenedRecord(
+            kind=kind,
+            label=label,
+            at=self._clock(),
+            title=_optional_text(record.get("title")),
+            pid=_optional_positive_int(record.get("pid")),
+            process_path=_optional_text(record.get("process_path")),
+            _handle=_optional_positive_int(record.get("hwnd")),
+        )
+
+    def _recent_open(self) -> _OpenedRecord | None:
+        record = self._last_opened
+        if record is None:
+            return None
+        if self._clock() - record.at > _LAST_OPENED_TTL_S:
+            self._last_opened = None
+            return None
+        return record
 
     def _resolve_handle(self, handle: Any) -> Handle | None:
         return self._handles.resolve(handle)
@@ -539,6 +669,17 @@ class ToolRegistry:
             return True
         if name != "open":
             return False
+        link = arguments.get("link")
+        if link is not None:
+            # A link handle is host-minted from a URL this host already
+            # validated against the configured host allowlist, so it is the
+            # same shape of carve-out as a file handle: the model chose an id,
+            # not a destination. That is exactly what "open my skincare guide"
+            # needs -- the Drive URL only ever exists inside a tainting google
+            # result, so a rule that refuses every URL after external content
+            # refuses the only form the answer can take.
+            entry = self._handles.resolve(link)
+            return entry is None or entry.kind != "link"
         target = arguments.get("target")
         if not isinstance(target, str):
             return False
@@ -707,21 +848,75 @@ def builtin(
             return {"opened": name, "via": "web", "already": True}
         opener(url)
         recent_web_opens[name] = now
+        note_web_open(name)
         return {"opened": name, "via": "web"}
 
+    def note_web_open(label: str) -> None:
+        """Record a browser open as the last thing opened -- deliberately
+        WITHOUT any window identity.
+
+        The brain tells the model that focus_last_opened brings back what was
+        just opened. Leaving browser opens unrecorded made that a lie in the
+        worst direction: the record still held some earlier app or file, so
+        "bring that back" raised a stale window and called it the thing
+        Daniel had just opened.
+
+        Recorded without title/pid/process_path on purpose. A browser open
+        genuinely has no window Atlas can name: webbrowser hands the URL to
+        whatever browser is registered, usually as a TAB in a window that
+        already existed, so there is no new window to attribute and the
+        browser's other windows are indistinguishable from it. Rather than
+        invent an identity, the record carries none -- and focus_last_opened
+        reads that as "the last open is not refocusable" and says so.
+        """
+        registry._note_opened({"kind": "web", "label": label})
+
+    def note_app_open(app_id: str, name: str, opened: Any) -> None:
+        """Record a desktop-app open so focus_last_opened can find it again."""
+        if not isinstance(opened, Mapping):
+            return
+        registry._note_opened({
+            "kind": "app",
+            "label": name,
+            "pid": opened.get("pid"),
+            # Resolved host-side from the allowlisted profile id: the process
+            # path is the identity that survives a launcher pid exiting, and
+            # it never travels in the tool result the model sees.
+            "process_path": desktopapps.profile_executable_path(app_id),
+        })
+
     async def open_target(arguments: dict) -> ToolResult | dict:
+        link = arguments.get("link")
+        if link is not None:
+            # Gate-and-executor double check (the file-handle precedent): the
+            # taint gate already resolved this id, and the URL was validated
+            # at MINT time against the configured link hosts. Both checks run
+            # again here, at the moment of the actual open, so the executor
+            # never trusts a decision made by the layer above it.
+            entry = registry._resolve_handle(link)
+            if entry is None or entry.kind != "link":
+                return ToolResult("error", _UNKNOWN_LINK_HANDLE)
+            url = entry.value
+            if not registry._link_host_allowed(url):
+                return ToolResult("error", _LINK_NOT_ALLOWED)
+            opener(url)
+            note_web_open(url)
+            return {"opened": url, "via": "link"}
         target = _text_argument(arguments, "target", maximum=2048)
         entry = aliases.get(target.casefold())
         if entry is not None:
             name, app = entry
             if app.exe is not None:
                 try:
-                    opened = profile_opener(app.exe, None)
+                    # Off-thread for the same reason as open_file: the
+                    # launcher now polls for its window before returning.
+                    opened = await asyncio.to_thread(profile_opener, app.exe, None)
                 except desktopapps.DesktopAppError:
                     if app.url is None:
                         raise
                     return open_web(name, app.url)
                 else:
+                    note_app_open(app.exe, name, opened)
                     if (
                         isinstance(opened, Mapping)
                         and opened.get("focused") is True
@@ -736,8 +931,97 @@ def builtin(
                 return ToolResult("error", "unknown app")
         if _direct_https(target):
             opener(target)
+            note_web_open(target)
             return {"opened": target}
         return ToolResult("error", "unknown app")
+
+    async def focus_last_opened(_: dict) -> ToolResult | dict:
+        # ZERO arguments, deliberately, and that is the whole security
+        # argument for this tool: there is no property for a model to fill,
+        # so there is nothing planted external content can steer. It acts
+        # only on a record HOST code wrote from its own successful open. It
+        # therefore survives taint by construction rather than by carve-out,
+        # which is why it appears in no taint list below.
+        record = registry._recent_open()
+        if record is None:
+            return ToolResult("error", "nothing recently opened")
+        if (
+            record._handle is None
+            and record.pid is None
+            and record.process_path is None
+        ):
+            # The last open carries no window identity at all -- a browser
+            # open, which usually became a tab in a window that already
+            # existed. Refusing here is the point: without it this fell
+            # through to the older record underneath and confidently raised
+            # something Daniel did not just open.
+            return ToolResult(
+                "error",
+                f"{record.label} opened in the browser -- there is no Atlas "
+                f"window to bring back",
+            )
+        api = desktop_api()
+        # Live hwnd -> pid -> process path. Each step is skipped when the
+        # record carries nothing for it, and a step that fails falls through
+        # to the next rather than ending the call: a window that has since
+        # been closed and reopened keeps the same process path but neither
+        # its old handle nor (for a document) any pid Atlas ever knew.
+        # Broad except: every step here is a native call whose failure modes
+        # (window gone, ambiguous match, control unavailable) are all "try
+        # the next identity", and none of them should end the turn.
+        if (
+            record._handle is not None
+            and record.title is not None
+            and record.pid is not None
+        ):
+            try:
+                api.focus_resolved_window({
+                    "_handle": record._handle,
+                    "title": record.title,
+                    "pid": record.pid,
+                })
+            except Exception:
+                pass
+            else:
+                return {"focused": record.label}
+        if record.pid is not None:
+            try:
+                api.focus_window(pid=record.pid)
+            except Exception:
+                pass
+            else:
+                return {"focused": record.label}
+        if record.process_path is not None:
+            # The WHOLE list, not the first match, and this is the ordinary
+            # path rather than a corner: note_app_open stores only a pid and
+            # a process path, and the pid it stores is the launcher's, which
+            # for most apps has already exited by the time this runs. So a
+            # first-match lookup here was Atlas routinely picking an
+            # arbitrary window of a multi-window app and calling it the one
+            # Daniel opened.
+            try:
+                windows = api.windows_by_process_path(record.process_path)
+            except Exception:
+                windows = []
+            if len(windows) > 1:
+                # Honest refusal. `label` is host-shaped; the candidates'
+                # titles are page text and are deliberately not listed.
+                return ToolResult(
+                    "error",
+                    f"{record.label} has more than one window open and Atlas "
+                    f"cannot tell which one it opened",
+                )
+            if windows:
+                try:
+                    api.focus_resolved_window(windows[0])
+                except Exception:
+                    pass
+                else:
+                    return {"focused": record.label}
+        # Honest failure, not a swallowed one: the record exists, the window
+        # does not. `label` is host-shaped (a path, an app name Atlas
+        # configured) -- never the window's own title, which is page text.
+        return ToolResult("error", f"{record.label} is no longer open")
 
     async def focus(arguments: dict) -> ToolResult | dict:
         target = _text_argument(arguments, "app", maximum=256)
@@ -869,20 +1153,29 @@ def builtin(
         entry = registry._resolve_handle(handle)
         if entry is None:
             raise ValueError(_UNKNOWN_HANDLE)
+        if entry.kind == "link":
+            # A URL is not a path. Spending a link handle here would hand
+            # LocalFiles.resolve a string it would reject anyway, but saying
+            # so plainly is what keeps the two handle kinds from blurring.
+            raise ValueError("that handle is a link; pass it to open as link")
         if entry.kind == expected:
-            return entry.path
+            return entry.value
         if expected == "file":
             raise ValueError("that handle is a folder; use open_folder")
         # "open the folder that file is in": the parent is derived by the host
         # from an already-validated path, never supplied by the model, and
         # LocalFiles re-checks confinement before opening it.
-        return str(Path(entry.path).parent)
+        return str(Path(entry.value).parent)
 
+    # LocalFiles' own off-loop, deadline-bounded wrappers, not the raw sync
+    # ones these used to call. Opening now waits (bounded) for the window it
+    # produced so it can focus it, and blocking the event loop for that long
+    # would stall speech, status, and every other turn in flight.
     async def open_file(arguments: dict) -> dict:
-        return files.open(file_target(arguments, "file"))
+        return await files.open_file(file_target(arguments, "file"))
 
     async def open_folder(arguments: dict) -> dict:
-        return files.open_folder(file_target(arguments, "folder"))
+        return await files.open_directory(file_target(arguments, "folder"))
 
     async def read_file(arguments: dict) -> dict:
         path = _text_argument(arguments, "path", maximum=2048)
@@ -981,8 +1274,16 @@ def builtin(
             return ToolResult("error", "focused window changed; delete not executed")
 
     definitions = (
-        ("open", _open_description(aliases), {"target": {"type": "string"}}, open_target),
+        ("open", _open_description(aliases), {
+            "target": {"type": "string"}, "link": {"type": "string"},
+        }, open_target),
         ("focus", "Focus an allowlisted desktop app.", {"app": {"type": "string"}}, focus),
+        (
+            "focus_last_opened",
+            "Bring the thing Atlas most recently opened back to the front. Takes no "
+            "arguments -- never call list_windows first.",
+            {}, focus_last_opened,
+        ),
         ("launch_work", "Launch longer work in the background.", {
             "title": {"type": "string"}, "brief": {"type": "string"},
         }, launch_work),
@@ -996,6 +1297,13 @@ def builtin(
         # getattr, not attribute access: `files` is a duck type here (the
         # confined-service seam), and a stand-in without named roots should
         # lose the `root` argument, not fail to register the file tools.
+        # Host-to-host wiring: LocalFiles hands the registry the private
+        # window record for each successful open so focus_last_opened can
+        # find it again. getattr for the same duck-type reason as below -- a
+        # stand-in without the hook simply records nothing.
+        set_observer = getattr(files, "set_open_observer", None)
+        if callable(set_observer):
+            set_observer(registry._note_opened)
         root_names = sorted(getattr(files, "root_names", {}))
         # The registry needs the same closed vocabulary the schema enum
         # publishes, so the taint carve-out can check membership itself.
@@ -1261,11 +1569,19 @@ def _open_description(aliases: Mapping[str, tuple[str, AppEntry]]) -> str:
     listed = ", ".join(kept)
     if len(names) > len(kept):
         listed += ", ..." if listed else "..."
+    link_sentence = (
+        " To open a link a tool result printed, pass link with that result's handle "
+        "instead of target; never paste the URL itself."
+    )
     if not listed:
-        return "Open an allowlisted app or HTTPS URL."
+        return f"Open an allowlisted app or HTTPS URL.{link_sentence}"
+    # The alias list stays LAST: it is the one unbounded part of this
+    # description, and the schema test that bounds it reads everything after
+    # the colon. A sentence appended after the list would land inside what
+    # that test measures.
     return (
-        "Open an allowlisted app or HTTPS URL. Aliases open the real desktop app "
-        f"when configured: {listed}."
+        f"Open an allowlisted app or HTTPS URL.{link_sentence} Aliases open the real "
+        f"desktop app when configured: {listed}."
     )
 
 
@@ -1438,15 +1754,58 @@ def _bounded_window_inventory(inventory: Any) -> dict[str, Any]:
 def _configured_url(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    parsed = urlsplit(value)
-    return (parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-            and parsed.username is None and parsed.password is None)
+    try:
+        parsed = urlsplit(value)
+        return (parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+                and parsed.username is None and parsed.password is None)
+    except ValueError:
+        return False
 
 
 def _direct_https(value: str) -> bool:
-    parsed = urlsplit(value)
-    return (parsed.scheme == "https" and bool(parsed.netloc)
-            and parsed.username is None and parsed.password is None)
+    """The ONE predicate for "this is a plain https URL", at both ends.
+
+    Used at link-MINT time (mcp_client._openable_link) and again at OPEN time
+    (ToolRegistry._link_host_allowed, open's typed-URL branch), deliberately
+    shared so the two can never drift on what counts as direct.
+
+    Fail-soft, and that is load-bearing rather than tidy. `urlsplit` RAISES
+    ValueError on a netloc holding a character that NFKC-normalizes into one
+    of `/?#@:` -- CPython's `_checknetloc` -- so a Drive file named
+    "Link: https://docs.google.com<fullwidth #>evil.com" is an attacker-
+    plantable exception. Uncaught it escaped the mint closure, escaped
+    `pattern.sub`, escaped the mirrored tool's run(), and ToolRegistry.call
+    turned the WHOLE google result into ToolResult("error", "ValueError") --
+    one shared file permanently breaking every Drive tool. A candidate that
+    cannot even be parsed is simply not a direct https URL: say so and let
+    the rest of the result through.
+
+    Ports are restricted to the https default. A URL is only ever opened by
+    handing it to the browser, and an allowlisted HOST on an unexpected port
+    is a different service than the one the allowlist vouched for.
+    """
+    try:
+        parsed = urlsplit(value)
+        return (parsed.scheme == "https" and bool(parsed.netloc)
+                and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443))
+    except ValueError:
+        # Unparseable netloc, or a port that is not a number. Both are
+        # "not a direct https URL", never an exception for a caller to wear.
+        return False
+
+
+def _optional_text(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return _CONTROL_CHARACTERS.sub("", value)[:512] or None
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    """A pid or a native handle, or nothing. Never a bool, never <= 0."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def _state_value(state: Any) -> str:

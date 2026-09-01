@@ -1021,13 +1021,16 @@ def test_file_and_close_builtins_delegate_to_confined_services():
             calls.append(("find", query))
             return [{"path": "C:/Desk/report.csv", "size": 3, "modified": 1.0}]
 
-        def open(self, path):
+        # The seam is the bounded, off-loop pair (like read_file below), not
+        # the raw sync openers: opening now waits for the window it produced
+        # so it can focus it, and that wait belongs off the loop thread.
+        async def open_file(self, path):
             calls.append(("open_file", path))
-            return {"opened": path}
+            return {"opened": path, "focused": True}
 
-        def open_folder(self, path):
+        async def open_directory(self, path):
             calls.append(("open_folder", path))
-            return {"opened": path}
+            return {"opened": path, "focused": True}
 
         async def read_file(self, path):
             calls.append(("read_file", path))
@@ -1054,8 +1057,8 @@ def test_file_and_close_builtins_delegate_to_confined_services():
     url_close = _call(registry, "close", {"app": "gmail"})
 
     assert json.loads(found.content)[0]["path"] == "C:/Desk/report.csv"
-    assert json.loads(opened.content) == {"opened": "C:/Desk/report.csv"}
-    assert json.loads(opened_folder.content) == {"opened": "C:/Desk"}
+    assert json.loads(opened.content) == {"opened": "C:/Desk/report.csv", "focused": True}
+    assert json.loads(opened_folder.content) == {"opened": "C:/Desk", "focused": True}
     assert json.loads(read.content)["text"] == "abc"
     assert json.loads(closed.content) == {"closed": "vscode"}
     assert url_close == ToolResult("error", "I can close apps, not browser tabs")
@@ -1357,7 +1360,9 @@ def test_open_folder_accepts_root_and_confines_other_directories(tmp_path):
 
     for accepted in (root, allowed):
         result = _call(registry, "open_folder", {"path": str(accepted)})
-        assert json.loads(result.content) == {"opened": str(accepted.resolve())}
+        assert json.loads(result.content) == {
+            "opened": str(accepted.resolve()), "focused": False,
+        }
     assert launched == [str(root.resolve()), str(allowed.resolve())]
 
     # ValueError content now surfaces the host-authored message (bounded,
@@ -1699,7 +1704,7 @@ def test_find_file_mints_a_handle_that_opens_under_taint(tmp_path):
     # The chain C1 exists for: host search -> an MCP call taints the turn ->
     # the preexisting handle still acts.
     result = _call(registry, "open_file", {"handle": "f1"}, tainted=True)
-    assert json.loads(result.content) == {"opened": str(document.resolve())}
+    assert json.loads(result.content) == {"opened": str(document.resolve()), "focused": False}
     assert opened == [str(document.resolve())]
 
 
@@ -1843,7 +1848,15 @@ def test_the_handle_table_lives_only_in_tools_py():
     assert holders == ["worker/tools.py"]
 
 
-def test_handles_are_minted_only_by_the_find_file_builtin():
+def test_handles_are_minted_only_by_find_file_and_the_mcp_link_rewriter():
+    """Exactly two mint sites exist, and both mint host-validated targets.
+
+    find_file mints file/folder handles for paths LocalFiles resolved inside
+    the configured roots; the MCP mirror's link rewriter mints link handles
+    for URLs it checked against the configured host allowlist. A third site
+    appearing anywhere in worker/ is what this test is here to catch -- the
+    taint wall's whole premise is that the handle table has no other writer.
+    """
     from pathlib import Path as _Path
 
     worker_dir = _Path(__file__).parents[1] / "worker"
@@ -1858,12 +1871,29 @@ def test_handles_are_minted_only_by_the_find_file_builtin():
         if "_mint_handle(" in line or "_handles.mint(" in line
     ]
 
-    assert [name for name, _line in mentions] == ["tools.py"] * 3
+    assert [name for name, _line in mentions] == ["mcp_client.py"] + ["tools.py"] * 3
     calls = [
         line for _name, line in mentions
         if "_mint_handle(" in line and not line.startswith("def ")
     ]
-    assert calls == ['handle = registry._mint_handle(item["path"], kind)']
+    assert calls == [
+        'handle = registry._mint_handle(url, "link")',
+        'handle = registry._mint_handle(item["path"], kind)',
+    ]
+    # The link mint sits inside the rewriter, which is only ever reached from
+    # _mirror_tool.run -- never from a tool argument.
+    mcp_lines = sources["mcp_client.py"].splitlines()
+    link_call = next(
+        index for index, line in enumerate(mcp_lines) if line.strip() == calls[0]
+    )
+    link_start = next(
+        index for index, line in enumerate(mcp_lines) if "def _mint_link_handles(" in line
+    )
+    link_end = next(
+        index for index, line in enumerate(mcp_lines) if "def _openable_link(" in line
+    )
+    assert link_start < link_call < link_end
+    calls = calls[1:]
     lines = sources["tools.py"].splitlines()
     call_index = next(
         index for index, line in enumerate(lines) if line.strip() == calls[0]
@@ -1883,7 +1913,7 @@ def test_a_file_handle_opens_its_folder_and_a_folder_handle_refuses_open_file(tm
     folder = _call(registry, "open_folder", {"handle": "f1"}, tainted=True)
     refused = _call(registry, "open_file", {"handle": "f2"}, tainted=True)
 
-    assert json.loads(folder.content) == {"opened": str(plans.resolve())}
+    assert json.loads(folder.content) == {"opened": str(plans.resolve()), "focused": False}
     assert launched == [str(plans.resolve())]
     assert refused == ToolResult("error", "that handle is a folder; use open_folder")
     assert opened == []
@@ -1911,6 +1941,445 @@ def test_handle_tools_keep_path_calls_and_stay_api_compatible(tmp_path):
     # find_file's root is optional scoping; query stays required.
     assert schemas["find_file"]["input_schema"]["required"] == ["query"]
     assert api_incompatible_tool_names(registry.schemas()) == []
+
+
+# --- focus_last_opened -----------------------------------------------------
+
+
+class _FakeDesktop:
+    """Only the three lookups focus_last_opened is allowed to use."""
+
+    def __init__(self, *, resolved=None, by_pid=None, by_path=None,
+                 by_path_all=None):
+        self.calls = []
+        self._resolved = resolved
+        self._by_pid = by_pid
+        self._by_path = by_path
+        # The whole list the process-path branch now asks for. Defaults to
+        # "however many `by_path` is", so the existing single-window cases
+        # read the same as before.
+        self._by_path_all = (
+            by_path_all if by_path_all is not None
+            else ([by_path] if by_path is not None else [])
+        )
+
+    def focus_resolved_window(self, window):
+        self.calls.append(("resolved", window))
+        if window is self._by_path:
+            return {"focused": window["title"], "pid": window["pid"]}
+        if self._resolved is None:
+            raise RuntimeError("window is gone")
+        return self._resolved
+
+    def focus_window(self, **target):
+        self.calls.append(("pid", target))
+        if self._by_pid is None:
+            raise RuntimeError("window not found")
+        return self._by_pid
+
+    def windows_by_process_path(self, path):
+        self.calls.append(("path", path))
+        return list(self._by_path_all)
+
+
+def _focus_setup(desktop, *, clock=None):
+    registry = ToolRegistry(clock=clock) if clock else ToolRegistry()
+    builtin(registry, {}, _FakeWork(), desktop=desktop)
+    return registry
+
+
+def test_focus_last_opened_survives_the_turn_boundary_that_clears_handles():
+    """The record has to outlive the turn: the ask comes on the NEXT one.
+
+    "Bring that back" is never said in the same turn as the open, so a
+    per-turn record would be empty exactly when it is needed. Handles still
+    die at the boundary; this one record does not.
+    """
+    desktop = _FakeDesktop(resolved={"focused": "notes.txt - Notepad", "pid": 91})
+    registry = _focus_setup(desktop)
+    registry._note_opened({
+        "kind": "file", "label": "C:/Docs/notes.txt",
+        "title": "notes.txt - Notepad", "pid": 91, "hwnd": 9001,
+    })
+    registry._mint_handle("C:/Docs/notes.txt", "file")
+
+    registry.begin_turn()
+
+    assert registry._resolve_handle("f1") is None  # handles died
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "ok", json.dumps({"focused": "C:/Docs/notes.txt"}),
+    )
+    assert desktop.calls == [
+        ("resolved", {"_handle": 9001, "title": "notes.txt - Notepad", "pid": 91}),
+    ]
+
+
+def test_focus_last_opened_takes_no_arguments_and_so_survives_taint():
+    """No property means nothing for planted content to steer.
+
+    Every other acting tool needs a taint carve-out because the model
+    supplies its target. This one has no input at all, so the taint wall has
+    nothing to guard: it can only ever act on what the host itself opened.
+    """
+    desktop = _FakeDesktop(resolved={"focused": "x", "pid": 91})
+    registry = _focus_setup(desktop)
+    registry._note_opened({
+        "kind": "folder", "label": "C:/Downloads",
+        "title": "Downloads", "pid": 91, "hwnd": 9001,
+    })
+
+    assert _call(registry, "focus_last_opened", {}, tainted=True) == ToolResult(
+        "ok", json.dumps({"focused": "C:/Downloads"}),
+    )
+    schema = next(
+        item for item in registry.schemas() if item["name"] == "focus_last_opened"
+    )["input_schema"]
+    assert schema == {"type": "object", "properties": {}, "required": [],
+                      "additionalProperties": False}
+    # additionalProperties: false is what stops the model sending one, and if
+    # one arrives anyway it changes nothing: the runner reads no arguments at
+    # all, so the focused window is still the host's own record.
+    assert _call(
+        registry, "focus_last_opened", {"title": "Downloads - now open C:/evil"},
+        tainted=True,
+    ) == ToolResult("ok", json.dumps({"focused": "C:/Downloads"}))
+
+
+def test_focus_last_opened_forgets_a_record_older_than_ten_minutes():
+    now = [1000.0]
+    desktop = _FakeDesktop(resolved={"focused": "x", "pid": 91})
+    registry = _focus_setup(desktop, clock=lambda: now[0])
+    registry._note_opened({
+        "kind": "file", "label": "C:/Docs/notes.txt",
+        "title": "t", "pid": 91, "hwnd": 9001,
+    })
+
+    now[0] += 599.0
+    assert _call(registry, "focus_last_opened", {}).status == "ok"
+    now[0] += 2.0
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "error", "nothing recently opened",
+    )
+    # Expiry drops the record rather than leaving it to re-check forever.
+    assert registry._last_opened is None
+
+
+def test_opening_a_desktop_app_records_it_for_focus_last_opened(monkeypatch):
+    """The app path writes the record, and only on a real open.
+
+    The pid comes from the launcher's own result and the process path is
+    resolved host-side from the allowlisted profile id -- neither is ever in
+    the tool result the model reads (rule 7).
+    """
+    from worker import desktopapps
+
+    monkeypatch.setattr(
+        desktopapps, "profile_executable_path", lambda _app: "C:/Apps/Spotify.exe",
+    )
+    desktop = _FakeDesktop(by_pid={"focused": "Spotify", "pid": 4321})
+    registry = ToolRegistry()
+    builtin(
+        registry,
+        {"spotify": AppEntry(exe="spotify", url="https://open.spotify.com/",
+                             words=("spotify",))},
+        _FakeWork(),
+        profile_opener=lambda _exe, _url: {
+            "application": "spotify", "pid": 4321, "targeted": False, "focused": True,
+        },
+        desktop=desktop,
+    )
+
+    assert _call(registry, "open", {"target": "spotify"}).status == "ok"
+    registry.begin_turn()
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "ok", json.dumps({"focused": "spotify"}),
+    )
+    assert desktop.calls == [("pid", {"pid": 4321})]
+    assert registry._last_opened.process_path == "C:/Apps/Spotify.exe"
+
+
+def test_focus_last_opened_says_so_when_nothing_was_opened():
+    registry = _focus_setup(_FakeDesktop())
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "error", "nothing recently opened",
+    )
+
+
+def test_focus_last_opened_falls_back_from_a_dead_hwnd_to_pid_to_process_path():
+    """Each identity is tried in turn; a failure is not the end of the call.
+
+    A document reopened since is a new window with the old process path and
+    neither the old handle nor any pid Atlas ever saw.
+    """
+    found = {"title": "notes.txt - Notepad", "pid": 92, "_handle": 9002}
+    desktop = _FakeDesktop(by_path=found)  # resolved and pid both fail
+    registry = _focus_setup(desktop)
+    registry._note_opened({
+        "kind": "file", "label": "C:/Docs/notes.txt", "title": "t", "pid": 91,
+        "hwnd": 9001, "process_path": "C:/Windows/notepad.exe",
+    })
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "ok", json.dumps({"focused": "C:/Docs/notes.txt"}),
+    )
+    assert [call[0] for call in desktop.calls] == ["resolved", "pid", "path", "resolved"]
+
+
+def test_focus_last_opened_reports_failure_when_every_identity_is_gone():
+    desktop = _FakeDesktop()  # nothing resolves
+    registry = _focus_setup(desktop)
+    registry._note_opened({
+        "kind": "app", "label": "spotify", "pid": 91,
+        "process_path": "C:/Apps/Spotify.exe",
+    })
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "error", "spotify is no longer open",
+    )
+    # `label` is host-shaped -- an app name Atlas configured, never the
+    # window's own title, which is page text the host did not author.
+    assert [call[0] for call in desktop.calls] == ["pid", "path"]
+
+
+def test_focus_last_opened_refuses_when_the_process_has_several_windows():
+    """DD-2/F3. The process-path branch must not pick a window by luck.
+
+    This is the NORMAL path for an app open, not a corner: note_app_open
+    stores only a pid and a process path, and the pid it stores is the
+    launcher's, which has usually exited by the time this runs. Taking the
+    first match meant Atlas routinely raised an arbitrary window of a
+    multi-window app and announced it as the one Daniel had just opened.
+    """
+    windows = [
+        {"title": "notes.txt - Notepad", "pid": 92, "_handle": 9002},
+        {"title": "taxes.txt - Notepad", "pid": 93, "_handle": 9003},
+    ]
+    desktop = _FakeDesktop(by_path_all=windows)  # resolved and pid both fail
+    registry = _focus_setup(desktop)
+    registry._note_opened({
+        "kind": "app", "label": "notepad", "pid": 91,
+        "process_path": "C:/Windows/notepad.exe",
+    })
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "error",
+        "notepad has more than one window open and Atlas cannot tell which "
+        "one it opened",
+    )
+    # Refused, not guessed: nothing was focused at all...
+    assert [call[0] for call in desktop.calls] == ["pid", "path"]
+    # ...and neither candidate's title leaked into the refusal. Window titles
+    # are page text; `label` is the host-shaped name Atlas configured.
+    assert "notes.txt" not in _call(registry, "focus_last_opened", {}).content
+
+
+def test_a_browser_open_is_recorded_as_not_refocusable(monkeypatch):
+    """DD-2/F6. `open` on a URL must not leave an older record answerable.
+
+    The brain tells the model focus_last_opened brings back what was just
+    opened. Before this, a browser open wrote no record at all, so the call
+    fell through to whatever app or file was opened before it and raised THAT
+    -- confidently, and wrongly. A browser open now records itself with no
+    window identity, and the refusal is explicit.
+    """
+    desktop = _FakeDesktop(resolved={"focused": "notes.txt - Notepad", "pid": 91})
+    opened = []
+    registry = ToolRegistry()
+    builtin(
+        registry,
+        {"spotify": AppEntry(url="https://open.spotify.com/", words=("spotify",))},
+        _FakeWork(),
+        opener=opened.append,
+        desktop=desktop,
+    )
+    # An app open first, so there is genuinely an older record underneath.
+    registry._note_opened({
+        "kind": "file", "label": "C:/Docs/notes.txt",
+        "title": "notes.txt - Notepad", "pid": 91, "hwnd": 9001,
+    })
+
+    assert _call(registry, "open", {"target": "spotify"}).status == "ok"
+    registry.begin_turn()
+
+    assert _call(registry, "focus_last_opened", {}) == ToolResult(
+        "error",
+        "spotify opened in the browser -- there is no Atlas window to bring back",
+    )
+    # The browser open really happened, and it really replaced the record.
+    assert opened == ["https://open.spotify.com/"]
+    assert registry._last_opened.kind == "web"
+    assert registry._last_opened._handle is None
+    assert registry._last_opened.pid is None
+    assert registry._last_opened.process_path is None
+    # Nothing was focused -- the older notepad window stayed where it was.
+    assert desktop.calls == []
+
+
+def test_only_host_code_writes_the_last_opened_record():
+    registry = ToolRegistry()
+    registry._note_opened({"kind": "file", "label": ""})
+    registry._note_opened({"kind": 7, "label": "C:/x"})
+    registry._note_opened({"label": "C:/x"})
+
+    assert registry._last_opened is None
+    # Malformed identity fields are dropped, not stored: a bool pid, a
+    # negative hwnd and a control-character title never reach a native call.
+    registry._note_opened({
+        "kind": "file", "label": "C:/x", "pid": True, "hwnd": -1, "title": "a\x00b",
+    })
+    assert registry._last_opened.pid is None
+    assert registry._last_opened._handle is None
+    assert registry._last_opened.title == "ab"
+
+
+# --- link handles (open by handle instead of by URL) -----------------------
+
+_DRIVE_LINK = "https://drive.google.com/file/d/1a2b/view"
+
+
+def _link_setup(hosts=("drive.google.com", "docs.google.com")):
+    """A registry whose `open` can spend link handles, plus the opened list."""
+    opened: list[str] = []
+    registry = ToolRegistry()
+    builtin(registry, {}, _FakeWork(), opener=opened.append)
+    registry._configure_link_hosts(hosts)
+    return registry, opened
+
+
+def test_a_minted_link_handle_opens_while_the_same_url_typed_out_is_refused():
+    """The whole point of F1, in one test.
+
+    A Drive document's address exists only inside a google result, and a
+    google result taints the turn. Before link handles that meant "open my
+    skincare guide" had no legal form at all: the URL was visible and
+    unusable. The handle is the legal form -- and the URL itself stays
+    refused, so nothing was widened.
+    """
+    registry, opened = _link_setup()
+    handle = registry._mint_handle(_DRIVE_LINK, "link")
+
+    assert handle == "u1"
+    assert _call(registry, "open", {"link": handle}, tainted=True) == ToolResult(
+        "ok", json.dumps({"opened": _DRIVE_LINK, "via": "link"}),
+    )
+    assert opened == [_DRIVE_LINK]
+    # Same URL, model-authored: still refused after external content.
+    assert _call(registry, "open", {"target": _DRIVE_LINK}, tainted=True) == ToolResult(
+        "error", "refused after external content; ask Daniel again next turn",
+    )
+    assert opened == [_DRIVE_LINK]
+
+
+def test_open_by_link_re_validates_the_host_at_open_time():
+    """Gate and executor check independently (the file-handle precedent).
+
+    Minting is where the allowlist is normally enforced. This drives the
+    executor's own check by minting a handle the mint-time check would have
+    refused: `open` must still refuse it, because it does not take the gate's
+    word for what a handle points at.
+    """
+    registry, opened = _link_setup()
+    smuggled = registry._mint_handle("https://evil.test/x", "link")
+
+    assert _call(registry, "open", {"link": smuggled}) == ToolResult(
+        "error", "that link is not an openable https URL",
+    )
+    assert _call(registry, "open", {"link": smuggled}, tainted=True) == ToolResult(
+        "error", "that link is not an openable https URL",
+    )
+    assert opened == []
+
+
+def test_an_unknown_or_stale_link_handle_fails_closed():
+    registry, opened = _link_setup()
+    handle = registry._mint_handle(_DRIVE_LINK, "link")
+    registry.begin_turn()
+
+    # Ids are monotonic, so last turn's id is not reassigned -- it simply is
+    # not in the table any more, clean or tainted.
+    assert _call(registry, "open", {"link": handle}) == ToolResult(
+        "error", "unknown link handle; use one a tool result printed this turn",
+    )
+    assert _call(registry, "open", {"link": "u99"}, tainted=True) == ToolResult(
+        "error", "refused after external content; ask Daniel again next turn",
+    )
+    assert registry._mint_handle(_DRIVE_LINK, "link") == "u2"
+    assert opened == []
+
+
+def test_open_takes_exactly_one_of_target_and_link():
+    registry, opened = _link_setup()
+    handle = registry._mint_handle(_DRIVE_LINK, "link")
+
+    assert _call(registry, "open", {"target": "spotify", "link": handle}) == ToolResult(
+        "error", "provide either target or link, not both",
+    )
+    assert opened == []
+    schema = next(
+        item for item in registry.schemas() if item["name"] == "open"
+    )["input_schema"]
+    assert set(schema["properties"]) == {"target", "link"}
+    assert schema["required"] == []
+    assert api_incompatible_tool_names(registry.schemas()) == []
+
+
+def test_a_link_handle_is_not_a_file_handle_and_a_file_handle_is_not_a_link(tmp_path):
+    registry, document, _plans, opened, _launched = _handle_setup(tmp_path)
+    registry._configure_link_hosts(["drive.google.com"])
+    found = _call(registry, "find_file", {"query": "atlas plan"})
+    file_handle = _handles(found)[str(document.resolve())]
+    link_handle = registry._mint_handle(_DRIVE_LINK, "link")
+
+    assert file_handle == "f1"
+    assert link_handle == "u2"  # one shared, monotonic counter
+    assert _call(registry, "open_file", {"handle": link_handle}) == ToolResult(
+        "error", "that handle is a link; pass it to open as link",
+    )
+    assert _call(registry, "open", {"link": file_handle}) == ToolResult(
+        "error", "unknown link handle; use one a tool result printed this turn",
+    )
+    assert opened == []
+
+
+def test_the_live_chain_a_tainting_drive_search_then_open_by_handle():
+    """Both halves, joined: the real mirror rewriter feeding the real `open`.
+
+    This is the forensics case that started F1. "open my skincare guide"
+    needs a google search (which taints the turn) and then an open of a URL
+    that exists only inside that tainted result. Every earlier test drives
+    one side; this one runs the actual mint site against the actual registry.
+    """
+    from worker import mcp_client
+
+    registry, opened = _link_setup(hosts=())
+    pattern, hosts = mcp_client._link_extraction({
+        "link_pattern": "trailing_link",
+        "link_hosts": ["drive.google.com"],
+    })
+    registry._configure_link_hosts(hosts)
+    result = mcp_client._mint_link_handles(
+        '- Name: "Skincare guide" (ID: 1a2b, Type: application/pdf)'
+        f" Link: {_DRIVE_LINK}\n",
+        pattern, hosts, registry,
+    )
+
+    handle = result.split("[handle: ")[1].split("]")[0]
+    assert _call(registry, "open", {"link": handle}, tainted=True) == ToolResult(
+        "ok", json.dumps({"opened": _DRIVE_LINK, "via": "link"}),
+    )
+    assert opened == [_DRIVE_LINK]
+
+
+def test_open_still_refuses_a_url_on_a_host_no_server_configured():
+    registry, opened = _link_setup(hosts=())
+    handle = registry._mint_handle(_DRIVE_LINK, "link")
+
+    assert _call(registry, "open", {"link": handle}) == ToolResult(
+        "error", "that link is not an openable https URL",
+    )
+    assert opened == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Explorer resolution is Windows-only")
@@ -1953,7 +2422,7 @@ def test_open_folder_by_handle_reaches_the_real_explorer_resolution(tmp_path, mo
     handle = found[0]["handle"]
     result = _call(registry, "open_folder", {"handle": handle}, tainted=True)
 
-    assert json.loads(result.content) == {"opened": str(plans.resolve())}
+    assert json.loads(result.content) == {"opened": str(plans.resolve()), "focused": False}
     command, kwargs = spawned[0]
     assert Path(command[0]).is_file()
     assert Path(command[0]).name.casefold() == "explorer.exe"
@@ -2065,8 +2534,8 @@ def test_open_folder_by_root_works_clean_and_survives_taint(tmp_path):
     # returned outside content, with no earlier find_file and no handle.
     tainted = _call(registry, "open_folder", {"root": "Downloads"}, tainted=True)
 
-    assert json.loads(clean.content) == {"opened": str(downloads.resolve())}
-    assert json.loads(tainted.content) == {"opened": str(downloads.resolve())}
+    assert json.loads(clean.content) == {"opened": str(downloads.resolve()), "focused": False}
+    assert json.loads(tainted.content) == {"opened": str(downloads.resolve()), "focused": False}
     assert launched == [str(downloads.resolve()), str(downloads.resolve())]
 
 
@@ -2316,7 +2785,7 @@ def test_open_folder_by_root_reaches_the_real_explorer_resolution(tmp_path, monk
 
     result = _call(registry, "open_folder", {"root": "downloads"}, tainted=True)
 
-    assert json.loads(result.content) == {"opened": str(downloads.resolve())}
+    assert json.loads(result.content) == {"opened": str(downloads.resolve()), "focused": False}
     command, kwargs = spawned[0]
     assert Path(command[0]).is_file()
     assert Path(command[0]).name.casefold() == "explorer.exe"

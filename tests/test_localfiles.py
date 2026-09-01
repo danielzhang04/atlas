@@ -133,6 +133,215 @@ def test_find_does_not_follow_a_directory_link_outside_the_roots(tmp_path):
     assert LocalFiles([root], opener=lambda _path: None).find("haiku") == []
 
 
+def test_open_focuses_the_window_it_produced_and_reports_it_honestly(tmp_path):
+    """Opening ends with the thing in front, and says whether it managed it.
+
+    The snapshot is taken BEFORE the launch and the focuser is given only
+    that snapshot, so what gets focused is the window this open produced --
+    never one that was already on screen.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    note = root / "notes.txt"
+    note.write_text("hi", encoding="utf-8")
+    folder = root / "plans"
+    folder.mkdir()
+    order = []
+    window = {"title": "notes.txt - Notepad", "pid": 91, "_handle": 9001}
+    files = LocalFiles(
+        [root],
+        opener=lambda path: order.append(("launch", path)),
+        folder_opener=lambda path: order.append(("launch_folder", path)),
+        window_snapshot=lambda: order.append(("snapshot",)) or frozenset({1}),
+        new_window_focuser=lambda before, expected: (
+            order.append(("focus", before, expected))
+            or (window if len(order) < 5 else None)
+        ),
+        handler_resolver=lambda suffix: (
+            "C:/Windows/notepad.exe" if suffix == ".txt" else None
+        ),
+    )
+    recorded = []
+    files.set_open_observer(recorded.append)
+
+    opened = files.open(note)
+    listed = files.open_folder(folder)
+
+    assert opened == {"opened": str(note.resolve()), "focused": True}
+    # Second open: the focuser found nothing unambiguous, and that is
+    # reported as a failure rather than swallowed into a bare "opened".
+    assert listed == {"opened": str(folder.resolve()), "focused": False}
+    # The focuser is handed the expected handler alongside the snapshot, so
+    # what it focuses has to be a window of the process the shell said would
+    # handle this file -- not merely a window that turned up in time.
+    assert order == [
+        ("snapshot",), ("launch", str(note.resolve())),
+        ("focus", frozenset({1}), ("C:/Windows/notepad.exe",)),
+        ("snapshot",), ("launch_folder", str(folder.resolve())),
+        ("focus", frozenset({1}), ()),
+    ]
+    # Only the successful focus is remembered, and the HWND travels to the
+    # host observer -- never in the dict the model reads.
+    assert recorded == [{
+        "kind": "file",
+        "label": str(note.resolve()),
+        "title": "notes.txt - Notepad",
+        "pid": 91,
+        "hwnd": 9001,
+    }]
+    assert "hwnd" not in opened and "_handle" not in opened
+
+
+def test_a_foreign_window_that_pops_during_an_open_is_neither_focused_nor_recorded(
+    tmp_path, monkeypatch,
+):
+    """DD-2/F2, end to end through the real focuser.
+
+    `open_file` goes through os.startfile, which returns no focused key, so
+    this is the path EVERY file open takes. A Teams call toast appearing
+    inside the 2.5s poll used to be focused, `open` reported focused: true
+    about it, and the opened-record observer filed the toast's title and pid
+    under the file's label -- which a later focus_last_opened would then
+    raise as though it were Daniel's document.
+
+    Nothing is stubbed out between LocalFiles and the enumeration here except
+    the enumeration itself: the real _focus_new_window wrapper and the real
+    desktopcontrol.focus_new_window both run.
+    """
+    from worker import desktopcontrol, localfiles
+
+    root = tmp_path / "root"
+    root.mkdir()
+    note = root / "notes.txt"
+    note.write_text("hi", encoding="utf-8")
+
+    focused = []
+    # One new window, from a process that is not the registered handler.
+    toast = {
+        "_handle": 70, "_process_path": "C:/Apps/Teams.exe",
+        "title": "Incoming call", "pid": 707,
+    }
+    monkeypatch.setattr(
+        desktopcontrol, "_window_records", lambda **_kwargs: [toast],
+    )
+    monkeypatch.setattr(
+        desktopcontrol, "_focus_record",
+        lambda record, **_kwargs: focused.append(record),
+    )
+    monkeypatch.setattr(desktopcontrol, "_apis", lambda *_a, **_k: (None, None))
+    # The autouse fixture points localfiles at a no-window stub; this test
+    # wants the real thing, and its own patch wins.
+    monkeypatch.setattr(localfiles, "_desktopcontrol", lambda: desktopcontrol)
+
+    files = LocalFiles(
+        [root],
+        opener=lambda _path: None,
+        window_snapshot=frozenset,
+        handler_resolver=lambda _suffix: "C:/Windows/notepad.exe",
+    )
+    recorded = []
+    files.set_open_observer(recorded.append)
+
+    opened = files.open(note)
+
+    # Honest: the file opened, nothing was brought to the front.
+    assert opened == {"opened": str(note.resolve()), "focused": False}
+    assert focused == []       # the toast was never focused
+    assert recorded == []      # and never filed under the file's label
+
+
+def test_an_open_with_no_resolvable_handler_focuses_nothing(tmp_path):
+    """Unknown identity is reported as focused: false, never guessed at."""
+    root = tmp_path / "root"
+    root.mkdir()
+    note = root / "notes.txt"
+    note.write_text("hi", encoding="utf-8")
+    seen = []
+    files = LocalFiles(
+        [root],
+        opener=lambda _path: None,
+        window_snapshot=frozenset,
+        new_window_focuser=lambda before, expected: seen.append(expected),
+        handler_resolver=lambda _suffix: None,
+    )
+
+    assert files.open(note) == {"opened": str(note.resolve()), "focused": False}
+    assert seen == [()]
+
+    # A resolver that raises is the same answer, not a failed open: a shell
+    # lookup blowing up must never cost Daniel the file he asked for.
+    def explode(_suffix):
+        raise OSError("shlwapi said no")
+
+    exploding = LocalFiles(
+        [root], opener=lambda _path: None, window_snapshot=frozenset,
+        new_window_focuser=lambda before, expected: seen.append(expected),
+        handler_resolver=explode,
+    )
+    assert exploding.open(note) == {
+        "opened": str(note.resolve()), "focused": False,
+    }
+    assert seen == [(), ()]
+
+
+def test_a_launcher_that_already_focused_is_not_polled_a_second_time(tmp_path):
+    """One wait per open, not two.
+
+    The folder opener polls for its own window and reports the answer. Doing
+    it again here stacked two 2.5s waits into one call and overran the open
+    deadline, so a folder that had opened fine came back as a cloud
+    placeholder error. When the launcher answers, that answer is used.
+    """
+    root = tmp_path / "root"
+    folder = root / "plans"
+    folder.mkdir(parents=True)
+    window = {"title": "plans", "pid": 5, "_handle": 8001}
+    polled = []
+    files = LocalFiles(
+        [root],
+        folder_opener=lambda _path: {
+            "application": "explorer.exe", "pid": 5, "targeted": True,
+            "focused": True, "_window": window,
+        },
+        window_snapshot=frozenset,
+        new_window_focuser=lambda before, _expected: polled.append(before),
+    )
+    recorded = []
+    files.set_open_observer(recorded.append)
+
+    assert files.open_folder(folder) == {
+        "opened": str(folder.resolve()), "focused": True,
+    }
+    assert polled == []  # no second wait
+    assert recorded == [{
+        "kind": "folder", "label": str(folder.resolve()),
+        "title": "plans", "pid": 5, "hwnd": 8001,
+    }]
+
+
+def test_a_launcher_that_reports_no_focus_is_believed(tmp_path):
+    root = tmp_path / "root"
+    folder = root / "plans"
+    folder.mkdir(parents=True)
+    polled = []
+    files = LocalFiles(
+        [root],
+        folder_opener=lambda _path: {
+            "application": "explorer.exe", "pid": 5, "targeted": True,
+            "focused": False, "_window": None,
+        },
+        window_snapshot=frozenset,
+        new_window_focuser=lambda before, _expected: polled.append(before),
+    )
+
+    # Explorer answered inside one of several windows it already had, so the
+    # launcher could not tell which. That is reported, not re-litigated here.
+    assert files.open_folder(folder) == {
+        "opened": str(folder.resolve()), "focused": False,
+    }
+    assert polled == []
+
+
 def test_open_uses_the_resolved_path_and_small_read_returns_full_text(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -141,7 +350,7 @@ def test_open_uses_the_resolved_path_and_small_read_returns_full_text(tmp_path):
     opened = []
     files = LocalFiles([root], opener=opened.append)
 
-    assert files.open(note) == {"opened": str(note.resolve())}
+    assert files.open(note) == {"opened": str(note.resolve()), "focused": False}
     assert opened == [str(note.resolve())]
     result = files.read(note)
     assert result == {
@@ -382,11 +591,12 @@ def test_open_file_and_read_file_run_off_loop_with_five_second_deadline(
     opened_result = asyncio.run(files.open_file(document))
     read_result = asyncio.run(files.read_file(document))
 
-    assert opened_result == {"opened": str(document.resolve())}
+    assert opened_result == {"opened": str(document.resolve()), "focused": False}
     assert read_result["text"] == "hello"
     assert opened == [str(document.resolve())]
     assert offloaded == ["open", "read"]
-    assert deadlines == [5.0, 5.0]
+    # Opens get the longer deadline: they also wait for the window to focus.
+    assert deadlines == [7.5, 5.0]
 
 
 @pytest.mark.parametrize("operation", ["open_file", "read_file"])
