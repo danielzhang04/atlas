@@ -2542,3 +2542,27 @@ def test_webview_occlusion_patch_rewrites_the_installed_pywebview_constructor():
         assert desktop.WEBVIEW_BROWSER_ARGUMENTS not in constants
     finally:
         module.EdgeChrome.__init__ = original
+
+
+def test_the_pending_confirmation_card_keeps_the_readbacks_line_breaks():
+    """2026-09-01 re-review, R1. The confirm readback is one field per line,
+    and that line break is the only thing a value provably cannot contain --
+    it is what makes the field boundaries unforgeable (worker/tools.py
+    _READBACK_LINE_SEPARATOR). ui/app.js sets the card with textContent, which
+    preserves the newlines in the DOM, but HTML collapses them on render: the
+    card would show one run-on line and a value carrying "; to: someone.else"
+    would look like a field of its own again. pre-line is what stops that, so
+    it is pinned here rather than left to survive the next restyle by luck.
+    """
+    assert css_value(".pending-confirmation p", "white-space") == "pre-line"
+    # ...and what survives the readback's own field bound has to stay ON
+    # SCREEN. The card is anchored to the top of the window with no natural
+    # ceiling, so a long readback ran off the bottom -- hiding fields the host
+    # deliberately kept IN the summary.
+    assert css_value(".pending-confirmation", "overflow-y") == "auto"
+    assert css_value(".pending-confirmation", "max-height") == "min(60vh, 20rem)"
+    # And the card is narrow (16rem), so a long path has to wrap inside its
+    # own line instead of widening the card off-screen.
+    assert css_value(".pending-confirmation p", "overflow-wrap") == "anywhere"
+    # The projection really is the multi-line summary, not a flattened copy.
+    assert "textContent = readback" in APP_JS

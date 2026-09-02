@@ -14,6 +14,7 @@ import re
 import secrets
 import time
 from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol, Sequence
+import unicodedata
 from urllib.parse import urlsplit
 
 import yaml
@@ -204,6 +205,29 @@ class Tool:
     # what makes "escalate can only move instant -> confirm" structurally true
     # rather than a convention callers must remember.
     escalate: Callable[[Mapping], bool] | None = None
+    # Argument names this tool's confirm readback must ALWAYS name, in this
+    # order, whether or not the model supplied them (see _readback_summary).
+    # Consulted only on the confirm path. A readback is exact -- it lists the
+    # arguments that will actually run -- but "exact" is not the same as
+    # "answerable by voice": a Gmail reply sent with reply_all=True and only a
+    # thread_id reads back with no recipient at all, so Daniel would be saying
+    # yes to a send whose audience the readback never names. Listing "to" here
+    # makes the omission itself audible ("to: (not set)") instead of
+    # invisible. Declared per tool in
+    # config/mcp.yaml (readback_keys:), never guessed from the schema's
+    # required list -- the whole point is the keys that are OPTIONAL to the
+    # remote server but load-bearing for Daniel's yes.
+    readback_keys: tuple[str, ...] = ()
+    # Argument names this tool REFUSES outright, before any policy branch and
+    # before any readback exists. The companion to config/mcp.yaml's
+    # strip_args: -- that config removes a dangerous property from the
+    # mirrored schema the model sees, and this set refuses the same name if it
+    # arrives anyway. Two walls for one decision: the schema is what a
+    # well-behaved model reads, this is what holds when the model is being
+    # driven by page text it just read. See mcp_client._tool_stripped_arguments
+    # for the authoritative refusal at the session boundary, which covers
+    # call_raw too.
+    refused_arguments: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +266,7 @@ def _pending_collision(pending: PendingAction) -> str:
     summary is already bounded when it is built and is trimmed again here, so
     one collision cannot spend the reply on a wall of arguments.
     """
-    summary = " ".join(str(pending.summary).split())[:_PENDING_COLLISION_SUMMARY_LIMIT]
+    summary = _condensed_readback(str(pending.summary))[:_PENDING_COLLISION_SUMMARY_LIMIT]
     detail = f": {summary}" if summary else ""
     return (
         f"a previous action is still awaiting Daniel's yes or no{detail}. "
@@ -536,6 +560,19 @@ class ToolRegistry:
         if tool is None:
             return ToolResult("error", "unknown tool")
         try:
+            # Stripped arguments are refused FIRST, ahead of every other gate:
+            # a name that was removed from the model-facing schema must never
+            # reach a pending readback (where Daniel would be asked to approve
+            # an argument Atlas already decided he may not be asked about) and
+            # never reach the remote server. Ordering it before the
+            # pending-collision check also means the refusal cannot be used to
+            # probe whether an action is pending.
+            if tool.refused_arguments:
+                refused = sorted(tool.refused_arguments.intersection(arguments))
+                if refused:
+                    return ToolResult(
+                        "error", f"argument not available: {', '.join(refused)}",
+                    )
             if tool.policy == "confirm" and self.pending is not None:
                 return ToolResult("error", _pending_collision(self.pending))
             copied = deepcopy(dict(arguments))
@@ -620,16 +657,26 @@ class ToolRegistry:
                     confirm_id=secrets.token_urlsafe(8),
                     name=name,
                     arguments=copied,
-                    summary=_readback_summary(name, copied, condensed=condensed),
+                    summary=_readback_summary(
+                        name, copied,
+                        condensed=condensed,
+                        required_keys=tool.readback_keys,
+                        schema_keys=_schema_keys(tool),
+                    ),
                     expires=self._clock() + 120.0,
                     host_state=host_state,
                 )
                 self._pending = pending
                 return ToolResult(
                     "needs_confirmation",
-                    _bound_content(
-                        "NOT EXECUTED. Read this summary back to Daniel and wait for his yes or no: "
-                        f"{pending.summary}."
+                    # NOT _bound_content: it strips every C0 control, newlines
+                    # included, which would flatten the one-pair-per-line
+                    # readback back into a single line and hand the field
+                    # boundaries straight back to the values. The summary is
+                    # already bounded per value and in total when it is built.
+                    _bound_readback(
+                        "NOT EXECUTED. Read every line of this summary back to Daniel and wait "
+                        f"for his yes or no.\n{pending.summary}"
                     ),
                     pending.confirm_id,
                 )
@@ -1828,11 +1875,141 @@ def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# Stands in for a readback_keys argument the model did not supply, so the
+# omission is audible instead of invisible. Deliberately says only what is
+# always true -- Atlas is supplying no value for this key -- rather than
+# naming a mechanism. What absence MEANS is tool-specific: on
+# send_gmail_message with reply_all it is a thread-wide To and Cc derived
+# server-side; on draft_gmail_message with a thread_id it is the recipient and
+# subject taken from the message being replied to (workspace-mcp 1.25.2,
+# gmail/gmail_tools.py:3018-3021); on a plain draft it is an empty To. A
+# readback may not assert a mechanism that does not run, so the mechanism
+# lives in each tool's describe: text (config/mcp.yaml) where it can be
+# tool-specific, and this string stays true everywhere.
+_READBACK_OMITTED = "(not set)"
+
+# ONE PAIR PER LINE. The readback is what the model reads aloud to Daniel
+# before he approves a send, so its field boundaries have to be unforgeable by
+# the values themselves -- a string value can otherwise splice a reassuring
+# "to: sam@example.test" in right after a real "(not set)" placeholder, using
+# text the model just read off a page.
+#
+# A newline is the only separator a value provably cannot contain: every C0
+# control (\n and \r included) is already removed by _CONTROL_CHARACTERS, and
+# U+2028/2029 by the format strip below. So the split is exact with NO
+# escaping, which is why this shape and not quoting or delimiter-escaping --
+# every escape mutates the value, and rule 4 wants the readback exact. A
+# semicolon in a filename stays a semicolon; press_delete's chord is read back
+# character for character.
+#
+# Aloud it is also the better shape: a field list is the form a model renders
+# most naturally as "To: ... Subject: ...", where a run-on line invites it to
+# blur one field into the next.
+_READBACK_LINE_SEPARATOR = "\n"
+
+# Invisible characters that can make the rendered readback LIE about the value
+# it renders: the bidi controls and isolates (U+202E and friends can display a
+# recipient reversed while a different address is what gets sent), the
+# zero-width and deprecated format characters, and the line/paragraph
+# separators that would otherwise forge a pair boundary above. Category Cf
+# plus Zl/Zp, so a format character Unicode adds later is stripped by default.
+#
+# The three exceptions are orthography, not formatting, and removing them
+# corrupted real names: U+00AD SOFT HYPHEN made "co-op.txt" read back as
+# "coop.txt", U+200D ZERO WIDTH JOINER flattened emoji families in filenames,
+# and U+200C ZERO WIDTH NON-JOINER changes the spelling of Arabic and Persian
+# words. All three are bidi class BN (boundary-neutral), so none of them can
+# reorder text or forge a field, which is the whole job of this strip.
+#
+# They ARE invisible, and that is a deliberate fidelity trade, not an
+# oversight: two distinct values can still RENDER identically, so
+# "C:\\notes\\co<SHY>op.txt" and "C:\\notes\\coop.txt" are different files that
+# read back the same. The filename case is the real one. In a recipient
+# address the same trick mostly self-defeats, because IDNA2008 disallows all
+# three, so a crafted domain bounces rather than misdelivers. Stripping them
+# would trade a rare display ambiguity for corrupting every legitimate name
+# that needs them, which is the worse deal on a readback whose job is to be
+# exact.
+_READBACK_FORMAT_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+_READBACK_FORMAT_KEPT = frozenset({
+    "­",  # SOFT HYPHEN
+    "‌",  # ZERO WIDTH NON-JOINER
+    "‍",  # ZERO WIDTH JOINER
+})
+
+
+def _readback_text(value: Any) -> str:
+    """Serialize one argument value, exactly, minus what could misrender it."""
+    text = _CONTROL_CHARACTERS.sub("", _serialize(value))
+    if not text.isascii():
+        text = "".join(
+            character for character in text
+            if character in _READBACK_FORMAT_KEPT
+            or unicodedata.category(character) not in _READBACK_FORMAT_CATEGORIES
+        )
+    return text
+
+
+def _schema_keys(tool: Tool) -> tuple[str, ...]:
+    """The tool's own declared argument names, in the schema's order.
+
+    Host-side knowledge the model cannot influence: for a mirrored MCP tool
+    this is the remote server's schema (minus whatever strip_args and the
+    account parameter removed), and for a built-in it is the registry's own.
+    A malformed or absent schema yields nothing and the ordering simply falls
+    back to declared keys then the model's order -- never an exception on the
+    confirm path.
+    """
+    properties = tool.input_schema.get("properties") if isinstance(
+        tool.input_schema, Mapping) else None
+    if not isinstance(properties, Mapping):
+        return ()
+    return tuple(key for key in properties if isinstance(key, str))
+
+
+def _readback_order(
+    arguments: Mapping[str, Any],
+    required_keys: Sequence[str],
+    schema_keys: Sequence[str],
+) -> dict[str, Any]:
+    """Host-decided field order: declared keys, then the tool's own schema,
+    then whatever the model invented.
+
+    Field order used to be the MODEL'S JSON order for any tool without
+    readback_keys, and the readback is bounded, so a model could push the
+    field the decision turns on past the end of what Daniel ever hears -- forty
+    junk arguments in front of a write_file's `path` and `content` did exactly
+    that. Ordering cannot be left to the caller when the caller is the thing
+    being checked.
+
+    The three tiers, in the order that survives a bound:
+      1. readback_keys from config -- the rule-5 keys a spoken yes turns on.
+      2. The tool's OWN input schema properties, in the schema's order. This is
+         what generalizes readback_keys to every tool for free: `path` and
+         `content` are the write_file schema, `note0..note39` are not, so the
+         real arguments lead and the invented ones queue behind them.
+      3. Everything else, in the model's order -- rendered, never hidden, but
+         it can no longer displace a declared argument.
+    """
+    ordered: dict[str, Any] = {}
+    for key in required_keys:
+        ordered[key] = arguments[key] if key in arguments else _READBACK_OMITTED
+    for key in schema_keys:
+        if key in arguments and key not in ordered:
+            ordered[key] = arguments[key]
+    for key, value in arguments.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _readback_summary(
     name: str,
     arguments: Mapping[str, Any],
     *,
     condensed: bool = False,
+    required_keys: Sequence[str] = (),
+    schema_keys: Sequence[str] = (),
 ) -> str:
     if name == "press_delete":
         # The delete chord is read back whole, always: it is short, and it
@@ -1843,6 +2020,10 @@ def _readback_summary(
         maximum = _READBACK_CONDENSED_VALUE_LIMIT
     else:
         maximum = _READBACK_VALUE_LIMIT
+    # A declared key the model DID supply is rendered normally -- the
+    # placeholder is only ever a stand-in for absence, never a replacement for
+    # a value.
+    arguments = _readback_order(arguments, required_keys, schema_keys)
     details = []
     for key, value in arguments.items():
         # Condensing exists to tame the one oversized value (usually content);
@@ -1851,15 +2032,128 @@ def _readback_summary(
         # back whole under the normal per-value limit instead.
         value_maximum = maximum
         squeeze = condensed
-        if condensed and len(_serialize(value)) <= _READBACK_VALUE_LIMIT:
+        if condensed and len(_readback_text(value)) <= _READBACK_VALUE_LIMIT:
             value_maximum = _READBACK_VALUE_LIMIT
             squeeze = False
-        details.append(f"{key}: {_readback_value(value, value_maximum, total=squeeze)}")
-    return f"{name} - " + ("; ".join(details) if details else "no arguments")
+        # Keys go through the same cleaning and bound as values. An argument
+        # NAME is model-chosen too, so it must not be able to carry a newline
+        # into the sentence and open a line of its own.
+        details.append(
+            f"{_readback_value(key, _READBACK_VALUE_LIMIT)}: "
+            f"{_readback_value(value, value_maximum, total=squeeze)}"
+        )
+    if not details:
+        return f"{name} - no arguments"
+    return name + _READBACK_LINE_SEPARATOR + _READBACK_LINE_SEPARATOR.join(
+        _within_readback_budget(details, len(name)),
+    )
+
+
+# A readback that runs past _CONTENT_LIMIT used to be cut mid-value by the
+# content bound, so whole fields vanished behind a "...[truncated]" marker that
+# said something was cut but not that SIXTEEN ARGUMENTS were gone. These two
+# bounds are applied here instead, where the field structure still exists and
+# the loss can be counted and stated.
+#
+# The budget leaves room for the instruction sentence _bound_readback wraps
+# around this, so a summary built here never reaches that backstop.
+_READBACK_SUMMARY_LIMIT = 3_200
+# Not a size bound -- a speakability one. Nothing on the curated surface takes
+# anywhere near this many arguments, and past it a spoken readback stops being
+# something a person can hold in their head long enough to answer.
+_READBACK_MAX_FIELDS = 24
+# Width of the longest omission line below. It carries no ": ", so it can
+# never be mistaken for a field, and a value cannot forge one because a value
+# cannot open a line of its own.
+_OMITTED_FIELDS_RESERVE = 80
+
+
+def _within_readback_budget(details: list[str], used: int) -> list[str]:
+    """Drop whole fields, never half of one, and always say how many.
+
+    Refusing the call instead was the other option and is the wrong one here:
+    the BB-wave review already settled that an oversized confirm must condense
+    rather than refuse, because "split it into two calls" is advice that cannot
+    be followed for an overwrite -- it writes half a file and then replaces it
+    with the other half. So the readback stays answerable by telling the truth
+    about its own completeness, and Daniel can say no to a send whose last line
+    admits it did not show him everything.
+    """
+    shown: list[str] = []
+    for index, line in enumerate(details):
+        # The omission line has to fit even when the field that triggered it
+        # is the one being dropped, so its worst-case width is reserved.
+        if (
+            index >= _READBACK_MAX_FIELDS
+            or used + 1 + len(line) > _READBACK_SUMMARY_LIMIT - _OMITTED_FIELDS_RESERVE
+        ):
+            remaining = len(details) - index
+            shown.append(
+                f"({remaining} more argument{'' if remaining == 1 else 's'} not shown"
+                " - say no unless you know what they are)"
+            )
+            return shown
+        shown.append(line)
+        used += 1 + len(line)
+    return shown
+
+
+
+def _condensed_readback(summary: str) -> str:
+    """One line, for the two HOST NOTES that only need to identify a pending
+    action -- never for the approval readback itself.
+
+    _pending_collision and _supersede_note both say something ABOUT a pending
+    action ("one is still waiting", "that one was cancelled") in a single
+    sentence; neither is the thing Daniel says yes to. Flattening the newlines
+    would hand the pair boundary back to the values, so this rebuilds the line
+    from the exact split instead: a newline cannot occur inside a value, so
+    splitting on it is lossless, and only then are the delimiters neutralized
+    inside each value (semicolon to comma, colon-space to colon -- both
+    inaudible). Fidelity is traded ONLY here, where nothing is approved.
+    """
+    name, separator, rest = summary.partition(_READBACK_LINE_SEPARATOR)
+    if not separator:
+        return summary
+    pairs = []
+    for line in rest.split(_READBACK_LINE_SEPARATOR):
+        key, found, value = line.partition(": ")
+        if not found:
+            pairs.append(_neutralized(line))
+        else:
+            pairs.append(f"{_neutralized(key)}: {_neutralized(value)}")
+    return f"{name} - " + "; ".join(pairs)
+
+
+# Colon and semicolon lookalikes, folded to ASCII first so a fullwidth or
+# small-form separator meets the same rule instead of sailing past a check
+# that only knows the ASCII byte. Written as escapes, never as literals: half
+# of these are indistinguishable from ":" in an editor, which is the whole
+# point of them.
+#
+# The list does not have to be exhaustive, and that is a deliberate structural
+# claim, not a shrug. It feeds ONLY the one-line host notes below, where the
+# worst case is a misleading identification of an action nobody is being asked
+# to approve. The approval readback is unforgeable by construction (a value
+# cannot contain a newline) and depends on none of it.
+_SEPARATOR_CONFUSABLES = str.maketrans({
+    # colon-shaped
+    "：": ":", "﹕": ":", "︓": ":", "∶": ":", "꞉": ":",
+    "ː": ":", "˸": ":", "׃": ":", "܃": ":", "։": ":",
+    "᛫": ":", "⁚": ":", "⁝": ":", "꛶": ":",
+    # semicolon-shaped
+    "；": ";", "﹔": ";", ";": ";", "؛": ";", "⁏": ";",
+    "⸵": ";",
+})
+_COLON_SPACE = re.compile(r":\s+")
+
+
+def _neutralized(text: str) -> str:
+    return _COLON_SPACE.sub(":", text.translate(_SEPARATOR_CONFUSABLES).replace(";", ","))
 
 
 def _readback_value(value: Any, maximum: int | None, *, total: bool = False) -> str:
-    cleaned = _CONTROL_CHARACTERS.sub("", _serialize(value))
+    cleaned = _readback_text(value)
     if maximum is None or len(cleaned) <= maximum:
         return cleaned
     if total:
@@ -1871,6 +2165,20 @@ def _readback_value(value: Any, maximum: int | None, *, total: bool = False) -> 
 
 def _bound_content(value: str) -> str:
     cleaned = _CONTROL_CHARACTERS.sub("", str(value))
+    if len(cleaned) <= _CONTENT_LIMIT:
+        return cleaned
+    return cleaned[:_CONTENT_LIMIT - len(_TRUNCATED)] + _TRUNCATED
+
+
+# Every control character except the newline that separates readback pairs.
+# The pairs themselves were built from values _readback_text had already
+# stripped, so the only newlines in this text are the ones the host wrote.
+_READBACK_CONTROL_CHARACTERS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def _bound_readback(value: str) -> str:
+    """_bound_content for the one message whose line breaks are structural."""
+    cleaned = _READBACK_CONTROL_CHARACTERS.sub("", str(value))
     if len(cleaned) <= _CONTENT_LIMIT:
         return cleaned
     return cleaned[:_CONTENT_LIMIT - len(_TRUNCATED)] + _TRUNCATED
