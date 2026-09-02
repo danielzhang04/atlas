@@ -244,3 +244,50 @@ def test_the_checked_in_file_roots_are_named_and_reach_the_schema_text():
     for name in ("find_file", "open_folder"):
         assert f"Roots: {', '.join(resolved)}." in schemas[name]["description"]
     assert set(resolved) <= configured
+
+
+def test_system_text_names_one_tool_for_two_named_actions():
+    """The prompt half of the supersede fix.
+
+    The host now refuses to read "create the draft and send it" as a yes; this
+    is what stops the model from answering the same sentence with two calls, or
+    with a draft it then claims to have sent. There is no send-a-draft tool,
+    so the only honest answer is the single tool that does both.
+    """
+    text = build_system_text()
+
+    assert (
+        "When Daniel names two actions one tool already does, call the single tool "
+        "that does both:\nsend_gmail_message writes and sends in one step. Draft only "
+        "when he says draft; there is no\nsend-a-draft tool."
+    ) in text
+    assert "Call independent tools together in one turn." in text
+
+
+def test_system_text_tells_the_model_to_relay_a_pending_collision_and_stop():
+    text = build_system_text()
+
+    assert (
+        "If a tool is refused because an action is still awaiting Daniel's yes or no, "
+        "relay that refusal\nexactly as the result words it, in one sentence, and stop; "
+        "call no other tool that turn."
+    ) in text
+
+
+def test_system_text_does_not_ask_the_model_to_relay_a_host_note():
+    """DD-wave review, MEDIUM-4: the host says it, so the model must not.
+
+    H3(c) originally asked the model to speak the supersede cancellation in
+    one clause. Two live runs of the same scenario proved that unreliable --
+    one said it, one never mentioned the dropped draft at all -- so the host
+    now speaks SUPERSEDE_CANCELLED_CLAUSE itself. The instruction has to leave
+    with it, or Daniel hears the same sentence twice.
+    """
+    text = build_system_text()
+
+    assert (
+        "A [host: ...] note is the host talking, not Daniel. It reports something the "
+        "host has already done\nand already said out loud; never repeat it back to him, "
+        "just act on what it tells you."
+    ) in text
+    assert "say\nthat in one clause before you propose the new one" not in text

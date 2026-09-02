@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -15,12 +15,18 @@ import subprocess
 import time
 from typing import Any, AsyncContextManager, TYPE_CHECKING
 import unicodedata
+from urllib.parse import urlsplit
 import weakref
 
 import yaml
 
 from .jobobject import kill_process_tree
 from .statusdetail import STATUS_DETAIL_RENDERERS, render_status_detail, status_detail_allowed
+# Same-package privates, deliberately: the link-handle regime is defined in
+# tools.py (budget note, https predicate) and this module is its only other
+# half. Re-stating either here would let the mint site and the open site
+# disagree about what a handle costs or what a URL is.
+from .tools import _HANDLE_BUDGET_NOTE, _direct_https, _unpinned_argument_names
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -513,6 +519,9 @@ def _exposed_tools(server_cfg: Mapping) -> frozenset[str] | None:
 
 
 _MISSING_EXPOSE_WARNING_LIMIT = 500
+# Same bound, for the allow_args warnings. Both directions are server-supplied
+# property NAMES, so they are bounded rather than trusted to be short.
+_UNPINNED_WARNING_LIMIT = 500
 
 
 def _missing_exposed_tools(exposed: frozenset[str] | None, listed_tools: Any) -> tuple[str, ...]:
@@ -535,6 +544,20 @@ def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_descrip
         override = describe[remote_tool_name]
         if not isinstance(override, str) or not override:
             raise ValueError("invalid MCP describe value")
+        if len(override) > _DESCRIPTION_LIMIT:
+            # _mirror_tool truncates to _DESCRIPTION_LIMIT, and for a REMOTE
+            # description that is fine -- upstream prose is padding past the
+            # first sentence. A host-authored override is not padding: every
+            # one of these ends with the confirm-gate promise ("the host reads
+            # those back and waits for Daniel's yes"), so a silent cut removes
+            # exactly the sentence that tells the model the tool is gated, in
+            # the description of the most dangerous tool on the server. An
+            # override that does not fit is a config bug and says so here
+            # rather than shipping half a sentence.
+            raise ValueError(
+                f"MCP describe override for {remote_tool_name} exceeds "
+                f"{_DESCRIPTION_LIMIT} characters"
+            )
         return override
     return remote_description
 
@@ -624,6 +647,129 @@ def _tool_transform(server_cfg: Mapping, remote_tool_name: str) -> Callable[[str
     return _TRANSFORMERS[name]
 
 
+# Named, host-side link patterns only -- config picks one by name, it never
+# supplies a regex (rule 3, the same rule transform: follows).
+#
+# trailing_link matches the shape the pinned workspace-mcp 1.25.2 emits: one
+# " Link: <url>" per result line in search_drive_files/list_drive_items
+# (gdrive/drive_tools.py:318, :766) and a "Link: <url>" header line in
+# get_drive_file_content (:431). The `$` anchor is load-bearing: it is why a
+# Drive file NAMED "https://evil.com/x" does not mint. That name lands
+# mid-line inside `- Name: "..."` with the real Link: still to come, and a
+# mid-line URL can never satisfy \S+$.
+#
+# Anchoring is defense in depth, not the defense. A file name containing a
+# newline can still forge a whole "Link: https://..." line, so the HOST
+# ALLOWLIST is what actually bounds this: the forged URL must also name a
+# configured host. What an attacker who can share a file into Daniel's Drive
+# can therefore achieve is at most an allowlisted Google page opening -- the
+# same reachability the honest Drive results already have -- never a novel
+# origin.
+#
+# The line end is matched as a LOOKAHEAD over an optional CR, not as a bare
+# `$`. `$` under MULTILINE only ever matches before a bare "\n", so on a CRLF
+# result `\S+` stopped at the "\r" (whitespace) and `$` then failed one
+# character early: the whole feature silently minted nothing. A lookahead
+# also keeps the CR out of group(0), so the appended handle note cannot land
+# after the carriage return and split the line.
+_LINK_PATTERNS: dict[str, re.Pattern[str]] = {
+    "trailing_link": re.compile(r"\bLink: (https://\S+)(?=\r?$)", re.MULTILINE),
+}
+
+# Punctuation a URL at the end of a sentence or inside a quote/bracket picks
+# up from the text around it. `\S+` cannot tell it apart from the URL, so a
+# perfectly good Drive link written as `(Link: https://docs.google.com/d/x)`
+# validated as ".../x)" and minted nothing. Trimmed before validating AND
+# before minting, so the id spends the same URL the check passed.
+_LINK_TRAILING_PUNCTUATION = ")]}>\"'.,;:!?"
+
+
+def _link_extraction(server_cfg: Mapping) -> tuple[re.Pattern[str], frozenset[str]] | None:
+    """The (pattern, allowed hosts) pair for a server, or None if unconfigured.
+
+    Both keys are required together: a pattern with no hosts would mint
+    nothing, and hosts with no pattern would never be reached, so either one
+    alone is a config mistake worth failing on rather than silently ignoring.
+    """
+    pattern_name = server_cfg.get("link_pattern")
+    hosts = server_cfg.get("link_hosts")
+    if pattern_name is None and hosts is None:
+        return None
+    if not isinstance(pattern_name, str) or pattern_name not in _LINK_PATTERNS:
+        raise ValueError("invalid MCP link pattern")
+    if (
+        isinstance(hosts, (str, bytes))
+        or not isinstance(hosts, (list, tuple))
+        or not hosts
+        or not all(isinstance(host, str) and host.strip() for host in hosts)
+    ):
+        raise ValueError("invalid MCP link host list")
+    return _LINK_PATTERNS[pattern_name], frozenset(
+        host.strip().casefold() for host in hosts
+    )
+
+
+def _mint_link_handles(
+    text: str,
+    pattern: re.Pattern[str],
+    hosts: frozenset[str],
+    registry: "ToolRegistry",
+) -> str:
+    """Rewrite each allowlisted link in remote text to carry a host handle.
+
+    This is the only place a link handle is ever minted. The model reads the
+    id, not the URL, and `open` spends the id -- so the URL never has to
+    survive a round trip through model-authored text, which is exactly what
+    the taint wall refuses to let it do.
+    """
+
+    def rewrite(match: re.Match) -> str:
+        # NOTHING in here may raise. This closure runs inside pattern.sub,
+        # inside a mirrored tool's run(), under ToolRegistry.call's catch-all
+        # -- so one exception here does not spoil one link, it turns the
+        # entire remote result into ToolResult("error", ...). A single Drive
+        # file an attacker shared into Daniel's account could therefore
+        # permanently break search_drive_files, list_drive_items and
+        # get_drive_file_content. Every check below is fail-soft: a candidate
+        # that cannot be validated simply does not mint.
+        url = _trimmed_link(match.group(1))
+        if not url or not _openable_link(url, hosts):
+            # Not an allowlisted destination: left exactly as it was. It
+            # still reads fine to the model, it just has no id to spend.
+            return match.group(0)
+        handle = registry._mint_handle(url, "link")
+        note = _HANDLE_BUDGET_NOTE if handle is None else f"handle: {handle}"
+        return f"{match.group(0)} [{note}]"
+
+    return pattern.sub(rewrite, text)
+
+
+def _trimmed_link(candidate: str) -> str:
+    """Drop sentence/bracket punctuation the `\\S+` capture swallowed.
+
+    Right-hand only, so it can never change the HOST -- everything before the
+    first "/" is untouched -- which is what keeps this from being a way to
+    walk a non-allowlisted URL into an allowlisted one.
+    """
+    return candidate.rstrip(_LINK_TRAILING_PUNCTUATION)
+
+
+def _openable_link(url: str, hosts: frozenset[str]) -> bool:
+    # _direct_https is the SAME scheme/userinfo/port predicate `open` applies
+    # to a typed URL, reused rather than restated so mint time and open time
+    # can never drift apart on what counts as a direct https URL. It is also
+    # where the ValueError urlsplit raises on an NFKC-hostile netloc is
+    # absorbed, so the .hostname read below is reached only for a netloc that
+    # already parsed cleanly.
+    if not _direct_https(url):
+        return False
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:  # pragma: no cover -- _direct_https already parsed it
+        return False
+    return hostname is not None and hostname.casefold() in hosts
+
+
 def _tool_content_bearing(server_cfg: Mapping, remote_tool_name: str) -> bool:
     """Whether this remote tool's output can taint the turn.
 
@@ -646,11 +792,154 @@ def _tool_content_bearing(server_cfg: Mapping, remote_tool_name: str) -> bool:
     return value
 
 
+def _tool_readback_keys(server_cfg: Mapping, remote_tool_name: str) -> tuple[str, ...]:
+    """Argument names this tool's confirm readback must always name, in order.
+
+    See Tool.readback_keys. Declared per tool here rather than derived from the
+    remote schema's ``required`` list on purpose: the keys that matter to a
+    spoken yes (a send's recipient and subject) are exactly the ones
+    workspace-mcp leaves OPTIONAL, because it can derive them from a thread or
+    from the message being forwarded. Absent for a tool means no key is forced,
+    which is every tool but the Gmail sends today.
+    """
+    configured = server_cfg.get("readback_keys", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP readback_keys map")
+    if remote_tool_name not in configured:
+        return ()
+    keys = configured[remote_tool_name]
+    if (
+        isinstance(keys, (str, bytes))
+        or not isinstance(keys, (list, tuple))
+        or not keys  # an empty list is a config mistake, not "no keys"
+        or not all(isinstance(key, str) and key for key in keys)
+        or len(set(keys)) != len(keys)
+    ):
+        raise ValueError("invalid MCP readback_keys value")
+    return tuple(keys)
+
+
+def _tool_stripped_arguments(server_cfg: Mapping, remote_tool_name: str) -> frozenset[str]:
+    """Argument names removed from this tool's mirrored schema and refused.
+
+    ``strip_args:`` is the companion of ``blocked:``. blocked: removes a whole
+    remote TOOL; this removes a named ARGUMENT from a tool that is otherwise
+    worth having. It exists because a mirrored schema is passed through from
+    the remote server essentially untouched, so an upstream argument that
+    Atlas would never have designed rides in with it -- and the model sees it,
+    and can use it:
+
+      * take_snapshot/take_screenshot carry ``filePath``, "an absolute path to
+        save to instead of attaching it to the response". Both are instant, so
+        a single model assertion writes page-controlled text to any path on
+        the machine, around file_write_roots, around the files server's
+        write-only confinement and around localfiles' credential shield.
+      * navigate_page carries ``initScript``, JavaScript run in Daniel's
+        logged-in browser before any page script -- the same capability
+        evaluate_script is blocked: for, arriving as an argument instead of as
+        a tool. Confirm tier does not hold it: the readback would be a real
+        URL followed by a truncated wall of JavaScript, which is exact and
+        unanswerable.
+      * navigate_page carries ``handleBeforeUnload``, and select_page carries
+        ``bringToFront`` -- real-world side effects the model has no business
+        choosing.
+
+    Two enforcement points, both required. The schema strip (see _mirror_tool)
+    keeps the name out of the model's snapshot, which is what stops a
+    well-behaved model. This set is also handed to the Tool and re-checked at
+    _call_session, so a name supplied anyway -- by a model steered by content
+    it just read, or through call_raw -- is refused rather than forwarded.
+    Silently dropping it would be worse than refusing: the model would be told
+    the call succeeded as asked.
+    """
+    configured = server_cfg.get("strip_args", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP strip_args map")
+    if remote_tool_name not in configured:
+        return frozenset()
+    names = configured[remote_tool_name]
+    if (
+        isinstance(names, (str, bytes))
+        or not isinstance(names, (list, tuple))
+        or not names  # an empty list is a config mistake, not "strip nothing"
+        or not all(isinstance(name, str) and name for name in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("invalid MCP strip_args value")
+    return frozenset(names)
+
+
 def _server_domain(server_cfg: Mapping) -> str | None:
     domain = server_cfg.get("domain")
     if domain is not None and (not isinstance(domain, str) or not domain):
         raise ValueError("invalid MCP domain")
     return domain
+
+
+
+def _tool_allowed_arguments(
+    server_cfg: Mapping, remote_tool_name: str,
+) -> frozenset[str] | None:
+    """The pinned allowlist of property names this tool may carry.
+
+    ``allow_args:`` is the inverse of ``strip_args:``, and it exists because
+    strip_args only ever catches what a reviewer already named. A mirrored
+    schema is the remote server's own, passed through, so what the model sees
+    is whatever upstream decided to offer that day. strip_args notices a
+    RENAME -- a configured name absent from the offered properties raises a
+    connect-time warning -- but nothing noticed an ADDITION. chrome-devtools is
+    spawned from ~/.claude.json and is NOT version-pinned, so an upstream
+    release adding a property to any exposed tool was mirrored straight into
+    the model's snapshot with nothing refusing it. That already happened once,
+    unnoticed: it is how ``filePath`` (an instant-tier arbitrary file write)
+    and ``initScript`` (arbitrary JavaScript in Daniel's logged-in browser)
+    reached the model in the first place.
+
+    REFUSE, not silently strip, when a non-allowlisted name arrives anyway --
+    the same choice strip_args made, for the same reason: dropping an argument
+    reports success for a call Atlas quietly changed, and here the host does
+    not even know what the argument would have done. In practice the refusal is
+    close to unreachable, because the property is not in the model's schema
+    either; it is what holds for call_raw and for a model being driven by page
+    text it just read.
+
+    The failure this mechanism must NOT have is a silent capability loss when
+    upstream legitimately adds something benign. That is answered by the
+    connect-time warning in _mirror_tool -- the new property is named, loudly,
+    in the log -- and by a human then deciding, rather than by letting the
+    property through by default. There is no ordering that lets a benign
+    addition in without also letting a dangerous one in.
+    """
+    configured = server_cfg.get("allow_args", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP allow_args map")
+    if remote_tool_name not in configured:
+        return None
+    names = configured[remote_tool_name]
+    if (
+        isinstance(names, (str, bytes))
+        or not isinstance(names, (list, tuple))
+        # An EMPTY list is legal here, unlike every other list in this file.
+        # "This tool takes no arguments" is a real, useful statement -- it is
+        # the only way to pin a zero-property tool like list_pages, which
+        # otherwise has nothing for a future upstream property to be checked
+        # against. The reason the convention flips is the direction of the
+        # failure: an empty strip_args or readback_keys silently disables a
+        # protection, while an empty allow_args is the strictest setting there
+        # is, and a mistaken one shows up immediately as a refused call.
+        or not all(isinstance(name, str) and name for name in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("invalid MCP allow_args value")
+    allowed = frozenset(names)
+    # A name that is both stripped and allowed is a config edit that quietly
+    # re-permits exactly what strip_args exists to remove. It cannot be
+    # resolved by precedence -- whichever wins, the other line is a lie -- so
+    # it is a load error.
+    overlap = allowed & _tool_stripped_arguments(server_cfg, remote_tool_name)
+    if overlap:
+        raise ValueError("invalid MCP allow_args value: also in strip_args")
+    return allowed
 
 
 def _compile_instant_when(server_cfg: Mapping, remote_tool_name: str) -> Callable[[Mapping], bool] | None:
@@ -906,7 +1195,9 @@ class McpServers:
                                 ", ".join(missing)[:_MISSING_EXPOSE_WARNING_LIMIT],
                             )
                         mirrored = [
-                            self._mirror_tool(name, server_cfg, defaults, session, tool)
+                            self._mirror_tool(
+                                name, server_cfg, defaults, session, tool, registry,
+                            )
                             for tool in listed.tools
                             if tool.name not in blocked and (exposed is None or tool.name in exposed)
                         ]
@@ -1261,14 +1552,86 @@ class McpServers:
             params={"token": token, "expiresAt": expires_at},
         ))
 
-    def _mirror_tool(self, server_name, server_cfg, defaults, session, remote_tool) -> Tool:
+    def _mirror_tool(
+        self, server_name, server_cfg, defaults, session, remote_tool, registry=None,
+    ) -> Tool:
         timeout_s = float(defaults.get("call_timeout_s", 8))
-        schema = _without_account_parameter(
-            remote_tool.inputSchema,
-            server_cfg.get("account_param"),
+        stripped = _tool_stripped_arguments(server_cfg, remote_tool.name)
+        allowed = _tool_allowed_arguments(server_cfg, remote_tool.name)
+        # Enforcement point 1: the dangerous property never reaches the model
+        # snapshot. Applied to the same schema object the account parameter is
+        # removed from, so a stripped name is gone from `properties` AND from
+        # `required` before Brain.schemas() ever serializes it.
+        schema = _without_arguments(
+            _without_account_parameter(
+                remote_tool.inputSchema,
+                server_cfg.get("account_param"),
+            ),
+            stripped,
         )
+        if allowed is not None:
+            # Same enforcement point, opposite direction: whatever the server
+            # offered that nobody pinned is gone from the snapshot too. The
+            # account parameter is excluded from the comparison because the
+            # host fills it in itself and has already removed it above.
+            offered = schema.get("properties")
+            if isinstance(offered, Mapping):
+                schema = _without_arguments(
+                    schema, [name for name in offered if name not in allowed],
+                )
+            unpinned = sorted(
+                name for name in (remote_tool.inputSchema.get("properties") or {})
+                if name not in allowed
+                and name not in stripped
+                and name != server_cfg.get("account_param")
+            )
+            if unpinned:
+                # The loud half of the mechanism. A benign upstream addition is
+                # not lost silently: it is named here, and a human decides
+                # whether to pin it. Names only, bounded by the server's own
+                # schema (rule 10).
+                _LOGGER.warning(
+                    "MCP server %s offers unpinned properties on %s: %s",
+                    server_name, remote_tool.name,
+                    ", ".join(unpinned)[:_UNPINNED_WARNING_LIMIT],
+                )
+            missing = sorted(
+                allowed - frozenset(remote_tool.inputSchema.get("properties") or {})
+            )
+            if missing:
+                # The inverse, and the one that actually breaks a capability:
+                # an allowlisted name the server no longer offers means an
+                # upstream rename, and the renamed property is now being
+                # refused with nothing else saying so.
+                _LOGGER.warning(
+                    "MCP server %s allow_args names not offered by %s: %s",
+                    server_name, remote_tool.name,
+                    ", ".join(missing)[:_UNPINNED_WARNING_LIMIT],
+                )
+        # A strip_args entry the server does not actually offer is the same
+        # failure mode expose: warns about, and a worse one: chrome-devtools is
+        # spawned from ~/.claude.json and is NOT version-pinned, so an upstream
+        # rename (filePath -> path) would silently un-strip the argument and
+        # put the capability back with nothing saying so. Names only, bounded
+        # by the config itself (rule 10).
+        if stripped:
+            offered = remote_tool.inputSchema.get("properties")
+            if isinstance(offered, Mapping):
+                absent = sorted(stripped - frozenset(offered))
+                if absent:
+                    _LOGGER.warning(
+                        "MCP server %s strip_args names not offered by %s: %s",
+                        server_name, remote_tool.name, ", ".join(absent),
+                    )
         description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
         transform = _tool_transform(server_cfg, remote_tool.name)
+        links = _link_extraction(server_cfg) if registry is not None else None
+        if links is not None:
+            # The registry needs the same closed host vocabulary this mint
+            # site checks against, so its open-time re-check can enforce the
+            # sentence rather than trust it -- the _configure_root_names
+            # precedent.
+            registry._configure_link_hosts(links[1])
 
         async def run(arguments: dict) -> str:
             text = await self._call_session(
@@ -1283,6 +1646,11 @@ class McpServers:
             # matches on the raw "Found N messages"/"Thread ID:" shape.
             if transform is not None:
                 text = transform(text)
+            if links is not None:
+                # After transform (so a rewritten line is what gets scanned)
+                # and before _bounded_text (so a truncation can never cut a
+                # URL in half and leave a handle pointing at a prefix).
+                text = _mint_link_handles(text, links[0], links[1], registry)
             return _bounded_text(text)
 
         return Tool(
@@ -1294,6 +1662,9 @@ class McpServers:
             domain=_server_domain(server_cfg),
             content_bearing=_tool_content_bearing(server_cfg, remote_tool.name),
             escalate=_compile_instant_when(server_cfg, remote_tool.name),
+            readback_keys=_tool_readback_keys(server_cfg, remote_tool.name),
+            refused_arguments=stripped,
+            allowed_arguments=allowed,
         )
 
     async def call_raw(
@@ -1325,6 +1696,32 @@ class McpServers:
     ) -> str:
         if tool in _blocked_tools(server_cfg):
             raise McpToolError("unknown MCP tool")
+        # Enforcement point 2, and the authoritative one: nothing reaches a
+        # remote server except through here, call_raw included. A stripped
+        # argument that arrived anyway is REFUSED, never dropped -- dropping it
+        # would report success for a call Atlas quietly changed.
+        stripped = _tool_stripped_arguments(server_cfg, tool)
+        if stripped:
+            supplied = sorted(stripped.intersection(arguments))
+            if supplied:
+                raise McpToolError(f"argument not available: {', '.join(supplied)}")
+        # The pinned allowlist, enforced at the same authoritative boundary and
+        # returning the same sentence. The account parameter is exempt: the
+        # host appends it itself a few lines below, so a caller that already
+        # carries it (count_mail's own search arguments do not, but a future
+        # one might) is not refused for a key Atlas is about to overwrite.
+        allowed = _tool_allowed_arguments(server_cfg, tool)
+        if allowed is not None:
+            account_name = server_cfg.get("account_param")
+            unpinned = _unpinned_argument_names(
+                {
+                    name: value for name, value in arguments.items()
+                    if name != account_name
+                },
+                allowed,
+            )
+            if unpinned:
+                raise McpToolError(f"argument not available: {', '.join(unpinned)}")
         call_arguments = dict(arguments)
         account_param = server_cfg.get("account_param")
         if account_param is not None:
@@ -1521,14 +1918,31 @@ def _normalize_recipients(arguments: Mapping[str, Any], account: str) -> dict[st
     return normalized
 
 
-def _without_account_parameter(schema: dict, account_param: Any) -> dict:
+def _without_arguments(schema: dict, names: Iterable[str]) -> dict:
+    """Drop named properties from a mirrored input schema, and from `required`.
+
+    One helper for both callers that need it: the account parameter the host
+    fills in itself, and strip_args' dangerous-argument removals. Removing a
+    name from `required` matters as much as removing the property -- a schema
+    that demands a property it no longer defines is one the model cannot
+    satisfy, which would take the whole tool down rather than just the
+    argument.
+    """
     mirrored = deepcopy(schema)
-    if not isinstance(account_param, str) or not account_param:
+    dropped = frozenset(name for name in names if isinstance(name, str) and name)
+    if not dropped:
         return mirrored
     properties = mirrored.get("properties")
     if isinstance(properties, dict):
-        properties.pop(account_param, None)
+        for name in dropped:
+            properties.pop(name, None)
     required = mirrored.get("required")
     if isinstance(required, list):
-        mirrored["required"] = [name for name in required if name != account_param]
+        mirrored["required"] = [name for name in required if name not in dropped]
     return mirrored
+
+
+def _without_account_parameter(schema: dict, account_param: Any) -> dict:
+    if not isinstance(account_param, str) or not account_param:
+        return deepcopy(schema)
+    return _without_arguments(schema, (account_param,))

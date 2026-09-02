@@ -96,11 +96,19 @@ input:focus-visible {
   -webkit-app-region: no-drag;
 }
 
+/*
+ * The brand button and the nav are clickable, so the host must not claim them as window caption.
+ * Their widths are capped here and mirrored by TITLEBAR_BRAND_WIDTH_CSS_PX and
+ * TITLEBAR_NAV_WIDTH_CSS_PX in worker/desktop.py, which excludes those zones from its WM_NCHITTEST
+ * caption strip; tests/test_desktop.py pins both numbers against this file. The caps sit far above
+ * the rendered content, so they change nothing visually - they only bound the excluded zones.
+ */
 .brand {
   display: inline-flex;
   justify-self: start;
   align-items: center;
   gap: .48rem;
+  max-width: 160px;
   padding: .25rem .2rem;
   color: var(--white);
   background: transparent;
@@ -134,6 +142,7 @@ input:focus-visible {
   align-self: stretch;
   justify-content: center;
   gap: 1.2rem;
+  max-width: 280px;
 }
 
 .nav-button {
@@ -221,12 +230,21 @@ input:focus-visible {
   place-items: center;
 }
 
-.window-control:hover {
+/*
+ * The host answers WM_NCHITTEST with HTMINBUTTON/HTMAXBUTTON/HTCLOSE over these buttons in both
+ * window states, so WebView2 never sees the pointer there and `:hover` cannot fire. The host
+ * mirrors its own nonclient hover through window.__atlasNcHover, which toggles .is-nc-hover. The
+ * `:hover` selector is still the one that fires whenever the native hook is not installed - a
+ * failed setup, or any host that is not the pywebview desktop window.
+ */
+.window-control:hover,
+.window-control.is-nc-hover {
   color: var(--white);
   background: rgb(255 255 255 / 7%);
 }
 
-.window-control.window-close:hover {
+.window-control.window-close:hover,
+.window-control.window-close.is-nc-hover {
   color: #fff;
   background: #e5484d;
 }
@@ -337,6 +355,13 @@ main {
   right: .7rem;
   z-index: 4;
   width: min(16rem, 42%);
+  /* A readback is bounded but not short (worker/tools.py
+     _READBACK_SUMMARY_LIMIT), and this card is anchored to the top of the
+     window: without a ceiling a long one runs off the bottom, which hides
+     fields the host went to some trouble to keep IN the readback. Scroll the
+     card instead of overflowing the window. */
+  max-height: min(60vh, 20rem);
+  overflow-y: auto;
   padding: .55rem .65rem;
   border: 1px solid rgb(255 165 55 / 48%);
   border-radius: 5px;
@@ -357,6 +382,13 @@ main {
 
 .pending-confirmation p {
   margin: .28rem 0 0;
+  /* The readback is one field per line, and that line break is what makes the
+     field boundaries unforgeable by the values (worker/tools.py
+     _READBACK_LINE_SEPARATOR). textContent keeps the newlines; without
+     pre-line the browser would collapse them to spaces and hand the boundary
+     straight back to a value that contains "; to: ...". */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
   font-size: .62rem;
   line-height: 1.35;
 }

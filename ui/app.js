@@ -154,18 +154,32 @@
     const BAR_COUNT = 96;
     const UNIQUE_BANDS = 48;
     const INPUT_BANDS = 24;
-    // ---- CC6 comet-trail tuning ----
-    // Daniel's explicit pick: "fewer, larger, glowing particles with soft
-    // motion trails -- Siri-orb fluidity" (replacing CC4-era 42 small
-    // pinpricks with no trail). Every knob for that redesign lives here so a
-    // Daniel-driven tweak is a one-line edit; nothing else needs to move.
-    // The integrated-angle motion itself (particleOrbitAngle/wrapAngle, see
-    // the CONVENTION note above draw()) is untouched by this block.
-    const PARTICLE_COUNT = 16; // was 42 pre-CC6
-    const PARTICLE_SIZE_BASE = 4.4; // px @ index%3===0, was 2.2
-    const PARTICLE_SIZE_STEP = 2.6; // px added per size tier, was 1.35
-    const PARTICLE_GLOW_RADIUS_PX = 48; // particleSprite backing size, was 32
-    const TRAIL_FADE_ALPHA = .12; // destination-out fade per 60fps frame, .08-.15 (dt-scaled at use)
+    // ---- CC6/DD-6 comet-trail tuning ----
+    // CC6 baseline: Daniel's pick was "fewer, larger, glowing particles with
+    // soft motion trails -- Siri-orb fluidity" (replacing CC4-era 42 small
+    // pinpricks with no trail): PARTICLE_COUNT 42->16, bigger/brighter sprite.
+    // DD-6: after seeing that on screen, Daniel's next call was "smaller,
+    // more, and less bright and behind" -- i.e. the CC6 comets read as too
+    // few, too big, and too foreground/bright. This pass turns the same
+    // knobs the other way (count up, size/glow down, sprite + trail-layer
+    // alpha softened) so the swarm reads as ambient background dust behind
+    // the rings/waveform/core, not foreground comets. See TRAIL layer alpha
+    // and particleGlow gradient-stop comments below for the brightness split.
+    // Every knob for this redesign lives here so a Daniel-driven tweak is a
+    // one-line edit; nothing else needs to move. The integrated-angle motion
+    // itself (particleOrbitAngle/wrapAngle, see the CONVENTION note above
+    // draw()) is untouched by this block.
+    const PARTICLE_COUNT = 28; // DD-6: 16 -> 28 (CC6 was 16, pre-CC6 42)
+    const PARTICLE_SIZE_BASE = 2.6; // px @ index%3===0, DD-6: 4.4 -> 2.6 (~-40%)
+    const PARTICLE_SIZE_STEP = 1.6; // px added per size tier, DD-6: 2.6 -> 1.6 (~-40%)
+    const PARTICLE_GLOW_RADIUS_PX = 32; // particleSprite backing size, DD-6: 48 -> 32 (proportional to size cut)
+    const TRAIL_FADE_ALPHA = .16; // destination-out fade per 60fps frame, DD-6: .12 -> .16 (dimmer trails fade quicker so they don't linger brighter-looking than the live particles; dt-scaled at use)
+    // DD-6: layer-level dim applied to the final trail blit below (see
+    // drawParticles' context.globalAlpha before drawImage(trailCanvas, ...)),
+    // on top of the per-particle sprite softening -- this is the "behind"
+    // half of "less bright and behind": it recedes the whole layer under
+    // drawBackdrop()'s output rather than only shrinking each particle.
+    const TRAIL_LAYER_ALPHA = .6;
     // Trail canvas backing-store resolution multiplier against CSS-px
     // width/height. 1 = CSS-px (NOT pixelRatio-scaled like tickRingSprite/
     // segmentRingSprite -- see the resize()/drawParticles() notes on
@@ -343,11 +357,18 @@
     glowContext.fillStyle = glow;
     glowContext.fillRect(0, 0, 256, 256);
 
-    // CC6: reuses this exact radial-gradient-sprite technique (same as
-    // glowSprite above), just bigger and hotter -- PARTICLE_GLOW_RADIUS_PX
-    // was 32, and the stops below are stronger than the pre-CC6 sprite
-    // (0.95/0.5/0.1/0 @ 0/.16/.52/1) so fewer, larger particles read as
+    // CC6 reused this exact radial-gradient-sprite technique (same as
+    // glowSprite above), just bigger and hotter than pre-CC6
+    // (0.95/0.5/0.1/0 @ 0/.16/.52/1), so fewer, larger particles read as
     // glowing comets rather than pinpricks.
+    // DD-6: Daniel called those comets too bright/foreground. Stops softened
+    // roughly in half (CC6 was 1/.62/.16/0 @ the same 0/.18/.55/1 positions)
+    // -- this is the per-particle half of the brightness cut (softer core,
+    // no more near-opaque center), paired with TRAIL_LAYER_ALPHA above for
+    // a whole-layer dim. Splitting it this way keeps individual dust motes
+    // soft-edged AND keeps the whole swarm receded behind the backdrop,
+    // rather than one big alpha multiply that would just shrink a still-hot
+    // pinpoint.
     particleSprite.width = PARTICLE_GLOW_RADIUS_PX;
     particleSprite.height = PARTICLE_GLOW_RADIUS_PX;
     const particleContext = particleSprite.getContext("2d");
@@ -355,9 +376,9 @@
     const particleGlow = particleContext.createRadialGradient(
       particleCenter, particleCenter, 0, particleCenter, particleCenter, particleCenter,
     );
-    particleGlow.addColorStop(0, "rgb(255 255 255 / 1)");
-    particleGlow.addColorStop(.18, "rgb(255 255 255 / 0.62)");
-    particleGlow.addColorStop(.55, "rgb(255 255 255 / 0.16)");
+    particleGlow.addColorStop(0, "rgb(255 255 255 / 0.55)");
+    particleGlow.addColorStop(.18, "rgb(255 255 255 / 0.34)");
+    particleGlow.addColorStop(.55, "rgb(255 255 255 / 0.09)");
     particleGlow.addColorStop(1, "rgb(255 255 255 / 0)");
     particleContext.fillStyle = particleGlow;
     particleContext.fillRect(0, 0, PARTICLE_GLOW_RADIUS_PX, PARTICLE_GLOW_RADIUS_PX);
@@ -919,7 +940,17 @@
       // carry the right RGBA (including their screen-blended overlaps), so
       // this is a plain alpha-composite onto whatever drawBackdrop() just
       // painted, not another blend-mode layer.
+      // DD-6: TRAIL_LAYER_ALPHA dims the whole composited layer one more
+      // step below its per-particle sprite alpha (see particleGlow stops
+      // above) -- the "behind" half of "less bright and behind": the swarm
+      // recedes as one layer under drawBackdrop()'s output instead of only
+      // each particle shrinking individually. Reset to 1 right after so it
+      // never leaks into drawTickRing/drawSegmentRings/etc, which assume
+      // globalAlpha is 1 on entry (same convention as drawBackdrop/
+      // drawWaveform/drawCore's own local globalAlpha resets).
+      context.globalAlpha = TRAIL_LAYER_ALPHA;
       context.drawImage(trailCanvas, 0, 0, width, height);
+      context.globalAlpha = 1;
     }
 
     function drawWaveform(now, dt) {
@@ -1934,4 +1965,18 @@
   refreshState();
   refreshJobs();
   updatePolling();
+
+  // Host-to-page only: the native title bar owns the window-control buttons in both window states
+  // (WM_NCHITTEST returns HTMINBUTTON/HTMAXBUTTON/HTCLOSE there), so CSS :hover never fires and
+  // worker/desktop.py mirrors its nonclient hover here. The click handlers above stay as the
+  // fallback for when that hook is not installed. The argument is one of "minimize", "maximize",
+  // "close" or "" and only toggles a class.
+  const NC_HOVER_BUTTONS = {
+    minimize: refs.windowMinimize, maximize: refs.windowMaximize, close: refs.windowClose,
+  };
+  root.__atlasNcHover = (state) => {
+    Object.entries(NC_HOVER_BUTTONS).forEach(([name, button]) => {
+      button.classList.toggle("is-nc-hover", name === state);
+    });
+  };
 })(globalThis);

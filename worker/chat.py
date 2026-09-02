@@ -56,6 +56,8 @@ async def run(utterance: str, *, no_mcp: bool = False) -> None:
         await asyncio.gather(work_task, return_exceptions=True)
         await services.mcp.close()
         services.store.close()
+        if services.transcript is not None:
+            services.transcript.close()
 
 
 def main() -> int:

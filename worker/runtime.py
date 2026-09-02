@@ -14,6 +14,7 @@ from .jobstore import JobStore
 from .localfiles import LocalFiles, valid_file_root
 from .mcp_client import McpServers, load_mcp_config
 from .tools import ToolRegistry, builtin, load_apps, register_count_mail
+from .transcript import TranscriptStore
 from .work import WorkManager
 
 __all__ = ["Runtime", "build"]
@@ -72,6 +73,10 @@ class Runtime:
     work: WorkManager
     brain: Brain
     store: JobStore
+    # DD-4. None whenever persistence.enabled is false, which is the shipped
+    # state -- so "the flag is off" and "there is no conversation store in
+    # this process" are the same fact, not two that could disagree.
+    transcript: TranscriptStore | None = None
 
     def warm_model_client(self) -> None:
         warm = getattr(self.brain.client, "warm", None)
@@ -84,6 +89,54 @@ def _required_text(cfg: dict[str, Any], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"invalid Atlas configuration: {name}")
     return value.strip()
+
+
+def _positive_int(
+    section: dict[str, Any], name: str, fallback: int, floor: int = 1,
+) -> int:
+    """Read one persistence bound, raising rather than silently substituting.
+
+    The store clamps its own arguments defensively, so a bad value here would
+    otherwise be absorbed in silence -- and a retention or size cap that
+    quietly became something other than what the amendment says is exactly the
+    kind of drift the amendment exists to prevent.
+
+    `floor` exists for max_rows (re-review LOW-F). One row is a legal positive
+    integer and a nonsensical store: an exchange is TWO rows, so a cap below
+    that evicts every write as it lands and leaves a store that reports itself
+    enabled while retaining nothing. A fat-fingered config should say so, not
+    silently keep an empty file.
+    """
+    value = section.get(name, fallback)
+    if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+        raise ValueError(f"invalid Atlas configuration: persistence.{name}")
+    return value
+
+
+def _transcript_store(
+    cfg: dict[str, Any], tool_names: Callable[[], list[str]],
+) -> TranscriptStore | None:
+    """Build the conversation store, or None while the feature ships dark.
+
+    `enabled is True` rather than `is not False`: traces default ON and so
+    read the config that way, but persistence is the first thing Atlas writes
+    that holds what was SAID, and it stays off until config says otherwise in
+    so many words. A missing section, a null, a "yes" -- all of them are off.
+    """
+    section = cfg.get("persistence")
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return None
+    return TranscriptStore(
+        section.get("path"),
+        retention_days=_positive_int(section, "retention_days", 30),
+        # Four rows = two exchanges, the least that can be a conversation.
+        max_rows=_positive_int(section, "max_rows", 20_000, floor=4),
+        max_content_bytes=_positive_int(section, "max_content_bytes", 4 * 1024 * 1024),
+        seed_token_budget=_positive_int(section, "seed_token_budget", 1_500),
+        seed_max_turns=_positive_int(section, "seed_max_turns", 20),
+        seed_max_age_hours=_positive_int(section, "seed_max_age_hours", 24),
+        tool_names=tool_names,
+    )
 
 
 def build(
@@ -125,8 +178,13 @@ def build(
         Path(os.path.expanduser(os.path.expandvars(workspace_path))),
         folders=files.folders if files is not None else {},
     )
+    # Built before builtin() because search_transcript needs it, and given
+    # registry.names as a live callable rather than a snapshot -- MCP tools
+    # register minutes later and must still count as known names.
+    transcript = _transcript_store(cfg, registry.names)
     builtin(registry, load_apps(ATLAS / "config" / "apps.yaml"), work,
-            paired_url=paired_url, files=files, **(tool_overrides or {}))
+            paired_url=paired_url, files=files, transcript=transcript,
+            **(tool_overrides or {}))
     mcp_kwargs = {"session_factory": session_factory} if session_factory is not None else {}
     google_account = _required_text(cfg, "google_account")
 
@@ -179,6 +237,14 @@ def build(
         turn_ceiling_s=float(ceiling_s),
         mcp_status=mcp.status(),
         cache_ttl=cache_ttl,
+        transcript_store=transcript,
     )
     brain_holder.append(brain)
-    return Runtime(registry, mcp, work, brain, store)
+    if transcript is not None:
+        # Boot, in the one place both entrypoints (worker/app.py and the
+        # worker/chat.py text lane) go through. Sweep BEFORE seeding, so a
+        # tail that retention should already have dropped can never be the
+        # thing the first live turn is answering.
+        transcript.sweep()
+        brain.seed_prior_session(transcript.seed_text())
+    return Runtime(registry, mcp, work, brain, store, transcript)

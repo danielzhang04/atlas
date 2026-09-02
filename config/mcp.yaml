@@ -5,7 +5,7 @@
 # handoffs/2026-08-27-atlas-xwave.md /health line -- server counts drift
 # upstream over time, which is exactly what the missing-exposed-tools
 # connect-time warning in mcp_client.py is for), 2-3x the ~30-50
-# model-accuracy threshold once combined with kb (32) and the 19 built-in
+# model-accuracy threshold once combined with kb (32) and the built-in
 # host tools. Curating the surface, not adding new servers, is the point
 # (see docs/plans/2026-08-31-atlas-bb-wave-plan.md Track C0). C0 curated
 # total, recounted exactly (BB-wave review nit): kb 32 (the bridge's whole
@@ -13,20 +13,55 @@
 # (expose: below) + chrome-devtools 7 (expose: below) + 19 built-in host
 # tools model-visible from the registry (14 desktop/work/open tools, 4
 # localfiles tools, count_mail; confirm/cancel_pending are host-only and
-# never in schemas()) = 72 (was 116). Track C2 then adds the files
-# server's 12 exposed tools on top: 72 + 12 = 84, back over the ~30-50
-# (and even the looser 72) accuracy budget C0 set.
-# The plan (Track C, C2 row) prioritizes the files domain over holding that
-# number this wave; flagged here for the per-turn tool-projection follow-up
-# C0's budget work implied (e.g. only project domains relevant to the
-# turn instead of the full curated surface) rather than re-cutting
-# elsewhere to force 85 back under 72.
+# never in schemas()) = 72 (was 116). Track C2 then added the files
+# server on top; F3's write-only cut brought that server to 5 and the
+# total to 77, and DD-2's focus_last_opened made the built-ins 20, for 78.
+#
+# DD-7 (connector tranche 1) takes it to 85: google 14 -> 15
+# (get_doc_content) and chrome-devtools 7 -> 13 (direct browser actions).
+# That is a deliberate +7 against a budget that was already over, spent on
+# capability Daniel approved rather than on breadth: every added tool is
+# named in its server's expose: with a stated policy, and the two Gmail
+# sends that carry reply/forward needed no new exposure at all.
+# The clawback is DD-8's per-turn domain projection (only project the
+# domains a turn actually needs instead of the full curated surface), not a
+# re-cut elsewhere. Measured cost of the tranche, through the real
+# _mirror_tool/ToolRegistry/Brain path against the pinned servers' cached
+# tool listings: serialized prefix 65,213 -> 71,261 chars (+6,048), roughly
+# +1,510 to +1,680 tokens. Of that, 4,739 is the seven added browser tools'
+# schema entries (3,197 of it their raw JSON input schemas, which describe:
+# cannot touch), 886 is get_doc_content, 219 is the capability line's longer
+# tool-name list, 230 is BASE_SYSTEM's new browser-vs-launch_work boundary,
+# and the google describe: overrides give 34 back.
+#
+# The 2026-09-01 security rework then gave 1,129 of that back, to 70,132
+# chars (roughly -280 to -310 tokens), while REMOVING capability rather than
+# adding it. Measured the same way, offline, against the real tools/list
+# schemas:
+#   -659  handle_dialog dropped entirely (see chrome-devtools below)
+#   -718  the four tools strip_args: touches, net of their describe: work --
+#         take_snapshot -187, take_screenshot -189, navigate_page -254
+#         (two properties gone, minus a longer host description that has to
+#         say a navigation can discard unsaved work), select_page -88
+#   +248  the two Gmail sends' describe: text, for the argument shapes DD-7
+#         claimed but never shipped (in_reply_to, quote_original) and for
+#         naming attachments as the read-a-local-file-out-to-the-internet
+#         argument it is
 servers:
   kb:
     command: [node, "{kb_bridge.path}/dist/server.js"]
     enabled_from: kb_bridge.enabled
     session_channel: true
     domain: kb
+    # No allow_args here, deliberately (DD-8 Part B). The other three servers
+    # are somebody else's code arriving over npx/uvx; this one is Atlas's own
+    # reviewed bridge, built from the kb checkout Daniel controls, with no
+    # expose: because it is already curated server-side. A pinned property
+    # allowlist for 32 first-party tools would be config with no adversary --
+    # every property on it changes only when Daniel changes it, and the change
+    # arrives as a diff he reads rather than as a release he did not ask for.
+    # If the bridge ever ships from anywhere but the local checkout, this
+    # reasoning expires with it.
     env_from:
       ATLAS_KB_BRIDGE_ENABLED: kb_bridge.enabled
       ATLAS_KB_MUTATIONS_ENABLED: kb_bridge.mutations
@@ -58,7 +93,38 @@ servers:
     # being slow/flaky (the actual 2026-08-31 outage). Pin verified present
     # in uv's local archive-v0 cache (workspace_mcp-1.25.2.dist-info) on
     # 2026-08-31; bump deliberately, not by cache drift.
-    args_override: [workspace-mcp==1.25.2, --tools, gmail, drive, calendar]
+    # `docs` added by DD-7 for get_doc_content. --tools is the SERVER's tool
+    # groups, not Atlas's surface: enabling docs makes the server offer 18 more
+    # tools (38 -> 56) and expose: below still mirrors exactly one of them, so
+    # the model-facing cost is +1 schema. NOTE FOR DANIEL: docs tools request
+    # the docs_read OAuth scope, which the existing google-workspace grant may
+    # not carry -- the first get_doc_content call after this ships can prompt
+    # for re-consent. Nothing here initiates that; it is a live-run
+    # observation, not a headless one.
+    #
+    # WHAT THE OTHER 17 ARE, and what actually keeps them out (2026-09-01
+    # rework, F8 -- the previous version of this comment was wrong on all
+    # three counts). Ten are mutations on Daniel's documents: create_doc,
+    # modify_doc_text, find_and_replace_doc, insert_doc_elements,
+    # insert_doc_image, update_doc_headers_footers, batch_update_doc,
+    # create_table_with_data, update_paragraph_style, manage_doc_tab. One more,
+    # export_doc_to_pdf, is declared not-read-only because it writes the PDF
+    # into Drive. The remaining SIX are reads, several of them Drive-wide:
+    # get_doc_as_markdown, list_docs_in_folder, search_docs,
+    # inspect_doc_structure, debug_docs_runtime_info, debug_table_structure.
+    #
+    # None is exposed, so none is mirrored or model-visible. But the reason a
+    # WIDENED expose: would still land them on confirm is NOT their names --
+    # get_doc_as_markdown, list_docs_in_folder and search_docs all start with
+    # an instant_prefix, and never_instant matches none of them. The only thing
+    # holding them is this server having an `instant:` key at all: policy_for
+    # (mcp_client.py:464) short-circuits there and returns confirm for any name
+    # not listed, never reaching the prefix heuristic. So the real risk is a
+    # config edit that DROPS or restructures `instant:` below -- that alone
+    # would silently promote three Drive-wide document reads to instant, with
+    # no other change. Keep `instant:` present and explicit; adding to expose:
+    # is a separate, deliberate decision.
+    args_override: [workspace-mcp==1.25.2, --tools, gmail, drive, calendar, docs]
     # Core 14-tool set (plan Track C0): the 10 existing instant reads below,
     # plus send_gmail_message/draft_gmail_message (product decision -- both
     # stay confirm: not in instant: below, and never_instant's "send"
@@ -81,34 +147,439 @@ servers:
     # kept (tested, general, and still the right shape for the next tool
     # whose safe subset is a set of argument values) -- it just has no
     # rules configured right now.
+    #
+    # DD-7 (connector tranche 1) adds ONE tool here, get_doc_content, and
+    # changes no policy. Gmail REPLY and FORWARD needed no new exposure at
+    # all: workspace-mcp 1.25.2 has no reply_gmail_message/
+    # forward_gmail_message tool -- reply is send_gmail_message with
+    # thread_id (+ optional in_reply_to / reply_all / quote_original) and
+    # forward is send_gmail_message with forward_message_id
+    # (gmail/gmail_tools.py:2280, and _forward_gmail_message_impl:2679 behind
+    # it). draft_gmail_message carries the reply arguments but NOT
+    # forward_message_id, so a forward can only be sent, never drafted. Both
+    # tools were already exposed and already confirm-tier, so the capability
+    # was reachable and correctly gated the whole time; what DD-7 adds for it
+    # is a readback that names the recipient and subject (readback_keys:
+    # below) and describe: overrides that teach the argument shapes.
+    # allow_args (DD-8 Part B; see mcp_client._tool_allowed_arguments). The
+    # pinned set of property names each tool may carry. Anything else is cut
+    # from the mirrored schema, refused at the call boundary, and named in a
+    # connect-time warning so a legitimate upstream addition is noticed rather
+    # than silently lost.
+    #
+    # WHY THIS SERVER AT ALL, given args_override pins workspace-mcp==1.25.2:
+    # "pinned" is a version string, not an integrity check -- the same caveat
+    # the files server below already carries about npx -- and a version bump is
+    # precisely the moment a new property arrives unread. The list is
+    # deliberately narrow: only the two Gmail sends, the highest-blast-radius
+    # tools on the whole surface, and only the properties Atlas's own describe:
+    # text teaches plus the ones plainly worth having.
+    #
+    # WHAT THIS DROPS, and why each is a decision rather than a byte cut:
+    #   from_email  - a 'Send As' alias. The model choosing a DIFFERENT sending
+    #     identity for Daniel's mail, which readback_keys [to, cc, subject]
+    #     never names, so the confirm readback would not mention it at all.
+    #     That is the finding this list exists for.
+    #   from_name   - the display name on the same envelope, same argument.
+    #   references  - RFC Message-ID ancestry. in_reply_to already threads a
+    #     reply and is described; this only lets a message be forged into an
+    #     arbitrary thread.
+    #   include_signature, include_forwarded_attachments - server defaults are
+    #     the right behavior (signature on, forwarded attachments kept) and no
+    #     describe: text teaches otherwise.
+    #   body_format - the server default is 'plain', so DROPPING THIS MEANS
+    #     ATLAS CAN NEVER SEND OR DRAFT HTML MAIL. That is intended, not a
+    #     side effect: Atlas composes by voice, every body it writes is
+    #     dictated prose, and the readback Daniel says yes to is read aloud as
+    #     plain text -- markup in the sent message that was never in the
+    #     readback is a difference between what he approved and what went out.
+    #     If HTML mail is ever wanted, adding body_format back is the whole
+    #     change, and it needs a readback that can say which format is going.
+    # bcc IS kept: it is an ordinary thing to want, and it appears in the
+    # readback as an argument the model supplied.
+    allow_args:
+      send_gmail_message: [to, cc, bcc, subject, body, thread_id, in_reply_to,
+                           quote_original, reply_all, forward_message_id,
+                           attachments]
+      draft_gmail_message: [to, cc, bcc, subject, body, thread_id, in_reply_to,
+                            quote_original, attachments]
+    # NOT allowlisted here, deliberately: manage_event. Its 32 properties are
+    # all confirm-tier behind a readback that names every argument the model
+    # supplied, and cutting the conference/guest/visibility cluster is a
+    # capability judgement Daniel has not made. The reads (get_events,
+    # search_drive_files, list_drive_items, ...) are left alone for the same
+    # reason in reverse: a new read property is a new way to read Daniel's own
+    # data, which is what the tool already does.
     expose: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
              list_gmail_labels, get_events, list_calendars, query_freebusy,
              search_drive_files, list_drive_items, get_drive_file_content,
+             get_doc_content,
              send_gmail_message, draft_gmail_message,
              get_drive_shareable_link, manage_event]
     instant: [search_gmail_messages, get_gmail_message_content, get_gmail_thread_content,
               list_gmail_labels, get_events, list_calendars, query_freebusy,
-              search_drive_files, list_drive_items, get_drive_file_content]
+              search_drive_files, list_drive_items, get_drive_file_content,
+              get_doc_content]
     # local_time rewrites Date: <rfc2822> header lines to Daniel's local
     # wall-clock time (CC2 fixture verified) so the model never quotes a
     # sender's foreign timezone back to him. Gmail read tools only -- the
     # three tools whose text carries a Date: header. NOT calendar
     # (get_events/query_freebusy): their date/time formatting is unverified
     # against this transformer and stays untouched this wave.
+    #
+    # DD-7 checked the three tools it touched and none joins this map:
+    # send_gmail_message returns "Email sent! Message ID: <id>"
+    # (gmail_tools.py:2673) and draft_gmail_message returns the same shape --
+    # neither renders a date at all, so a transform entry for them would be
+    # dead config. The reply/forward flow still gets local time where it
+    # actually matters: the model reads the thread through
+    # get_gmail_thread_content, which IS transformed here. get_doc_content
+    # returns document body text, where a "Date:" line is the author's
+    # content, not a mail header, and must not be rewritten.
     transform:
       search_gmail_messages: local_time
       get_gmail_message_content: local_time
       get_gmail_thread_content: local_time
+    # Taint (DD-7). Every MCP tool is content-bearing by default; get_doc_content
+    # is listed explicitly as true because it is the single most content-bearing
+    # tool on this server -- it returns the full body of a document that anyone
+    # who can share into Daniel's Drive may have written -- and because a future
+    # blanket entry in this map must not be able to sweep it up by accident.
+    # Restating the default here is deliberate, not redundant.
+    content_bearing:
+      get_doc_content: true
+    # Readback keys (DD-7, rule 5). See worker/tools.py Tool.readback_keys. A
+    # send/draft readback is exact either way; these keys make it ANSWERABLE.
+    # workspace-mcp leaves them optional -- `to` and `cc` are derived from the
+    # thread when reply_all is set, `subject` defaults to "Fwd: <original>"
+    # when forwarding -- so a reply-all or a forward could otherwise be read
+    # back to Daniel naming neither who it goes to nor what it says. Recipient
+    # first, then subject, then the model's own arguments.
+    #
+    # `cc` is on send (2026-09-01 rework, F3) because the old [to, subject]
+    # fired on the ABSENCE of `to` only. A model supplying BOTH an explicit
+    # `to` AND reply_all: true therefore read back exactly one recipient --
+    # while _derive_reply_all_recipients (gmail/gmail_helpers.py:286-300) still
+    # builds Cc from the sender plus every To and Cc on the thread. Daniel
+    # approved "sam@example.test" and mailed the whole thread. With `cc`
+    # declared, that call reads back "cc: (not set)" and the derivation is
+    # audible.
+    #
+    # draft_gmail_message does NOT need `cc`, verified against the pinned
+    # package rather than assumed: it has no reply_all argument at all, and
+    # _derive_reply_all_recipients is called from exactly one place
+    # (gmail/gmail_tools.py:2598, inside the send impl). So a draft never
+    # derives a Cc and an always-present "cc: (not set)" there would be noise.
+    #
+    # It does derive `to` and `subject`, though, which is why it keeps those
+    # two keys: a threaded draft with no `to` takes the recipient from the
+    # target message's Reply-To or From, and an empty subject takes the
+    # original's (gmail/gmail_tools.py:3018-3021). So "(not set)" on a draft
+    # means one of two different things depending on thread_id, which is
+    # exactly why the placeholder names no mechanism -- it says only what is
+    # always true, and each tool's describe: below says what absence means for
+    # that tool.
+    readback_keys:
+      send_gmail_message: [to, cc, subject]
+      draft_gmail_message: [to, subject]
+    # Link handles (DD-2/F1). A Drive document's only address is a URL, and
+    # that URL only ever appears inside a google result -- which taints the
+    # turn, after which `open` refuses every non-alias URL. So "open my
+    # skincare guide" could not be answered at all: the model could see the
+    # link and had no legal way to act on it. link_pattern names a host-side
+    # extractor (mcp_client._LINK_PATTERNS, never a regex from config) that
+    # tags each matching link with a one-turn handle; `open` then takes the
+    # handle, never the URL.
+    #
+    # link_hosts is the closed destination vocabulary, boss-approved. Every
+    # extracted URL is checked against it TWICE -- once when the handle is
+    # minted, once when open spends it -- so a hostile link can never reach a
+    # NEW ORIGIN. Adding a host here is Daniel's explicit decision.
+    #
+    # "Never a new origin" is the whole guarantee, and it is narrower than it
+    # sounds. Forged Link: lines ARE reachable: workspace-mcp interpolates
+    # Drive file names into its result text unescaped and without stripping
+    # newlines, so a file an attacker shares into Daniel's Drive can put a
+    # whole "Link: https://..." line of the attacker's choosing into a
+    # search_drive_files result. Anchoring the pattern at end-of-line does
+    # not stop that; only this allowlist does. What an attacker can therefore
+    # aim `open` at, on these hosts:
+    #   - drive.google.com/uc?export=download&id=... -- a one-click download
+    #     of an arbitrary attacker-supplied file into Daniel's Downloads
+    #     folder. It lands as a file, unopened and unexecuted, but it lands.
+    #     OPEN DECISION for Daniel, not settled here.
+    #   - mail.google.com/mail/?view=cm&to=...&su=...&body=... -- a compose
+    #     window pre-filled with the attacker's recipient, subject and body.
+    #     It still takes Daniel pressing send.
+    #   - docs.google.com/... -- any document the attacker shared, which is a
+    #     credible phishing page ("sign in to view") wearing a Google origin
+    #     and a Google TLS certificate, which is exactly what makes it worth
+    #     something to an attacker.
+    # None of these is a code-execution path and none reaches a non-Google
+    # origin; all of them are a step up from "the link just sits there as
+    # text". The carve-out is accepted with that understood.
+    #
+    # DD-7 verified get_doc_content against this machinery rather than
+    # assuming it: the tool's result header is
+    #   File: "<name>" (ID: <id>, Type: <mime>)
+    #   Link: <webViewLink>
+    #   \n--- CONTENT ---\n<body>
+    # (gdocs/docs_tools.py:325-329), so the Link: line is already exactly the
+    # trailing_link shape -- one "Link: <url>" ending its line -- and needed
+    # NO change to the pattern. A Google Doc's webViewLink is on
+    # docs.google.com and a Drive-hosted .docx's is on drive.google.com, both
+    # already in link_hosts above. When Drive returns no webViewLink the
+    # header carries the literal "#", which fails _direct_https and mints
+    # nothing, which is the correct fail-soft.
+    link_pattern: trailing_link
+    link_hosts: [docs.google.com, drive.google.com, sheets.google.com,
+                 slides.google.com, mail.google.com, calendar.google.com]
+    # Host-authored descriptions for the three tools DD-7 touched. Voice-first
+    # and short; the two sends also state the confirm gate and, because
+    # workspace-mcp has no separate reply/forward tool, they are the only place
+    # the model learns the reply and forward argument shapes.
+    describe:
+      send_gmail_message: "Send mail from Daniel's Gmail. New message: to, subject, body. Reply: thread_id from get_gmail_thread_content, plus in_reply_to for one message and quote_original to quote it. reply_all with no to or cc makes Gmail address the sender and every other participant. Forward: forward_message_id; subject and body come from the original. attachments mails a local file out by path - only if Daniel asked. Pass to, cc and subject when you know them; the host reads them back for Daniel's yes."
+      draft_gmail_message: "Save an unsent draft in Daniel's Gmail. Same arguments as sending: to, subject, body, plus thread_id to draft a reply on a thread, in_reply_to for one message and quote_original to quote it. On a thread, leaving to or subject empty makes Gmail take them from the message being replied to. No reply-all, no forward draft. attachments attaches a local file by path - only if Daniel asked. The host reads the recipient and subject back for Daniel's yes."
+      get_doc_content: "Read a Google Doc, or a .docx stored in Drive, by its document id or full URL. Returns the file name, its link with a handle you can pass to open, and the document text."
   chrome-devtools:
     from_claude_config: chrome-devtools
     domain: browser
-    blocked: [get_network_request, list_network_requests]
-    # 7 actually-useful tools (plan Track C0); network tools stay blocked
-    # even though they are already excluded by expose (defense in depth for
-    # call_raw and any future config edit that widens expose).
+    # Never mirrored, never callable through call_raw either -- defense in
+    # depth for any future config edit that widens expose. Network tools were
+    # blocked by C0. DD-7 adds two more, for rule 1 rather than for noise:
+    # evaluate_script runs arbitrary JavaScript in Daniel's real, logged-in
+    # browser, which is a one-call read of document.cookie and of any
+    # credential a page is holding; upload_file pushes a local file of the
+    # model's choosing into a live web form, which is the same exfiltration in
+    # the other direction. Neither is in expose:, and neither ever should be.
+    blocked: [get_network_request, list_network_requests,
+              evaluate_script, upload_file]
+    # strip_args (see mcp_client._tool_stripped_arguments). blocked: drops a
+    # whole tool; this drops one ARGUMENT off a tool worth keeping. A mirrored
+    # schema is the remote server's own, passed through, so upstream arguments
+    # Atlas would never have designed arrive with it. These five are removed
+    # from the model's schema AND refused if supplied anyway:
+    #
+    #   take_snapshot.filePath, take_screenshot.filePath -- "absolute path to
+    #     save to instead of attaching it to the response". Both tools are
+    #     INSTANT, so this was a one-assertion write of page-controlled text to
+    #     any path on the machine: past file_write_roots, past the files
+    #     server's write-only confinement, past localfiles' credential shield.
+    #     A tainted turn hands an attacker both the path and the bytes (a .bat
+    #     in Startup). PRE-EXISTING since C0 -- not introduced by the DD-7
+    #     tranche, but the tranche restated this tier as safe, so it is fixed
+    #     here. Snapshots still come back in the response, which is the only
+    #     way Atlas ever wanted them.
+    #   navigate_page.initScript -- "JavaScript executed on each new document
+    #     before any other scripts". That is evaluate_script, which is
+    #     blocked: above, arriving as an argument instead of as a tool. Confirm
+    #     tier does NOT hold it: the readback would be a legitimate URL
+    #     followed by a 160-char-truncated wall of JavaScript, exact and
+    #     unanswerable, which rule 5 cannot accept.
+    #   navigate_page.handleBeforeUnload -- decides whether a page's
+    #     "you have unsaved changes" dialog is accepted. Not the model's call.
+    #     NOTE the server-side default is still `accept`, which stripping the
+    #     argument does not change; navigate_page's describe: below says so.
+    #   select_page.bringToFront -- focuses the tab and raises it. select_page
+    #     is INSTANT, so this was a visible real-world side effect on the
+    #     instant tier under a description that said nothing changes.
+    strip_args:
+      take_snapshot: [filePath]
+      take_screenshot: [filePath]
+      navigate_page: [initScript, handleBeforeUnload]
+      select_page: [bringToFront]
+    # allow_args (DD-8 Part B; see mcp_client._tool_allowed_arguments). The
+    # inverse of strip_args, and the reason it exists: strip_args catches
+    # upstream RENAMING one of the four names above (the "names not offered"
+    # warning fires), but nothing caught upstream ADDING a new one. This server
+    # is spawned from ~/.claude.json and is NOT version-pinned, so an upstream
+    # release adding a property to any of these 13 tools was mirrored straight
+    # into the model's snapshot with nothing refusing it. That is not
+    # hypothetical: it already happened, unnoticed, and it is exactly how
+    # filePath (instant-tier arbitrary file write) and initScript (arbitrary
+    # JavaScript in Daniel's logged-in browser) reached the model in the first
+    # place. This server gets the allowlist first because it is the one that
+    # can change under Atlas without anyone deciding to let it.
+    #
+    # Every name below was read off the real tools/list schema and kept
+    # deliberately. What is NOT here is everything else the server ever grows.
+    # A name that disappears from upstream and a name that appears in upstream
+    # both raise a connect-time WARNING (both directions), which is how a
+    # benign addition gets noticed instead of silently lost -- there is no
+    # ordering that lets a benign new property through without also letting a
+    # dangerous one through.
+    #
+    # A name may not appear in both strip_args and allow_args: that would be a
+    # config edit quietly re-permitting exactly what the strip exists to
+    # remove, so it raises at load rather than resolving by precedence.
+    #
+    # Note the shapes deliberately kept: includeSnapshot (returns the page
+    # snapshot with the result, saving a whole extra take_snapshot round) and
+    # timeout (bounded by defaults.call_timeout_s anyway). And the ones kept
+    # with a shrug: new_page's `background` and `isolatedContext` are real
+    # upstream arguments on a confirm-tier tool whose readback names the URL.
+    #
+    # `pageId` IS ON NINE OF THESE, AND IT IS REQUIRED. Read this before
+    # editing the list, because the first version of it got this wrong and
+    # broke nine of the thirteen tools with a green test suite.
+    #
+    # pageId does not appear in a page-scoped tool's own `schema`. The server
+    # INJECTS it: build/src/ToolHandler.js composes
+    #   inputSchema = pageScoped && <routing flag> ? {...pageIdSchema, ...tool.schema}
+    #                                              : tool.schema
+    # and build/src/tools/ToolDefinition.js declares
+    #   pageIdSchema = { pageId: zod.number()... }   -- no .optional()
+    # so on a page-scoped tool it arrives as a REQUIRED property. Reading
+    # `tool.schema` out of the package source, which is how the DD-8 dump was
+    # taken, shows the pre-injection shape and misses it completely.
+    #
+    # The nine page-scoped exposed tools -- verified identical across the five
+    # versions cached on this machine (1.4.0, 1.5.0, 1.6.0, 1.7.0, 1.8.0) --
+    # are click, fill, fill_form, navigate_page, press_key, take_screenshot,
+    # take_snapshot, type_text and wait_for. select_page, new_page, close_page
+    # and list_pages are NOT page-scoped; the first three carry a pageId of
+    # their own, in their own schema, and list_pages takes nothing.
+    #
+    # Whether the injection happens is VERSION-DEPENDENT, which is the whole
+    # argument for this mechanism restated as a live example: 1.4.0's flag
+    # (experimentalPageIdRouting) has no default and is therefore off, while
+    # 1.8.0 renamed it pageIdRouting and gave it `default: true`. So a single
+    # upstream release silently made a required property appear on nine tools.
+    # Listing pageId here is correct under BOTH: with routing off the server
+    # simply does not offer it and the reverse "names not offered" warning
+    # says so, which is the honest signal that routing is off.
+    #
+    # What stripping it did, before this fix: pageId was cut from the
+    # model-facing schema AND refused if supplied, so every one of the nine
+    # failed. On the four confirm-tier ones (click, fill, press_key, type_text,
+    # navigate_page, fill_form) the failure mode was worse than a refusal --
+    # Atlas minted a pending action, read it back, took Daniel's yes, and only
+    # THEN did the server reject the call for a missing required argument.
+    #
+    # Net effect of this list today: it removes nothing that strip_args above
+    # does not already remove. That is expected and is not a reason to delete
+    # it -- its entire job is what happens on the NEXT upstream release, on a
+    # server Atlas spawns unpinned.
+    allow_args:
+      navigate_page: [pageId, url, type, timeout, ignoreCache]
+      take_snapshot: [pageId, verbose]
+      take_screenshot: [pageId, format, fullPage, quality, uid]
+      click: [pageId, uid, dblClick, includeSnapshot]
+      fill: [pageId, uid, value, includeSnapshot]
+      fill_form: [pageId, elements, includeSnapshot]
+      press_key: [pageId, key, includeSnapshot]
+      # No includeSnapshot on type_text: no released version offers it
+      # (1.4.0 through 1.8.0 all list exactly pageId, submitKey, text).
+      # Listing it produced the reverse-direction warning, which is the
+      # mechanism working -- an allowlisted name the server does not offer is
+      # either an upstream rename or, as here, a name that was never real.
+      type_text: [pageId, text, submitKey]
+      wait_for: [pageId, text, timeout]
+      select_page: [pageId]
+      new_page: [url, timeout, background, isolatedContext]
+      close_page: [pageId]
+      # list_pages offers no properties at all today. The empty list is not an
+      # oversight and not a config mistake: it is the only way to PIN a
+      # zero-property tool, so that an upstream release giving list_pages its
+      # first argument raises the unpinned-property warning and gets refused
+      # instead of arriving unread. allow_args is the one list in this file
+      # where empty is legal, for exactly this case.
+      list_pages: []
+    # RECOMMENDED, NOT DONE: pin this server the way google is pinned, with an
+    # args_override naming an exact chrome-devtools-mcp version. The case for
+    # it is the pageId story above -- between 1.4.0 and 1.8.0 a required
+    # property appeared on nine tools with no change to any tool's own schema,
+    # purely because a CLI default flipped -- plus the server growing 50 -> 58
+    # tools over those five releases (the additions are heap-snapshot, PWA
+    # install/launch and OS-app-state tools; none is in expose:, so expose: is
+    # doing its job, but the server is acquiring real capability Atlas never
+    # asked for). Verified for a pin to 1.8.0: it is present in the local npx
+    # cache, offers all 13 tools in expose: and all 4 in blocked:, and its
+    # property sets for those 13 are identical to 1.4.0's.
+    #
+    # It is NOT applied here because args_override REPLACES the argv from
+    # ~/.claude.json, and this host must not read that file (rule 1: it is
+    # shared with Claude Code and holds authentication state). Any flags Daniel
+    # set on the chrome-devtools entry there -- a browser channel, an isolated
+    # profile, a headless switch -- would be silently dropped by an override
+    # written blind. Applying the pin means reading the current entry's args
+    # first and carrying them over verbatim, which is Daniel's call to make,
+    # not something to guess at from here.
+    # DD-7 (connector tranche 1) widens C0's 7 to 13. The 6 added are
+    # fill_form, press_key, type_text, select_page, new_page and close_page:
+    # enough to actually drive a page Daniel is looking at (fill a form, hit
+    # Enter, type into a focused field, pick a tab, open or close one) instead
+    # of only clicking one field at a time.
+    #
+    # handle_dialog was in this tranche and is NOT exposed (2026-09-01 rework,
+    # F6). Its readback can only ever be "pageId: 1; action: accept" -- Daniel
+    # can tell accept from dismiss but never learns WHAT he is accepting, so
+    # "Delete all files?" reads back identically to a cookie banner. Splicing
+    # the dialog's own text into the readback would mean the host making an
+    # extra browser call of its own inside a confirm, which is a mechanism this
+    # wave is not building. An unanswerable readback is worse than a missing
+    # tool, so the tool is missing.
+    #
+    # This is the browser server's whole job here: ONE direct action on a page
+    # Daniel already has open. Multi-step research browsing -- LinkedIn,
+    # comparison shopping, anything that means "go look and come back" -- stays
+    # routed to launch_work (rule 2). There is deliberately no agentic browse
+    # loop in the worker, and this widening does not create one: every action
+    # below still costs a separate turn and, for the mutating ones, a separate
+    # yes from Daniel.
     expose: [navigate_page, take_snapshot, click, fill, take_screenshot,
-             list_pages, wait_for]
-    instant: [list_pages, take_snapshot, take_screenshot]
+             list_pages, wait_for,
+             fill_form, press_key, type_text, select_page, new_page,
+             close_page]
+    # POLICY. Instant is reads and tab orientation only:
+    #   list_pages/take_snapshot/take_screenshot  - look at the browser
+    #   wait_for                                  - block until text appears
+    #   select_page                               - choose which tab the next
+    #                                               call targets
+    # Each of those is instant only because strip_args: above took its
+    # side-effecting argument away: take_snapshot/take_screenshot no longer
+    # write files and select_page no longer raises a window. Anything that
+    # would put a side effect back onto one of these tools belongs on confirm,
+    # not here.
+    # wait_for and select_page are DD-7 additions to instant:. wait_for was
+    # confirm by omission, which is friction with no safety in it -- the tool
+    # waits, bounded by defaults.call_timeout_s, and changes nothing; making
+    # Daniel say yes to a wait in the middle of a fill/click sequence bought
+    # nothing and cost a turn. select_page only decides which already-open tab
+    # the next call addresses.
+    #
+    # Everything else confirms, by omission from instant: (no never_instant
+    # substring catches any of these names, so omission is the whole gate --
+    # which is why nothing may be added to instant: without re-reading this):
+    #   click, fill, fill_form, press_key, type_text  - a wrong click or a
+    #     wrong keystroke in Daniel's real, logged-in browser session is a
+    #     real-world action: it can submit, purchase, delete, or post. Rule 5
+    #     tier, exactly like a send.
+    #   navigate_page, new_page  - the model chooses a URL to load in a session
+    #     that carries Daniel's cookies. Worth stating plainly: `open` refuses
+    #     a model-typed URL once the turn is tainted, which is the entire
+    #     reason DD-2's link handles exist -- and these two tools do NOT go
+    #     through that wall, they take a raw url argument. navigate_page has
+    #     been exposed since C0, so new_page adds no new class of reach, but it
+    #     does widen it. What holds the line here is rule 5, not rule 7: both
+    #     confirm, and the readback names the URL, so a hostile destination
+    #     smuggled out of a poisoned Drive result still has to be read aloud
+    #     and agreed to before Chrome goes anywhere.
+    #     Neither may ever be added to instant:.
+    #   close_page  - closes one of Daniel's tabs, with no undo.
+    instant: [list_pages, take_snapshot, take_screenshot, wait_for, select_page]
+    # Voice-first descriptions for the DD-7 additions. Each mutating one states
+    # the confirm gate in the same words the files server's mutations use, so
+    # the model never proposes one as if it would just happen.
+    describe:
+      fill_form: "Fill several fields on the current page at once, each by its uid from the latest snapshot. Prefer this over repeated fill calls. The host reads back every field and value and waits for Daniel's yes."
+      press_key: "Press one key or combination on the current page, like Enter or Control+A - shortcuts and submitting, not typing. The host reads back the key and waits for Daniel's yes."
+      type_text: "Type text with the keyboard into the field the page has focused, optionally pressing a key like Enter after. Use fill when you have a uid. The host reads back the text and waits for Daniel's yes."
+      select_page: "Choose which open tab your next browser calls act on, by the page id from list_pages. It does not switch what Daniel is looking at."
+      new_page: "Open a URL in a new browser tab. The host reads back the URL and waits for Daniel's yes."
+      close_page: "Close one open tab by its page id from list_pages. No undo. The host reads back which tab and waits for Daniel's yes."
+      navigate_page: "Go to a URL in the chosen tab, or back, forward, or reload it. If that tab has unsaved work, going anywhere discards it. The host reads back the URL and waits for Daniel's yes."
   files:
     # Official @modelcontextprotocol/server-filesystem (npm, stdio via
     # npx), version-pinned (not @latest -- see
@@ -171,6 +642,21 @@ servers:
     # guardrail, not a policy choice made here.
     expose: [write_file, edit_file, create_directory, move_file,
              list_allowed_directories]
+    # allow_args (DD-8 Part B). Small and boring, which is the point: these
+    # five tools take between zero and three arguments each, so pinning them
+    # costs nothing and closes the same hole chrome-devtools had. The npx pin
+    # above is a version string, not an integrity check -- this file already
+    # says so about list_allowed_directories' trust boundary -- and a
+    # 2026.8.31 rebuild that grew write_file a `mode` or `append` property
+    # would otherwise be mirrored straight through onto a confirm-tier
+    # readback that names it without knowing what it does.
+    # list_allowed_directories takes nothing, and the empty list pins that.
+    allow_args:
+      write_file: [path, content]
+      edit_file: [path, edits, dryRun]
+      create_directory: [path]
+      move_file: [source, destination]
+      list_allowed_directories: []
     instant: [list_allowed_directories]
     # write_/edit_/create_/move_ are not in instant_prefixes and are absent
     # from instant: above, so all four mutations default to confirm (see

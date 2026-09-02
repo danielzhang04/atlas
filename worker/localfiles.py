@@ -12,7 +12,11 @@ import stat
 import time
 from typing import Callable, Mapping, Sequence
 
-from .desktopapps import _launch_folder, known_folder_path
+from .desktopapps import (
+    _launch_folder,
+    associated_executable_path,
+    known_folder_path,
+)
 
 __all__ = ["LocalFiles", "resolve_file_roots", "valid_file_root"]
 logger = logging.getLogger("atlas.localfiles")
@@ -169,6 +173,13 @@ _CLOUD_REPARSE_MASK = 0xFFFF0000
 _CLOUD_REPARSE_FAMILY = 0x90000000
 _CLOUD_PLACEHOLDER_ERROR = "file not available yet (cloud placeholder)"
 _FILE_DEADLINE_S = 5.0
+# Opens get a longer deadline than reads because they now do strictly more:
+# the same possible cloud-hydration stall, and THEN up to
+# desktopapps._LAUNCH_WINDOW_WAIT_S waiting for the window to focus it. On
+# the old 5s an ordinary slow open could have been reported as a cloud
+# placeholder that never happened. Still under the registry's 8s tool
+# timeout, so the deadline that fires is this specific one.
+_OPEN_DEADLINE_S = 7.5
 _READ_CAP_BYTES = 16_384
 _PREVIEW_CHARS = 1_024
 _PREVIEW_READ_BYTES = _PREVIEW_CHARS * 4 + len(codecs.BOM_UTF16_LE)
@@ -186,6 +197,37 @@ def _is_cloud_files_tag(value) -> bool:
     )
 
 
+def _desktopcontrol():
+    # Lazy, like desktopapps' own accessor: importing ctypes machinery is not
+    # worth paying for on the worker startup path (rule 11) when a session
+    # that never opens a file never needs it.
+    import importlib
+
+    return importlib.import_module("worker.desktopcontrol")
+
+
+def _visible_window_snapshot() -> frozenset[int]:
+    try:
+        return _desktopcontrol().visible_window_handles()
+    except Exception:
+        # No desktop control (headless test host, an EnumWindows failure) must
+        # never turn an open into a failure. An empty snapshot only means the
+        # new-window diff cannot distinguish anything, so nothing is focused.
+        return frozenset()
+
+
+def _focus_new_window(
+    before: frozenset[int],
+    expected_process_paths: tuple[str, ...] = (),
+) -> dict | None:
+    try:
+        return _desktopcontrol().focus_new_window(
+            before, expected_process_paths=expected_process_paths,
+        )
+    except Exception:
+        return None
+
+
 class LocalFiles:
     def __init__(
         self, roots: Sequence[Path | str], *,
@@ -193,6 +235,11 @@ class LocalFiles:
         opener: Callable[[str], object] = os.startfile,
         folder_opener: Callable[[str], object] = _launch_folder,
         known_folder_resolver: Callable[[str], Path] = known_folder_path,
+        window_snapshot: Callable[[], frozenset[int]] | None = None,
+        new_window_focuser: Callable[
+            [frozenset[int], tuple[str, ...]], dict | None
+        ] | None = None,
+        handler_resolver: Callable[[str], str | None] = associated_executable_path,
     ) -> None:
         if not roots:
             raise ValueError("at least one file root is required")
@@ -203,6 +250,37 @@ class LocalFiles:
         self._clock = clock
         self._opener = opener
         self._folder_opener = folder_opener
+        self._window_snapshot = window_snapshot
+        self._new_window_focuser = new_window_focuser
+        self._handler_resolver = handler_resolver
+        self._open_observer: Callable[[Mapping], None] | None = None
+
+    def _expected_handler_paths(self, resolved: Path, kind: str) -> tuple[str, ...]:
+        """Which executable is about to handle this open, host-resolved.
+
+        `os.startfile` is the shell doing whatever is registered, so the host
+        has no launcher pid and no profile to name the process by. The
+        registered association is the one identity available BEFORE the
+        window exists, and it is what stops "focus the new window" from
+        focusing an unrelated toast that happened to pop during the poll.
+
+        Empty is a normal answer, not an error: no registered handler, a
+        packaged app, or desktop control unavailable. The caller treats empty
+        as "cannot attribute a window to this open" and focuses nothing.
+
+        Files only. A folder goes out through the signed Explorer profile,
+        which identifies its own window and reports it, so asking the
+        association database about a directory whose name happens to contain
+        a dot would be a lookup whose answer is never read.
+        """
+        if kind != "file":
+            return ()
+        try:
+            handler = self._handler_resolver(resolved.suffix)
+        except Exception:
+            # A shell lookup failing must never turn an open into a failure.
+            return ()
+        return (handler,) if isinstance(handler, str) and handler else ()
 
     @property
     def folders(self) -> Mapping[str, Path]:
@@ -481,19 +559,78 @@ class LocalFiles:
             return
         heapq.heappushpop(fallback_matches, candidate)
 
+    def set_open_observer(self, observer: Callable[[Mapping], None] | None) -> None:
+        """Host-only: called with the private window record after each open.
+
+        The record carries a native HWND, so it must never be what open()
+        RETURNS -- that dict is serialized into a tool result the model
+        reads. Handing it to a host callback instead keeps the handle inside
+        host code (rule 12) while still letting the registry remember what it
+        just put on screen.
+        """
+        self._open_observer = observer
+
     def open(self, path: str | Path) -> dict:
         resolved = self.resolve(path)
         if not resolved.is_file() or resolved.suffix.casefold() not in _OPENABLE_EXTENSIONS:
             raise ValueError("not an openable document")
-        self._opener(str(resolved))
-        return {"opened": str(resolved)}
+        return self._open_and_focus(resolved, self._opener, "file")
 
     def open_folder(self, path: str | Path) -> dict:
         resolved = self.resolve(path)
         if not resolved.is_dir():
             raise ValueError("not a directory")
-        self._folder_opener(str(resolved))
-        return {"opened": str(resolved)}
+        return self._open_and_focus(resolved, self._folder_opener, "folder")
+
+    def _open_and_focus(
+        self,
+        resolved: Path,
+        launch: Callable[[str], object],
+        kind: str,
+    ) -> dict:
+        """Open, then bring the window it produced to the front.
+
+        os.startfile and the Explorer spawn both return before any window
+        exists, so neither ever focused anything: Atlas said "opened" while
+        the document stayed behind the current window. Snapshotting first and
+        focusing the single new window afterwards is what makes "open X" put
+        X in front. `focused` is reported honestly -- an ambiguous or absent
+        new window is false, not a silent success.
+
+        A launcher that already did that work reports it, and then nothing is
+        waited for here. That is not an optimization: the folder opener polls
+        for its own window for up to desktopapps._LAUNCH_WINDOW_WAIT_S, and
+        polling a second time here stacked two waits into one call, overran
+        _OPEN_DEADLINE_S, and made a folder that had opened perfectly well
+        come back as "file not available yet (cloud placeholder)" -- a false
+        error, which is worse than a slow one.
+        """
+        # Resolved here, not bound at construction: these two default to
+        # module-level functions, and looking them up at call time is what
+        # lets a test (or a headless host) substitute them without every
+        # LocalFiles caller having to pass them through.
+        snapshot = self._window_snapshot or _visible_window_snapshot
+        focuser = self._new_window_focuser or _focus_new_window
+        # Resolved BEFORE the launch, so the identity the focuser filters on
+        # cannot have been influenced by anything the open itself put on
+        # screen. Empty when the shell has no answer, and the focuser then
+        # focuses nothing rather than grabbing an unattributable new window.
+        expected = self._expected_handler_paths(resolved, kind)
+        before = snapshot()
+        outcome = launch(str(resolved))
+        if isinstance(outcome, Mapping) and "focused" in outcome:
+            window = outcome.get("_window") if outcome.get("focused") else None
+        else:
+            window = focuser(before, expected)
+        if window is not None and self._open_observer is not None:
+            self._open_observer({
+                "kind": kind,
+                "label": str(resolved),
+                "title": window.get("title"),
+                "pid": window.get("pid"),
+                "hwnd": window.get("_handle"),
+            })
+        return {"opened": str(resolved), "focused": window is not None}
 
     def read(self, path: str | Path, max_bytes: int = _READ_CAP_BYTES) -> dict:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
@@ -534,10 +671,17 @@ class LocalFiles:
 
     async def open_file(self, path: str | Path) -> dict:
         """Open a file off-loop, bounding a possible cloud hydration stall."""
+        return await self._open_off_loop(self.open, path)
+
+    async def open_directory(self, path: str | Path) -> dict:
+        """Open a folder off-loop, on the same bounded deadline."""
+        return await self._open_off_loop(self.open_folder, path)
+
+    async def _open_off_loop(self, opener: Callable[[str | Path], dict], path) -> dict:
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self.open, path),
-                timeout=_FILE_DEADLINE_S,
+                asyncio.to_thread(opener, path),
+                timeout=_OPEN_DEADLINE_S,
             )
         except TimeoutError:
             return {"error": _CLOUD_PLACEHOLDER_ERROR}

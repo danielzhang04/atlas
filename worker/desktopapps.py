@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import threading
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -23,11 +24,13 @@ __all__ = [
     "DesktopAppError",
     "DesktopApps",
     "StatusSnapshot",
+    "associated_executable_path",
     "close_profile",
     "focus_profile",
     "known_folder_path",
     "native_launcher",
     "open_profile",
+    "profile_executable_path",
     "status",
 ]
 
@@ -42,6 +45,13 @@ class AppProfile:
     executable: str
     close_executable: str | None = None
 
+
+# How long a launch waits for its own window before giving up on focusing it.
+# 2.5s covers Explorer and notepad comfortably and a cold VS Code sometimes;
+# past that, waiting costs more than the focus is worth, and the result says
+# focused: false rather than blocking the turn.
+_LAUNCH_WINDOW_WAIT_S = 2.5
+_LAUNCH_WINDOW_POLL_S = 0.15
 
 DEFAULT_PROFILES = {
     "vscode": AppProfile("vscode", "Code.exe"),
@@ -270,13 +280,25 @@ class StatusSnapshot:
 
 
 def _direct_https(value: str) -> bool:
-    parsed = urlsplit(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
-        and parsed.username is None
-        and parsed.password is None
-    )
+    """Deliberately identical to tools._direct_https; kept separate only
+    because tools imports THIS module, so importing back would be a cycle.
+
+    Fail-soft for the same reason: `urlsplit` raises ValueError on a netloc
+    that NFKC-normalizes into `/?#@:`, and on a non-numeric port. An
+    unparseable URL is not a direct https URL -- it is never an exception a
+    launcher has to wear.
+    """
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme == "https"
+            and bool(parsed.netloc)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in (None, 443)
+        )
+    except ValueError:
+        return False
 
 
 def open_profile(app_id: str, url: str | None = None) -> object:
@@ -290,7 +312,17 @@ def focus_profile(app_id: str) -> object:
 
 
 def _launch_folder(path: str) -> object:
-    """Open a host-validated directory with the signed system Explorer profile."""
+    """Open a host-validated directory with the signed system Explorer profile.
+
+    Identified by the new-window rule, not by "a window of explorer.exe":
+    that one process hosts the desktop, the taskbar, the tray and every
+    folder window -- around thirty visible top-level windows on an ordinary
+    session -- so the first match is an arbitrary folder. Measured on this
+    machine: the folder window arrives ~1.5s after the spawn on a quiet
+    session, and around 5.5s on a session already holding two dozen Explorer
+    windows, where it exceeds _LAUNCH_WINDOW_WAIT_S and the open honestly
+    reports focused: false rather than holding the turn open for it.
+    """
     return native_launcher("explorer.exe", path)
 
 
@@ -326,18 +358,33 @@ def _taskkill_executable() -> str:
     return str(taskkill.resolve())
 
 
-def native_launcher(executable: str, url: str | None) -> dict[str, object]:
+def native_launcher(
+    executable: str,
+    url: str | None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
     """Launch one already-allowlisted executable without a shell or inherited stdin."""
     if executable not in _EXPECTED_PUBLISHERS:
         raise DesktopAppError("desktop application is not an approved profile")
     resolved = _resolve_executable(executable)
-    existing = None
-    if url is None:
-        try:
-            existing = _visible_profile_window(resolved)
-        except _desktopcontrol().DesktopControlError:
-            existing = None
-    if existing is not None:
+    # The pre-spawn lookup now runs for the url case TOO. It used to be
+    # skipped there, which quietly made "open X with a URL" the one path that
+    # never focused anything: Popen returned, the call reported success, and
+    # the window arrived later behind whatever Daniel was looking at. For the
+    # url case the lookup is not a short-circuit -- the URL still has to be
+    # delivered, so the launch always happens -- it is the record of what was
+    # already on screen, so the post-spawn step can tell a window this launch
+    # produced from one that was there all along.
+    before = _visible_window_snapshot()
+    existing_windows = _profile_windows(resolved)
+    # Exactly one, the same rule the post-spawn side applies. With several
+    # windows already on screen "the app's window" is an arbitrary one of
+    # them, and raising the wrong one is worse than launching: the launch
+    # below surfaces a window the new-window diff CAN attribute.
+    existing = existing_windows[0] if len(existing_windows) == 1 else None
+    if url is None and existing is not None:
         _focus_profile_window(existing)
         return {
             "application": executable,
@@ -369,19 +416,113 @@ def native_launcher(executable: str, url: str | None) -> dict[str, object]:
         )
     except OSError as exc:
         raise DesktopAppError("configured desktop application is unavailable") from exc
+    window = _await_profile_window(resolved, before, clock=clock, sleep=sleep)
+    if window is None and len(existing_windows) == 1:
+        # Nothing new appeared in time. When the app was already running that
+        # is the ordinary case: it handled the launch inside the window it
+        # already had, so that window is what to focus.
+        #
+        # ONLY when there was exactly one. explorer.exe is the case this
+        # guard exists for: every folder window shares one process, so "the
+        # app's window" is an arbitrary folder, and raising the wrong folder
+        # is worse than raising nothing. Several windows and no new one means
+        # the host cannot tell which one answered -- so it says focused:
+        # false rather than guessing (the focus_new_window rule, applied to
+        # the other end of the same problem).
+        window = existing
+    focused = False
+    if window is not None:
+        try:
+            _focus_profile_window(window)
+            focused = True
+        except _desktopcontrol().DesktopControlError:
+            # Focus really can fail (another process holds the foreground
+            # lock, the window closed again). Report it; do not pretend.
+            focused = False
     return {
         "application": executable,
         "pid": process.pid,
         "targeted": url is not None,
+        "focused": focused,
+        # Private, for the host that called this launcher: the window it
+        # ended up on, so a caller does not have to poll for it a second
+        # time. Never serialized into a tool result -- worker/tools.py builds
+        # its own dict from `application` and `pid` and never returns this
+        # one (pinned by a regression test).
+        "_window": window if focused else None,
     }
+
+
+def _await_profile_window(
+    resolved: str,
+    before: frozenset[int],
+    *,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> dict | None:
+    """Poll for the window this launch produced, up to _LAUNCH_WINDOW_WAIT_S.
+
+    "Produced" means new since `before`, not "belongs to this process": for a
+    single-process shell like Explorer the latter is an arbitrary window.
+    """
+    deadline = clock() + _LAUNCH_WINDOW_WAIT_S
+    while True:
+        window = _profile_window(resolved, exclude_handles=before)
+        if window is not None:
+            return window
+        if clock() >= deadline:
+            return None
+        sleep(min(_LAUNCH_WINDOW_POLL_S, max(0.0, deadline - clock())))
 
 
 def _desktopcontrol():
     return importlib.import_module("worker.desktopcontrol")
 
 
-def _visible_profile_window(executable_path: str) -> dict | None:
-    return _desktopcontrol().find_window_by_process_path(executable_path)
+def _profile_window(executable_path: str, *, exclude_handles: Any = ()) -> dict | None:
+    """The ONE window of a profile, or nothing. Never fatal, never a guess.
+
+    Desktop control being unavailable must never turn a launch into a
+    failure: the app still opens, it just does not get focused.
+
+    Exactly one, for the reason focus_new_window applies the same rule: this
+    used to take found[0], which for a launch that produced two new windows
+    (a splash plus the real one, or two documents) focused an arbitrary one
+    of them. Ambiguity is reported as focused: false, not resolved by
+    enumeration order.
+    """
+    found = _profile_windows(executable_path, exclude_handles=exclude_handles)
+    return found[0] if len(found) == 1 else None
+
+
+def _profile_windows(executable_path: str, *, exclude_handles: Any = ()) -> list[dict]:
+    """Every visible window of a profile, fail-soft, so ambiguity is visible."""
+    try:
+        return _desktopcontrol().windows_by_process_path(
+            executable_path, exclude_handles=exclude_handles,
+        )
+    except _desktopcontrol().DesktopControlError:
+        return []
+
+
+def _visible_window_snapshot() -> frozenset[int]:
+    try:
+        return _desktopcontrol().visible_window_handles()
+    except _desktopcontrol().DesktopControlError:
+        return frozenset()
+
+
+def profile_executable_path(app_id: str) -> str | None:
+    """Host-only: the resolved path of an allowlisted profile, or None.
+
+    Used to remember what was opened well enough to find it again later. The
+    path never travels in a tool result -- rule 7 keeps executables out of the
+    model's hands in both directions.
+    """
+    try:
+        return _resolve_executable(app_id)
+    except DesktopAppError:
+        return None
 
 
 def _focus_profile_window(window: dict) -> object:
@@ -619,6 +760,56 @@ def known_folder_path(name: str) -> Path:
 def _known_folder_path(name: str) -> Path:
     """Keep the private desktop-app resolver seam used by existing callers."""
     return known_folder_path(name)
+
+
+# ASSOCSTR_EXECUTABLE, and "resolve it even if the class is not registered
+# the way we expect" -- the two constants AssocQueryStringW needs.
+_ASSOCSTR_EXECUTABLE = 2
+_ASSOCF_INIT_IGNOREUNKNOWN = 0x400
+
+
+def associated_executable_path(extension: str) -> str | None:
+    """Which executable Windows will hand this file type to, or None.
+
+    Host-side identity for an `os.startfile` open. startfile is the shell's
+    "do whatever is registered", so unlike a profile launch the host does not
+    otherwise know WHICH process is about to put a window on screen -- and
+    without that, focusing "the new window" focuses whatever new window turns
+    up, including a chat toast that had nothing to do with the open. Asking
+    the association database first turns that guess into a check.
+
+    Advisory, never authoritative, and never an executable the model chose:
+    the answer is only ever used to FILTER windows the host is willing to
+    focus, never to launch anything (rule 7 -- the exec path stays host-side
+    and the launch itself is still plain os.startfile). Anything unresolvable
+    -- no registered handler, a packaged app the shell answers for
+    indirectly, a non-Windows host -- returns None, and the caller then
+    focuses nothing and reports focused: false.
+    """
+    if os.name != "nt" or not isinstance(extension, str):
+        return None
+    normalized = extension if extension.startswith(".") else f".{extension}"
+    if len(normalized) < 2 or any(character in normalized for character in "\\/:*?\"<>|"):
+        return None
+    try:
+        query = ctypes.windll.shlwapi.AssocQueryStringW
+    except (AttributeError, OSError):
+        return None
+    size = ctypes.c_ulong(0)
+    # First call sizes the buffer: it returns S_FALSE (1) and fills `size`.
+    if query(
+        _ASSOCF_INIT_IGNOREUNKNOWN, _ASSOCSTR_EXECUTABLE, normalized,
+        None, None, ctypes.byref(size),
+    ) != 1 or not size.value or size.value > 32_768:
+        return None
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if query(
+        _ASSOCF_INIT_IGNOREUNKNOWN, _ASSOCSTR_EXECUTABLE, normalized,
+        None, buffer, ctypes.byref(size),
+    ) != 0 or not buffer.value:
+        return None
+    resolved = os.path.expandvars(buffer.value)
+    return resolved if os.path.isabs(resolved) else None
 
 
 def _windows_directory() -> Path:

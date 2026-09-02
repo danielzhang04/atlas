@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
@@ -1183,15 +1184,19 @@ def test_bare_confirm_executes_pending():
 
 
 def test_closed_affirmative_allows_normalized_argument_key_words():
+    # The pending tool is named for what it does ("send_message"), which is how
+    # every real confirm-tier tool is named. The utterance says "send", and an
+    # action verb is only an affirmation when the pending action performs it --
+    # the tool name is what proves that.
     mutation_calls = []
     registry = ToolRegistry()
     registry.register(registry_tool(
-        "mutate",
+        "send_message",
         lambda arguments: return_value(mutation_calls.append(arguments) or "done"),
         policy="confirm",
     ))
     arguments = {"recipient_email": "daniel@example.test"}
-    asyncio.run(registry.call("mutate", arguments))
+    asyncio.run(registry.call("send_message", arguments))
     client = FakeClient(FakeStream(["Done."], content=[text_block("Done.")]))
     brain = Brain(client, registry, model="fast", persona="")
 
@@ -1391,10 +1396,12 @@ def test_model_issued_confirmation_is_host_only_and_cannot_consume_new_pending()
 def test_model_confirmation_after_external_content_is_host_only_and_pending_survives(
     monkeypatch,
 ):
+    # Named for what it does, like every real confirm-tier tool: "Yes, send
+    # it" is only a yes to a pending action that actually sends.
     mutation_calls = []
     registry = ToolRegistry()
     registry.register(registry_tool(
-        "mutate",
+        "send_message",
         lambda arguments: return_value(mutation_calls.append(arguments) or "sent"),
         policy="confirm",
     ))
@@ -1408,7 +1415,7 @@ def test_model_confirmation_after_external_content_is_host_only_and_pending_surv
         lambda _length: "confirm-123",
     )
     client = FakeClient(
-        FakeStream(content=[tool_block(name="mutate")], stop_reason="tool_use"),
+        FakeStream(content=[tool_block(name="send_message")], stop_reason="tool_use"),
         FakeStream(["Should I send it?"], content=[text_block("Should I send it?")]),
         FakeStream(content=[tool_block(name="google__read")], stop_reason="tool_use"),
         FakeStream(
@@ -1646,7 +1653,9 @@ def test_a_host_minted_handle_survives_an_mcp_call_and_dies_with_the_turn(tmp_pa
     ]
     results = client.messages.calls[3]["messages"][-1]["content"]
     assert results[0]["is_error"] is False
-    assert json.loads(results[0]["content"]) == {"opened": str(document.resolve())}
+    assert json.loads(results[0]["content"]) == {
+        "opened": str(document.resolve()), "focused": False,
+    }
     for refused in results[1:]:
         assert refused["is_error"] is True
         assert refused["content"] == (
@@ -2128,7 +2137,21 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM
-    assert "reading or acting inside a web page, or Chrome, uses launch_work" in BASE_SYSTEM
+    # DD-7 replaced "anything ... inside a web page, or Chrome, uses
+    # launch_work" with the boundary the connector tranche actually draws.
+    # The old sentence contradicted the seven browser actions now exposed --
+    # the model would have been told to route every one of them away. The new
+    # split is: ONE direct action on a page Daniel already has open goes
+    # through chrome-devtools; BROWSING (go look, come back, multiple steps)
+    # still goes to launch_work, which is rule 2 -- there is no agentic browse
+    # loop in the worker and the model must not build one out of these tools.
+    assert (
+        "One direct action on a page Daniel already has open -- a click, a field, some text, a key, a tab --\n"
+        "uses the chrome-devtools tools: take_snapshot first, then act on a uid from that snapshot.\n"
+        "Browsing -- going to look and coming back, research, comparison, more than a couple of steps --\n"
+        "uses launch_work."
+    ) in BASE_SYSTEM
+    assert "or Chrome, uses launch_work" not in BASE_SYSTEM
     assert "unless the tool result for that call" in BASE_SYSTEM
     assert "do not narrate between tool calls" in BASE_SYSTEM
     assert "read every summary field back" in BASE_SYSTEM
@@ -2468,7 +2491,9 @@ def test_a_host_authored_mcp_result_does_not_taint_the_turn(tmp_path):
     assert by_root["is_error"] is False
     # Nothing tainted the turn, so a plain path works again too.
     assert by_path["is_error"] is False
-    assert json.loads(by_path["content"]) == {"opened": str(downloads.resolve())}
+    assert json.loads(by_path["content"]) == {
+            "opened": str(downloads.resolve()), "focused": False,
+        }
     assert launched == [str(downloads.resolve()), str(downloads.resolve())]
 
 
@@ -2486,7 +2511,9 @@ def test_a_genuinely_content_bearing_result_still_refuses_paths_but_not_roots(tm
     # A root is one of N host-authored constants, so it survives -- which is
     # what keeps "open my downloads" answerable after reading mail.
     assert by_root["is_error"] is False
-    assert json.loads(by_root["content"]) == {"opened": str(downloads.resolve())}
+    assert json.loads(by_root["content"]) == {
+            "opened": str(downloads.resolve()), "focused": False,
+        }
     assert launched == [str(downloads.resolve())]
 
 
@@ -2523,3 +2550,486 @@ def test_content_bearing_lookup_prefers_the_registry_over_the_name_shape():
     # A registry that cannot answer at all (an older double) is not a crash.
     assert brain_mod._content_bearing_tool(object(), "google__read") is True
     assert brain_mod._content_bearing_tool(None, "find_file") is False
+
+
+# --- Unit DD-1: a yes that names a different action is not a yes ------------
+
+
+def _pending(name: str, arguments: dict | None = None) -> PendingAction:
+    return PendingAction(
+        confirm_id="confirm-1",
+        name=name,
+        arguments=dict(arguments or {}),
+        summary=name,
+        expires=float("inf"),
+    )
+
+
+def test_confirmation_intent_reads_the_forensics_phrases_the_way_daniel_meant_them():
+    draft = _pending(
+        "google__draft_gmail_message",
+        {"recipient": "x", "subject": "y", "body": "z"},
+    )
+    send = _pending(
+        "google__send_gmail_message",
+        {"recipient": "x", "subject": "y", "body": "z"},
+    )
+    intent = brain_mod._confirmation_intent
+
+    # The forensics case: "send" used to be a bare affirmation, so this
+    # sentence confirmed the very draft it was asking to move past.
+    assert intent("Create the draft and send it", draft) == "supersede"
+    # The same sentence against a pending send still names an action that
+    # pending does not perform (creating a draft), so it supersedes too.
+    assert intent("Create the draft and send it", send) == "supersede"
+    assert intent("Send it", draft) == "supersede"
+    assert intent("Send it", send) == "confirm"
+
+    # Plain agreement and plain refusal are untouched.
+    for phrase in ("yes", "yeah go ahead", "yep do it", "ok please proceed"):
+        assert intent(phrase, draft) == "confirm", phrase
+    for phrase in ("no", "nope", "cancel", "never mind", "stop"):
+        assert intent(phrase, draft) == "cancel", phrase
+
+    # An action the pending action DOES perform is still a yes: "create" is
+    # proved by the tool's own name, and a word after a determiner is a noun.
+    assert intent("yes go ahead and create the draft", draft) == "confirm"
+    assert intent("yeah go ahead and send that draft", send) == "confirm"
+    # Item 2: the object noun keeps a plain spoken yes inside the closed
+    # vocabulary instead of dropping out of it as neither yes nor no.
+    assert intent("yeah go ahead and send that email", send) == "confirm"
+    assert intent("yes send the message", send) == "confirm"
+    # Anything outside the closed vocabulary is still an ordinary turn.
+    assert intent("check the mail then yes", send) is None
+
+
+def test_supersede_cancels_the_pending_and_runs_the_ordinary_tool_lane(monkeypatch):
+    """The whole point of superseding: the model gets to pick the right tool.
+
+    A supersede routed into the confirmation narration lane would say something
+    and stop, because that lane is sent tool_choice "none". Daniel asked for an
+    action, so the turn has to be able to take one.
+    """
+    sent = []
+    drafted = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__draft_gmail_message",
+        lambda arguments: return_value(drafted.append(arguments) or "drafted"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value(sent.append(arguments) or "sent"),
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe",
+        lambda _length: "confirm-123",
+    )
+    asyncio.run(registry.call(
+        "google__draft_gmail_message", {"recipient": "daniel@example.test"},
+    ))
+    assert registry.pending is not None
+
+    events = []
+    client = FakeClient(
+        FakeStream(
+            content=[tool_block(
+                name="google__send_gmail_message",
+                arguments={"recipient": "daniel@example.test"},
+            )],
+            stop_reason="tool_use",
+        ),
+        FakeStream(["Sent."], content=[text_block("Sent.")]),
+    )
+    brain = Brain(
+        client,
+        registry,
+        model="fast",
+        persona="",
+        on_tool=lambda name, result: events.append(name),
+    )
+
+    result = asyncio.run(collect(brain, "Create the draft and send it"))
+
+    # The host's own cancellation clause leads, then the model's answer.
+    assert result == [brain_mod.SUPERSEDE_CANCELLED_CLAUSE, "Sent."]
+    # The pending draft was dropped by the host, never executed...
+    assert drafted == []
+    assert registry.pending is None
+    # ...and the turn ran through the ordinary loop, with tools available.
+    assert client.messages.calls[0]["tool_choice"] == {"type": "auto"}
+    assert sent == [{"recipient": "daniel@example.test"}]
+    assert events == ["cancel_pending", "google__send_gmail_message"]
+
+
+def test_supersede_never_fires_for_a_pending_that_does_the_named_action(monkeypatch):
+    executed = []
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value(executed.append(arguments) or "sent"),
+        policy="confirm",
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe",
+        lambda _length: "confirm-123",
+    )
+    asyncio.run(registry.call(
+        "google__send_gmail_message", {"recipient": "daniel@example.test"},
+    ))
+    client = FakeClient(FakeStream(["Sent."], content=[text_block("Sent.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    assert asyncio.run(collect(brain, "yeah go ahead and send that email")) == ["Sent."]
+    assert executed == [{"recipient": "daniel@example.test"}]
+    assert registry.pending is None
+    # The narration lane, not the tool lane: the host has already acted.
+    assert client.messages.calls[0]["tool_choice"] == {"type": "none"}
+
+
+def test_a_noun_after_a_determiner_is_not_read_as_an_action():
+    send = _pending("send_message", {"body": "hi"})
+
+    assert brain_mod._spoken_action_verbs(["send", "that", "draft"]) == {"send"}
+    assert brain_mod._spoken_action_verbs(["create", "the", "draft"]) == {"create"}
+    assert brain_mod._spoken_action_verbs(["draft", "it"]) == {"draft"}
+    assert brain_mod._confirmation_intent("yes send that draft", send) == "confirm"
+
+
+def test_object_nouns_are_not_offered_to_the_negative_branch():
+    """Deliberate asymmetry.
+
+    "not that one" is a correction, not a cancellation: it stays an ordinary
+    turn so the model can ask which one, and the pending action survives to be
+    answered properly.
+    """
+    pending = _pending("mutate", {"message": "hello"})
+
+    assert brain_mod._confirmation_intent("not that one", pending) is None
+    assert brain_mod._confirmation_intent("no not that", pending) == "cancel"
+
+
+def test_a_barge_in_is_not_answered_with_an_apology(tmp_path):
+    """An empty turn Daniel caused himself must not apologise for itself."""
+    from worker import traces as traces_mod
+
+    recorder = traces_mod.TraceRecorder(tmp_path / "traces.db", enabled=False)
+    turn = recorder.begin_turn(wake_kind="wake")
+    client = FakeClient(FakeStream([], content=[]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    async def scenario():
+        token = traces_mod.activate(recorder, turn)
+        try:
+            traces_mod.mark_speech_interrupted(turn)
+            return await collect(brain, "read me the first one")
+        finally:
+            traces_mod.reset(token)
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_a_genuinely_empty_turn_still_speaks(tmp_path):
+    from worker import traces as traces_mod
+
+    recorder = traces_mod.TraceRecorder(tmp_path / "traces.db", enabled=False)
+    turn = recorder.begin_turn(wake_kind="wake")
+    client = FakeClient(FakeStream([], content=[]))
+    brain = Brain(client, FakeRegistry(), model="fast", persona="")
+
+    async def scenario():
+        token = traces_mod.activate(recorder, turn)
+        try:
+            return await collect(brain, "read me the first one")
+        finally:
+            traces_mod.reset(token)
+
+    # Same turn, same empty stream, no barge-in: the fallback is still spoken.
+    assert asyncio.run(scenario()) == [EMPTY_TURN_REPLY]
+
+
+# --- Unit DD-1 rework: the confirmation matrix, in one place ---------------
+
+_DRAFT = ("google__draft_gmail_message", {"recipient": "x", "subject": "y", "body": "z"})
+_SEND = ("google__send_gmail_message", {"recipient": "x", "subject": "y", "body": "z"})
+_DELETE = ("press_delete", {"chord": "delete"})
+_EVENT = ("google__manage_event", {"action": "delete", "event_id": "abc123"})
+_RUN = ("kb_run_control", {"command": "stop", "run_id": "r1"})
+
+# phrase, pending, expected intent. The three outcomes mean:
+#   confirm    -- the host executes the pending action now
+#   supersede  -- the host drops it and the model proposes the right tool
+#   None       -- an ordinary turn; the pending action survives untouched
+_MATRIX = [
+    # The forensics sentence, against both mail tools.
+    ("Create the draft and send it", _DRAFT, "supersede"),
+    ("Create the draft and send it", _SEND, "supersede"),
+    ("Send it", _DRAFT, "supersede"),
+    ("Send it", _SEND, "confirm"),
+    # A bare action verb IS an answer when the pending action performs it,
+    # and is too thin a signal to destroy one when it does not.
+    ("send", _SEND, "confirm"),
+    ("send", _DRAFT, None),
+    ("create", _DRAFT, "confirm"),
+    ("create", _SEND, None),
+    ("delete", _DELETE, "confirm"),
+    ("delete", _SEND, None),
+    # The verb lives in an ARGUMENT for tools that take it as one.
+    ("yes delete it", _EVENT, "confirm"),
+    ("yes send it", _EVENT, "supersede"),
+    ("yes stop it", _RUN, "confirm"),
+    # Ordinary agreement, ordinary refusal, ordinary turns.
+    ("yes go ahead and create the draft", _DRAFT, "confirm"),
+    ("yeah go ahead and send that email", _SEND, "confirm"),
+    ("yeah go ahead and send that draft", _SEND, "confirm"),
+    ("yes", _DRAFT, "confirm"),
+    ("no", _DRAFT, "cancel"),
+    ("never mind", _DRAFT, "cancel"),
+    ("not that one", _DRAFT, None),
+    ("check the mail then yes", _SEND, None),
+]
+
+
+@pytest.mark.parametrize(
+    "phrase,pending,expected",
+    _MATRIX,
+    ids=[f"{phrase}|{pending[0]}" for phrase, pending, _expected in _MATRIX],
+)
+def test_confirmation_matrix(phrase, pending, expected):
+    name, arguments = pending
+    assert brain_mod._confirmation_intent(phrase, _pending(name, arguments)) == expected
+
+
+def test_free_text_arguments_never_vouch_for_an_action_the_tool_cannot_take():
+    """A draft whose BODY says "send it" is still only a draft.
+
+    Argument values are read because a tool can take its verb as one
+    ("action": "delete"). Prose cannot be allowed to do that job: Daniel's own
+    words, quoted back inside the pending action, would otherwise prove
+    whatever they happen to contain.
+    """
+    draft = _pending(
+        "google__draft_gmail_message",
+        {"recipient": "d@example.test", "subject": "send it", "body": "send it"},
+    )
+
+    assert brain_mod._confirmation_intent("Create the draft and send it", draft) == "supersede"
+    assert "send" not in brain_mod._pending_action_words(draft)
+    # A long enum-ish value is not read either -- only short, tool-shaped ones.
+    long_valued = _pending("run_tool", {"mode": "delete" + "x" * 40})
+    assert "delete" not in brain_mod._pending_action_words(long_valued)
+
+
+def test_supersede_tells_the_model_what_the_host_did_without_touching_the_transcript():
+    """H3(a): the model cannot acknowledge what it was never told."""
+    registry = FakeRegistry(ToolResult("ok", "cancelled"))
+    registry._pending = PendingAction(
+        confirm_id="confirm-1",
+        name="google__draft_gmail_message",
+        arguments={"recipient": "d@example.test"},
+        summary="draft to d@example.test - subject: hello",
+        expires=float("inf"),
+    )
+    client = FakeClient(FakeStream(
+        ["Dropped the draft. Sending now."],
+        content=[text_block("Dropped the draft. Sending now.")],
+    ))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    asyncio.run(collect(brain, "Create the draft and send it"))
+
+    content = client.messages.calls[0]["messages"][-1]["content"]
+    # Daniel's words are their own block, unedited...
+    assert content[0] == {"type": "text", "text": "Create the draft and send it"}
+    # ...and the host note is a second block that names what was dropped.
+    note = content[1]["text"]
+    assert note.startswith("[host: the pending action 'draft to d@example.test - subject: hello'")
+    assert "was cancelled because Daniel asked for a different action" in note
+    assert "propose the right tool now" in note
+    # History keeps the utterance, never the host's note.
+    assert brain._history[0] == {
+        "role": "user", "content": "Create the draft and send it",
+    }
+
+
+def _supersede_registry(monkeypatch):
+    """A live registry holding one pending draft, ready to be superseded."""
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__draft_gmail_message",
+        lambda arguments: return_value("drafted"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value("sent"),
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe", lambda _length: "confirm-123",
+    )
+    asyncio.run(registry.call(
+        "google__draft_gmail_message", {"recipient": "d@example.test"},
+    ))
+    assert registry.pending is not None
+    return registry
+
+
+@pytest.mark.parametrize("said", [
+    # The model volunteers nothing about the dropped draft (live run 2)...
+    "Sending it now.",
+    # ...and the model says its own version of it (live run 1). Neither
+    # changes whether Daniel is told, and neither doubles the host's clause.
+    "Your draft request was cancelled since you'd rather send it outright.",
+])
+def test_the_host_speaks_the_supersede_cancellation_itself(monkeypatch, said):
+    """DD-wave review, MEDIUM-4.
+
+    Superseding destroys a readback Daniel is mid-answering. Two live runs of
+    the same scenario against the real model disclosed it once and skipped it
+    once, which is the whole argument: this wave's posture is that if the host
+    knows it, the host says it -- the same reason the reflex cancel branch in
+    worker/app.py speaks PENDING_CANCELLED_REPLY itself instead of asking for
+    it in the prompt.
+    """
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream([said], content=[text_block(said)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    spoken = asyncio.run(collect(brain, "Create the draft and send it"))
+
+    # Said, first, before anything the model produced.
+    assert spoken[0] == brain_mod.SUPERSEDE_CANCELLED_CLAUSE
+    # And said exactly once: the host clause is not repeated, whatever the
+    # model chose to say after it.
+    assert spoken.count(brain_mod.SUPERSEDE_CANCELLED_CLAUSE) == 1
+    assert "".join(spoken).count(brain_mod.SUPERSEDE_CANCELLED_CLAUSE) == 1
+    # It is Daniel's to hear and the model's to have said, so it is what the
+    # next turn's history says Atlas said.
+    assert brain._history[1]["content"].startswith(
+        brain_mod.SUPERSEDE_CANCELLED_CLAUSE,
+    )
+
+
+def test_a_supersede_whose_model_says_nothing_is_still_an_empty_turn(monkeypatch):
+    """The host clause is a disclosure, not an answer.
+
+    It is deliberately kept out of `spoken` -- which is this generator's
+    record of what the MODEL said -- so a supersede that drops the pending
+    and then produces no reply still speaks EMPTY_TURN_REPLY. Daniel asked
+    for a new action and got none; hearing only "I've cancelled the action I
+    was waiting on" would leave that silence looking deliberate.
+    """
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream([], content=[text_block("")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    spoken = asyncio.run(collect(brain, "Create the draft and send it"))
+
+    assert spoken == [brain_mod.SUPERSEDE_CANCELLED_CLAUSE, EMPTY_TURN_REPLY]
+    # Both are in history, in the order Daniel heard them.
+    assert brain._history[1]["content"] == (
+        brain_mod.SUPERSEDE_CANCELLED_CLAUSE + EMPTY_TURN_REPLY
+    )
+
+
+def test_an_ordinary_turn_never_speaks_the_supersede_clause(monkeypatch):
+    """The other side of it: a plain confirm is not a supersede, and a turn
+    with no pending action at all must not apologise for cancelling one."""
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream(["Sent."], content=[text_block("Sent.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    # A yes to the pending draft: the narration lane, no cancellation.
+    spoken = asyncio.run(collect(brain, "yes go ahead and create the draft"))
+    assert brain_mod.SUPERSEDE_CANCELLED_CLAUSE not in spoken
+
+    client_two = FakeClient(FakeStream(["Sure."], content=[text_block("Sure.")]))
+    brain_two = Brain(client_two, ToolRegistry(), model="fast", persona="")
+    assert brain_mod.SUPERSEDE_CANCELLED_CLAUSE not in asyncio.run(
+        collect(brain_two, "what time is it"),
+    )
+
+
+def test_supersede_note_is_bounded():
+    pending = _pending("mutate", {})
+    oversized = PendingAction(
+        confirm_id="c", name="mutate", arguments={},
+        summary="x" * 4_000, expires=float("inf"),
+    )
+
+    assert len(brain_mod._supersede_note(pending)) < 200
+    quoted = brain_mod._supersede_note(oversized).split("'")[1]
+    assert len(quoted) == brain_mod.SUPERSEDE_NOTE_SUMMARY_LIMIT
+
+
+def test_supersede_records_exactly_one_cancellation_row(tmp_path, monkeypatch):
+    """H3(b) plus the DD-wave review's MEDIUM-1.
+
+    A host decision that destroys a pending action leaves a row -- ONE row,
+    written by ToolRegistry.cancel_pending, naming the tool that was dropped
+    and carrying detail='cancelled'.
+
+    The brain used to add a second row of its own for the same event, and it
+    was wrong three ways at once. `cancel_pending` is host-only, so it is not
+    in the recorder's tool allowlist: the row landed as name='other' (the
+    value a real boundary breach writes) with a NULL detail (the marker that
+    means "a real tool executed", so the health rollup counted a tool that
+    does not exist as a successful call), and it burned the once-per-process
+    boundary warning, leaving the next genuine breach silent.
+    """
+    from worker import traces as traces_mod
+
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__draft_gmail_message",
+        lambda arguments: return_value("drafted"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value("sent"),
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe", lambda _length: "confirm-123",
+    )
+    # Minted OUTSIDE the traced turn, so the only pending row below is the
+    # cancellation this turn causes.
+    asyncio.run(registry.call(
+        "google__draft_gmail_message", {"recipient": "d@example.test"},
+    ))
+    assert registry.pending is not None
+
+    client = FakeClient(FakeStream(["Sending."], content=[text_block("Sending.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+    recorder = traces_mod.TraceRecorder(
+        tmp_path / "traces.db",
+        tool_names=tuple(registry.names()),
+        model_names=("fast",),
+    )
+    turn = recorder.begin_turn(wake_kind="wake")
+
+    async def scenario():
+        token = traces_mod.activate(recorder, turn)
+        try:
+            await collect(brain, "Create the draft and send it")
+        finally:
+            traces_mod.reset(token)
+
+    asyncio.run(scenario())
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        steps = connection.execute(
+            "SELECT kind,name,detail FROM steps WHERE kind='TOOL_CALL' ORDER BY seq"
+        ).fetchall()
+    # Exactly one row for one event, under the dropped tool's own registered
+    # name, and marked as a lifecycle event rather than an execution.
+    assert steps == [
+        ("TOOL_CALL", "google__draft_gmail_message", "cancelled"),
+    ]
+    assert not any(name == "other" for _kind, name, _detail in steps)
+    # And the one-shot boundary warning is still unspent, so the next genuine
+    # breach still logs.
+    assert recorder._warned_boundary is False

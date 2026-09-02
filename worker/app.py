@@ -5,13 +5,14 @@ import asyncio
 from collections import Counter, deque
 import inspect
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
 import sys
 import threading
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 import yaml
 
@@ -40,7 +41,36 @@ WAKE_LINE = "Hey boss. What can I do for you?"
 # Spoken when a reflex reaches no branch that says anything -- "repeat" with
 # nothing to repeat, or an intent this funnel does not route.
 REPEAT_FALLBACK = "I don't have anything to repeat yet. "
+# A reflex "cancel" that drops a pending action says so. Silence there reads as
+# the cancel not landing, and the pending would still be waiting.
+PENDING_CANCELLED_REPLY = "Cancelled. "
 REFLEX_FALLBACK = "I heard that, but I don't have a way to act on it. "
+# What the deterministic open lane says out loud. Every one of these is a
+# sentence about what the HOST just did, said the way Daniel would say it --
+# nothing here reports a model's intention, and nothing here is spoken unless
+# the host tool it describes has already returned.
+REFLEX_OPENING = "Opening {name}. "
+REFLEX_ALREADY_OPEN = "{name} was already open. I brought it to the front. "
+REFLEX_OPEN_FAILED = "I couldn't open {name}. "
+REFLEX_BROUGHT_BACK = "Bringing that back. "
+REFLEX_NOTHING_TO_BRING_BACK = "I haven't opened anything to bring back yet. "
+REFLEX_BRING_BACK_FAILED = "I couldn't bring that back. "
+# Which host tool answers each kind of match, and with what arguments. Every
+# value that reaches a tool is host-resolved (constitution rules 3 and 7): the
+# model supplies nothing here, and the only arguments are words out of the
+# host's own closed alias/root vocabularies.
+#
+# Every entry must ALSO be instant-tier, and that is not asserted here -- it
+# is checked against the live registry in _match_reflex_open, because this
+# table cannot know what a tool was registered as. A confirm-tier tool reached
+# from this lane would run, mint a pending action, and have its readback
+# swallowed: Atlas would say "I couldn't open gmail" while a live single-use
+# pending sat waiting for the next bare "yes" (rules 4 and 5).
+_REFLEX_OPEN_TOOLS = {
+    "alias": lambda name: ("open", {"target": name}),
+    "root": lambda name: ("open_folder", {"root": name}),
+    "last": lambda _name: ("focus_last_opened", {}),
+}
 SLEEP_LINE = "Okay, sleeping. Wake me when you need something."
 _BG_TASKS: set[asyncio.Task] = set()
 RESTART_EXIT_CODE = 21
@@ -82,7 +112,79 @@ _VOICE_DEFAULTS = {
     "min_interruption_words": 2,
     "min_interruption_duration_s": 0.8,
     "aec_warmup_duration_s": 4.0,
+    # See TurnAck and the `voice:` comment in config/atlas.yaml for how 1.8
+    # was chosen from Daniel's own trace database.
+    "ack_delay_s": 1.8,
+    # Neither of these claims anything. See _ack_lines: at the moment an ack
+    # is spoken the host does not yet know what kind of turn this is.
+    "ack_lines": ("One second. ", "Still with you. "),
 }
+_ACK_LINE_LIMIT = 60
+_ACK_LINE_COUNT = 8
+# Marks a transcript line as the instant ack rather than an answer. The only
+# reader is _last_atlas_line ("say that again"); it rides the existing
+# per-line `source` field, which nothing else in the host or the UI reads.
+ACK_LINE_SOURCE = "ack"
+# An ack has to be true in every world the turn could still turn out to be.
+# It is spoken when the FIRST spoken chunk has not arrived within
+# ack_delay_s, and that deadline pops while the model is still in its first
+# round -- measured at 4.4-12.6s on tool turns, so essentially always before
+# any tool call has been made. Nothing has run, nothing has been decided, and
+# a confirm-tier pending does not exist yet, so the host cannot tell a
+# question apart from a mutating action about to ask for permission.
+#
+# "On it." in front of "NOT EXECUTED. Read this back to Daniel and wait for
+# his yes or no" is Atlas saying it is doing the thing it is about to ask
+# permission for. That is the failure this rule exists for, and it is not
+# repairable by checking the pending: at ack time the information does not
+# exist. It is repairable in the WORDS. An ack may say Atlas is present and
+# that time is passing, and NOTHING else.
+#
+# ALLOWLIST, not a blocklist, and the shape is the point. The first version of
+# this check listed the ways an ack could be wrong -- first-person subjects,
+# action stems, a few phrases -- and review broke it seventeen ways with plain
+# English that named no verb from the list ("It's underway.", "In progress.",
+# "Consider it handled.", "Task accepted.", "Sure thing.") plus two languages
+# it had never heard of. There is no finite list of ways to claim an action,
+# so enumerating them is a losing race. There IS a finite list of words that
+# assert only time or presence, because that is the entire permitted meaning,
+# and it is about thirty words long. Every token of a configured ack line must
+# come from it.
+#
+# It also closes the homoglyph seam for free, with no normalization tricks: a
+# Cyrillic "О" in "Оn it." simply is not any of these tokens, and the
+# character gate below rejects it before tokenizing anyway.
+#
+# Still a backstop, not a proof: these words can be assembled into something
+# clumsy, and nothing here judges tone. It guarantees only that an ack cannot
+# assert an action, which is the property truthfulness depends on. A new line
+# is still read by a human, and adding a word here is a code change that gets
+# reviewed -- which is the correct amount of friction for a sentence Atlas
+# says in front of a mutating readback.
+_ACK_WORDS = frozenset({
+    # Time passing. No verb of doing, no object, nothing a task could be.
+    "a", "an", "one", "two", "few", "just", "moment", "moments", "second",
+    "seconds", "sec", "minute", "minutes", "bit", "while", "soon", "shortly",
+    "longer", "more", "another", "hang", "hold", "on", "yet",
+    # Presence. Second person only: "you" cannot be the actor of an Atlas
+    # claim, and there is deliberately no first-person word in this set, so a
+    # line built from it has no subject to hang an action on.
+    "still", "here", "there", "with", "you",
+    # Connective and courtesy.
+    "and", "okay", "ok", "please",
+})
+# The exact characters an ack line may contain. Letters are ASCII only ON
+# PURPOSE: it is what stops a homoglyph ("Оn it." with a Cyrillic О) from
+# reaching the tokenizer at all, and it also rejects zero-width joiners,
+# digits, and anything else invisible in a config diff. Checked against the
+# string that will actually be SPOKEN, not against a normalized copy of it --
+# the previous version validated router.normalize(value) and then spoke
+# value.strip(), which are different strings whenever the line is not pure
+# ASCII, and that gap was the whole bug.
+_ACK_ALLOWED_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ .,'!?-"
+)
+_ACK_WORD_SPLIT = re.compile(r"[^a-z]+")
 # SpeechEchoGuard's tunables (2026-09-01 final gate, F7). These are the knobs
 # that decide whether a genuine barge-in survives, and they were reachable
 # only by editing the class default -- while the three livekit knobs above,
@@ -118,12 +220,92 @@ def _voice_config(cfg: dict) -> dict:
     warmup = raw.get("aec_warmup_duration_s", _VOICE_DEFAULTS["aec_warmup_duration_s"])
     if isinstance(warmup, bool) or not isinstance(warmup, (int, float)) or warmup <= 0:
         raise ValueError("invalid Atlas configuration: voice.aec_warmup_duration_s")
+    ack_delay = raw.get("ack_delay_s", _VOICE_DEFAULTS["ack_delay_s"])
+    if (isinstance(ack_delay, bool) or not isinstance(ack_delay, (int, float))
+            or ack_delay <= 0):
+        raise ValueError("invalid Atlas configuration: voice.ack_delay_s")
     return {
         "min_interruption_words": words,
         "min_interruption_duration_s": float(duration),
         "aec_warmup_duration_s": float(warmup),
+        "ack_delay_s": float(ack_delay),
+        "ack_lines": _ack_lines(raw),
         "echo_guard": _echo_guard_config(raw),
     }
+
+
+def _ack_lines(raw: dict) -> tuple[str, ...]:
+    """Validate `voice.ack_lines` -- what Atlas says while a slow turn runs.
+
+    Bounded in both directions on purpose: these are spoken over the top of
+    Daniel waiting, so a long one costs more silence than it buys, and a
+    hundred variants would just be a hundred ways to be wrong. An empty list
+    is a valid way to turn the ack off, which is why it does not raise.
+
+    Three content rules, all refusals rather than fallbacks, and all three
+    applied to `spoken` -- the exact string this function is about to hand
+    back for TTS. Validating anything else (a normalized copy, say) is the
+    "checks one string, speaks another" bug this had in review: a Cyrillic
+    "О" vanished under router.normalize, so "Оn it." validated as "n it" and
+    then went to the speaker verbatim.
+
+      - Only permitted characters (_ACK_ALLOWED_CHARS). ASCII letters and a
+        little punctuation, which is what makes a homoglyph, a zero-width
+        joiner or a stray digit fail here rather than downstream.
+      - At least two words. SpeechEchoGuard passes single-token transcripts
+        straight through by design, so that a lone "stop" always interrupts.
+        A one-word ack is therefore an ack that CANNOT be filtered when it
+        comes back off the speakers -- an unfiltered transcript arriving in
+        the middle of the reply it was introducing, i.e. Atlas barging in on
+        its own answer. Measured: should_drop("sure") and should_drop("okay")
+        are both False, while "one second" and "still with you" are both
+        caught.
+      - Every word from _ACK_WORDS, the closed vocabulary of time and
+        presence. See the note there for why this is an allowlist: at ack
+        time the host does not yet know whether the turn ends in work or in a
+        confirm-tier readback for work that has NOT happened, so any line
+        asserting action is false on some turns no matter which line is
+        chosen -- and the ways to assert an action are not enumerable, while
+        the ways to assert only time and presence are.
+    """
+    values = raw.get("ack_lines")
+    if values is None:
+        return tuple(_VOICE_DEFAULTS["ack_lines"])
+    if not isinstance(values, list) or len(values) > _ACK_LINE_COUNT:
+        raise ValueError("invalid Atlas configuration: voice.ack_lines")
+    lines = []
+    for value in values:
+        if (not isinstance(value, str) or not value.strip()
+                or len(value) > _ACK_LINE_LIMIT):
+            raise ValueError("invalid Atlas configuration: voice.ack_lines")
+        # The string that will be spoken, and therefore the string that is
+        # checked. Everything below reads only this.
+        spoken = value.strip()
+        stray = sorted(set(spoken) - _ACK_ALLOWED_CHARS)
+        if stray:
+            raise ValueError(
+                "invalid Atlas configuration: voice.ack_lines may only use "
+                "plain ASCII letters and simple punctuation; "
+                f"{[hex(ord(char)) for char in stray]} is not allowed ({value!r})"
+            )
+        tokens = [token for token in _ACK_WORD_SPLIT.split(spoken.casefold()) if token]
+        if len(tokens) < 2:
+            raise ValueError(
+                "invalid Atlas configuration: voice.ack_lines needs at least "
+                "two words per line (a one-word ack cannot be echo-filtered)"
+            )
+        unknown = sorted(set(tokens) - _ACK_WORDS)
+        if unknown:
+            raise ValueError(
+                "invalid Atlas configuration: voice.ack_lines may only say "
+                "that Atlas is present and that time is passing -- an ack is "
+                "spoken before the host knows whether the turn will act at "
+                f"all. {unknown} is not in that vocabulary ({value!r})"
+            )
+        # One trailing space, like every other host line this file speaks, so
+        # the ack and the model's first sentence do not run together.
+        lines.append(f"{spoken} ")
+    return tuple(lines)
 
 
 def _echo_guard_config(raw: dict) -> dict:
@@ -476,6 +658,18 @@ class SpeechEchoGuard:
             return False
         return (now - self._speaking_last_seen_at) <= self._tail_s
 
+    def within_echo_window(self) -> bool:
+        """Was Atlas speaking (or just finished) when this transcript landed?
+
+        The same window `should_drop` filters in, read without a transcript.
+        A one-token utterance is never treated as an echo by design -- livekit
+        needs two words to interrupt, and a lone "stop" must always be able to
+        stop the speaking -- but that also means a self-echoed "stop" reaches
+        the reflex lane. Destroying a pending action is not something a
+        possible echo may do, so the reflex lane asks this first.
+        """
+        return self._within_filter_window(self._clock(), speaking=False)
+
     def should_drop(self, transcript: str, *, speaking: bool) -> bool:
         now = self._clock()
         self.note_speaking(speaking)
@@ -568,6 +762,72 @@ class AtlasAgent(Agent):
             yield event
 
 
+class TurnAck:
+    """Say something short if the model has not started talking yet.
+
+    Daniel's complaint is that acting feels slow, and the measurement behind
+    the threshold is his own trace database: over the single-round turns
+    recorded there (no tool call, so the whole wait is one model round), the
+    round took 1.0-8.1s with a median of 2.9s, and only 8% of them finished
+    inside 1.6s. Turns that DO call a tool are worse -- the first round alone
+    ran 4.4-12.6s before the tool even started. So the silence this fills is
+    the normal case, not an outlier.
+
+    1.8s, and the two bounds that pick it:
+      - Below it sits the fast tail. Atlas speaks its first complete SENTENCE
+        rather than its first token (brain.split_spoken), so audio starts
+        somewhat before the round finishes; a threshold much under 1.5s would
+        start prefixing an ack onto replies that were about to arrive anyway,
+        which turns one answer into two utterances and reads worse than the
+        silence did.
+      - Above it, the silence has already done its damage: this IS the point
+        where Daniel starts wondering whether Atlas heard him, and an ack
+        that lands after he has repeated himself is an ack that arrives into
+        a barge-in.
+    Config-tunable (`voice.ack_delay_s`), because the right value moves with
+    the model and the prefix size.
+
+    Exactly once per turn, structurally: the wait is raced against the FIRST
+    chunk only (see _submit_voice_turn), so there is no second place this can
+    fire from. Variants rotate rather than being drawn at random -- the same
+    two lines in the same order are quieter to live with than a shuffle, and
+    a test can pin what gets said.
+
+    `wait` is a seam, not a knob: it is asyncio.wait_for in production, and a
+    fake in tests, so ack timing is pinned without any test spending real
+    seconds waiting for a real clock.
+
+    What it may SAY is the constraint that matters, and it is a constraint on
+    the config, not on this class: at the moment an ack goes out the host does
+    not know what kind of turn it is in, so a line that claims action is false
+    on every turn that ends in a confirm-tier readback. _ack_lines refuses
+    such a line on load; the full argument is in config/atlas.yaml.
+    """
+
+    def __init__(
+        self,
+        lines: Sequence[str],
+        delay_s: float,
+        *,
+        wait: Callable[..., Awaitable[Any]] = asyncio.wait_for,
+    ) -> None:
+        self._lines = tuple(lines)
+        self.delay_s = float(delay_s)
+        self.wait = wait
+        self._next = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._lines) and self.delay_s > 0
+
+    def line(self) -> str:
+        if not self._lines:
+            return ""
+        line = self._lines[self._next % len(self._lines)]
+        self._next += 1
+        return line
+
+
 class TurnOwnership:
     """Identify the response task that owns brain and TTS work."""
 
@@ -617,6 +877,7 @@ async def _submit_voice_turn(
     engagement: engagement_mod.Engagement,
     context: str | None = None,
     source: str | None = None,
+    ack: TurnAck | None = None,
 ) -> str:
     """Speak one brain turn and return WHAT THE MODEL SAID.
 
@@ -624,6 +885,16 @@ async def _submit_voice_turn(
     produced nothing -- including on the guard above, which speaks nothing at
     all. The host may still have spoken a fallback; callers derive the trace
     outcome from this value precisely because it cannot drift from it.
+
+    An `ack` (see TurnAck) does not change that in either direction. It is
+    yielded into the SAME say() as the model's own text rather than spoken
+    from a second call, which is what makes it land first instead of queueing
+    behind a reply that has not started -- and what puts it through
+    AtlasAgent.tts_node, so SpeechEchoGuard records it like every other thing
+    Atlas says and its own echo cannot come back as a barge-in. It is
+    deliberately kept out of `spoken`: an ack is the host clearing its
+    throat, not an answer, so a turn where the model then says nothing is
+    still recorded as the empty turn it was.
     """
     if not isinstance(text, str) or not text.strip():
         return ""
@@ -632,20 +903,79 @@ async def _submit_voice_turn(
     spoken: list[str] = []
     respond_started: float | None = None
 
+    def _ack_line() -> str:
+        # Quiet while a readback from an EARLIER turn is still standing --
+        # that turn is waiting on one word from Daniel and has no use for
+        # filler. Read what this does not do: a pending minted by THIS turn
+        # cannot be seen from here, because the deadline pops in the middle
+        # of the model's first round, before the tool call that would mint
+        # it. There is no version of this check that covers the ordinary
+        # confirm turn; the information does not exist yet. What makes the
+        # ack safe in front of a readback is that no shipped ack line claims
+        # an action at all -- see _ack_lines and the note in
+        # config/atlas.yaml, which is where that is enforced.
+        registry = getattr(brain, "registry", None)
+        if registry is not None and getattr(registry, "pending", None) is not None:
+            return ""
+        return ack.line()
+
     async def _tee():
         nonlocal respond_started
         response = brain.respond(text, context=context) if context is not None else brain.respond(text)
-        async for chunk in response:
+        if ack is None or not ack.enabled:
+            async for chunk in response:
+                if respond_started is None:
+                    respond_started = time.perf_counter()
+                spoken.append(chunk)
+                yield chunk
+            return
+        # Only the FIRST chunk is raced, which is what makes "at most once
+        # per turn" structural rather than a flag someone has to remember to
+        # clear. shield keeps the model's turn running through the timeout --
+        # wait_for would cancel the very generation being waited on.
+        iterator = response.__aiter__()
+        first = asyncio.ensure_future(iterator.__anext__())
+        try:
+            try:
+                chunk = await ack.wait(asyncio.shield(first), ack.delay_s)
+            except TimeoutError:
+                line = _ack_line()
+                if line:
+                    # Timed from here: this is when Atlas starts making
+                    # sound, so it is when the RESPOND leg starts.
+                    respond_started = time.perf_counter()
+                    # Tagged, so "say that again" cannot replay it: an ack is
+                    # never an answer, and after a barge-in it would otherwise
+                    # be the newest atlas line in the ring.
+                    publisher.add_line("atlas", line, source=ACK_LINE_SOURCE)
+                    yield line
+                chunk = await first
+        except StopAsyncIteration:
+            return
+        finally:
+            if not first.done():
+                first.cancel()
+        while True:
             if respond_started is None:
                 respond_started = time.perf_counter()
             spoken.append(chunk)
             yield chunk
+            try:
+                chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+
+    from worker import traces as traces_mod
 
     responded = False
     try:
         await session.say(_tee(), add_to_chat_ctx=False)
         if spoken:
             responded = True
+        elif traces_mod.speech_was_interrupted():
+            # Daniel talked over this turn. The silence is his, not a fault, so
+            # the host says nothing at all -- an apology here is a false one.
+            logger.info("voice turn produced no speech after a barge-in")
         else:
             # Last funnel before the speaker: whatever went wrong upstream, an
             # addressed turn never ends without Atlas saying something. Spoken
@@ -657,7 +987,6 @@ async def _submit_voice_turn(
             await session.say(brain_mod.EMPTY_TURN_REPLY, add_to_chat_ctx=False)
             publisher.add_line("atlas", brain_mod.EMPTY_TURN_REPLY)
     finally:
-        from worker import traces as traces_mod
         traces_mod.record_current_respond(
             ms=(round((time.perf_counter() - respond_started) * 1000)
                 if respond_started is not None else 0),
@@ -672,7 +1001,17 @@ async def _submit_voice_turn(
 
 
 def _last_atlas_line(publisher: state.StatePublisher) -> str | None:
+    """The last thing Atlas ANSWERED, for "say that again".
+
+    Ack lines are skipped. An ack is filler spoken while the reply is still
+    being generated, so it is never the answer -- and after an ack followed by
+    a barge-in it is the last atlas line in the ring, which made "say that
+    again" replay "One second." instead of the reply Daniel wanted repeated,
+    or instead of the honest REPEAT_FALLBACK when there is nothing to repeat.
+    """
     for line in reversed(publisher.snapshot()["transcript"]):
+        if line.get("source") == ACK_LINE_SOURCE:
+            continue
         if line.get("role") == "atlas" and isinstance(line.get("text"), str):
             return line["text"]
     return None
@@ -681,6 +1020,89 @@ def _last_atlas_line(publisher: state.StatePublisher) -> str | None:
 def _address_window_open(addressing: router.Addressing) -> bool:
     """Probe only the activity window; an empty utterance cannot hit vocabulary."""
     return addressing.is_addressed("")
+
+
+def _match_reflex_open(text: str, registry) -> router.OpenReflex | None:
+    """Can the host answer this utterance itself, right now?
+
+    Four things have to be true, and all four are checked here rather than
+    inside the grammar, because they are about the HOST's state rather than
+    about the words:
+
+      - there is a registry (the text lane's fake brains have none);
+      - it holds no pending action. A confirm-tier readback is waiting for
+        exactly one word from Daniel, and quietly doing something else in
+        the middle of that is not a speed improvement -- that turn goes to
+        the model, which can see the readback in its history;
+      - the tool this match names is actually registered. `open_folder` only
+        exists when file roots resolved, and `focus_last_opened` is not in
+        every stand-in registry;
+      - and that tool is INSTANT-tier. This lane speaks a single sentence
+        about what already happened and never runs a second round, so a
+        confirm-tier tool here would mint a pending action whose readback
+        nobody says: Atlas would report a failure it did not have while a
+        live, single-use pending waited to be consumed by the next bare
+        "yes" about anything (rules 4 and 5). Today all three names are
+        instant and register() refuses duplicates, so this cannot fire --
+        which is the point of checking it at the gate rather than trusting a
+        comment on the table above.
+
+    Every registry access is defensive. This runs on EVERY addressed turn, so
+    a stand-in registry missing one property must degrade to the model lane,
+    not crash the turn -- the same reason `pending` is read with getattr.
+    """
+    if registry is None or getattr(registry, "pending", None) is not None:
+        return None
+    match = router.reflex_open(
+        text,
+        aliases=getattr(registry, "open_aliases", ()) or (),
+        roots=getattr(registry, "root_names", ()) or (),
+    )
+    if match is None:
+        return None
+    name, _arguments = _REFLEX_OPEN_TOOLS[match.kind](match.name)
+    policy = getattr(registry, "policy", None)
+    if not callable(policy) or policy(name) != "instant":
+        return None
+    return match
+
+
+async def _run_reflex_open(match: router.OpenReflex, registry) -> tuple[str, str]:
+    """Run one host-resolved open; return the tool it ran and what to say.
+
+    The NAME comes back with the sentence because the turn is filed into
+    history and into the transcript store by the caller, and the store's
+    contract is the names of the tools the turn touched (worker/transcript
+    module docstring). A reflex turn really did run one -- reporting an empty
+    tools column for it would make an open indistinguishable from small talk
+    (DD-wave review, LOW-5).
+    """
+    # A reflex turn is still a turn. brain.respond is what normally resets the
+    # per-turn handle table, and skipping the brain must not quietly extend a
+    # previous turn's handles across this one -- "handles live for exactly one
+    # turn" is what makes a stale id fail closed instead of resolving to
+    # something the model was never shown. Nothing below mints or spends one;
+    # this is only about not leaving the last turn's table standing.
+    registry.begin_turn()
+    name, arguments = _REFLEX_OPEN_TOOLS[match.kind](match.name)
+    result = await registry.call(name, arguments)
+    if match.kind == "last":
+        if result.status == "ok":
+            return name, REFLEX_BROUGHT_BACK
+        if result.content == tools_mod.NOTHING_RECENTLY_OPENED:
+            return name, REFLEX_NOTHING_TO_BRING_BACK
+        return name, REFLEX_BRING_BACK_FAILED
+    if result.status != "ok":
+        # The host refused or failed, so nothing is on screen and saying
+        # "Opening X" would be a lie. The turn does NOT fall through to the
+        # model afterwards: a second attempt at an action that just failed is
+        # a worse answer than an honest short one, and the trace already
+        # carries the failed TOOL_CALL row for anyone asking why.
+        logger.info("reflex open did not succeed (kind=%s)", match.kind)
+        return name, REFLEX_OPEN_FAILED.format(name=match.name)
+    if result.content == tools_mod.FOCUSED_EXISTING_WINDOW:
+        return name, REFLEX_ALREADY_OPEN.format(name=match.name)
+    return name, REFLEX_OPENING.format(name=match.name)
 
 
 async def _handle_reflex(
@@ -692,10 +1114,40 @@ async def _handle_reflex(
     dismiss,
     cancel_turn=None,
     on_spoken=None,
+    registry=None,
+    speaking_probe=None,
     source: str | None = None,
+    open_match: router.OpenReflex | None = None,
+    remember=None,
 ) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
+    if open_match is not None:
+        # The deterministic open lane. It joins this funnel rather than
+        # sitting beside it so that everything the funnel guarantees still
+        # holds: the utterance is published as a user line, exactly one
+        # sentence is spoken, that sentence is mirrored into the transcript,
+        # and the caller's on_spoken hook decides what the clocks do.
+        #
+        # Interrupt first, for the same reason the cancel branch below does:
+        # this lane speaks immediately, and an outgoing model reply is only
+        # stopped by task cancellation, which does not silence audio already
+        # handed to TTS. Without it the open confirmation lands on top of the
+        # previous answer.
+        session.interrupt()
+        publisher.add_line("user", text, source=source)
+        tool_name, line = await _run_reflex_open(open_match, registry)
+        await session.say(line, add_to_chat_ctx=False)
+        publisher.add_line("atlas", line)
+        # The model never saw this turn (see Brain.remember_host_exchange):
+        # without the exchange in its history, the next "close that" resolves
+        # to the turn BEFORE this one. The tool name travels with it so the
+        # filed turn says which tool it ran, the same as every model turn.
+        if remember is not None:
+            remember(text, line, (tool_name,))
+        if on_spoken is not None:
+            on_spoken()
+        return True
     lane, intent = router.route(text, intents)
     if lane != "reflex":
         return False
@@ -704,9 +1156,30 @@ async def _handle_reflex(
     if intent == "dismiss":
         dismiss()
     elif intent == "cancel":
+        # Stopping the speech is unconditional: whoever said it, and whether or
+        # not it was Atlas's own voice coming back, "stop" stops the talking.
         session.interrupt()
         if cancel_turn is not None:
             cancel_turn()
+        # Dropping the PENDING action is not unconditional. A one-token
+        # "cancel" or "stop" is never filtered as an echo (the guard passes
+        # 1-token transcripts by design), so a word Atlas itself just said
+        # could otherwise destroy a single-use mutating action nobody
+        # cancelled. Mid-speech it only stops the readback; the pending
+        # survives for an explicit follow-up in the quiet after it.
+        echoing = bool(speaking_probe()) if callable(speaking_probe) else False
+        if echoing:
+            logger.info("reflex cancel arrived mid-speech; pending action kept")
+        # The reflex lane never reaches the brain, so "cancel" used to stop the
+        # speech and the in-flight turn while leaving the pending action alive:
+        # Daniel cancelled, heard nothing, and the next plain "yes" -- about
+        # anything -- still had a mutating action waiting to consume it.
+        if not echoing and getattr(registry, "pending", None) is not None:
+            registry.cancel_pending()
+            await session.say(PENDING_CANCELLED_REPLY, add_to_chat_ctx=False)
+            publisher.add_line("atlas", PENDING_CANCELLED_REPLY)
+            if on_spoken is not None:
+                on_spoken()
     elif intent == "repeat" and repeated:
         await session.say(repeated, add_to_chat_ctx=False)
         if on_spoken is not None:
@@ -740,6 +1213,8 @@ async def _handle_audio_turn_inner(
     sleep,
     turn_ownership: TurnOwnership | None = None,
     source: str = "speech",
+    speaking_probe=None,
+    ack: TurnAck | None = None,
     _trace=None,
     _trace_meta: dict | None = None,
 ) -> str:
@@ -795,6 +1270,16 @@ async def _handle_audio_turn_inner(
         )
         if cancel_allowed:
             _mark(addressed=False, wake_kind="reflex", outcome="cancelled")
+
+            def _cancel_spoken() -> None:
+                # "Cancelled." is a real reply, so the follow-up ("do the other
+                # one instead") must not need the wake word again -- the same
+                # rule the repeat lane and the empty-turn fallback follow.
+                if engagement.state != engagement_mod.ENGAGED:
+                    return
+                engagement.interacted()
+                addressing.mark_activity()
+
             await _handle_reflex(
                 text,
                 intents=intents,
@@ -802,6 +1287,9 @@ async def _handle_audio_turn_inner(
                 publisher=publisher,
                 dismiss=_dismiss,
                 cancel_turn=ownership.cancel,
+                on_spoken=_cancel_spoken,
+                registry=getattr(brain, "registry", None),
+                speaking_probe=speaking_probe,
                 source=line_source,
             )
             return ""
@@ -853,6 +1341,48 @@ async def _handle_audio_turn_inner(
             source=line_source,
         ))
         return ""
+    # Deterministic opens, checked HERE and not earlier: an "open downloads"
+    # has no address vocabulary in it, so it has to clear exactly the same
+    # engagement and addressing gates a model turn clears. Everything above
+    # this line is unchanged; the only turns that behave differently are the
+    # ones that would have reached the model and asked it to call the very
+    # same instant, host-resolved tool.
+    #
+    # Trace shape, deliberately: a reflex turn writes ROUTE and TOOL_CALL and
+    # no RESPOND step, so its speech never enters the health rollup's RESPOND
+    # timings. That is right and it is the rule the dismiss, cancel and repeat
+    # lanes already follow -- RESPOND measures how long Daniel waited for a
+    # model answer, and a lane whose whole claim is that no model round
+    # happened would drag that number toward zero and hide the regression the
+    # metric exists to catch. The TOOL_CALL row carries the host cost, which
+    # is the only cost there was.
+    open_match = _match_reflex_open(text, getattr(brain, "registry", None))
+    if open_match is not None:
+        def _opened() -> None:
+            _mark(
+                addressed=True,
+                wake_kind="reply" if reply_window else "wake",
+                outcome="responded",
+            )
+            if engagement.state != engagement_mod.ENGAGED:
+                return
+            engagement.interacted()
+            addressing.mark_activity()
+
+        await ownership.run(lambda: _handle_reflex(
+            text,
+            intents=intents,
+            session=session,
+            publisher=publisher,
+            dismiss=_dismiss,
+            cancel_turn=ownership.cancel,
+            on_spoken=_opened,
+            registry=brain.registry,
+            source=line_source,
+            open_match=open_match,
+            remember=getattr(brain, "remember_host_exchange", None),
+        ))
+        return ""
     async def _respond() -> str:
         context = publisher.ambient_context(text)
         response = await _submit_voice_turn(
@@ -863,15 +1393,26 @@ async def _handle_audio_turn_inner(
             engagement=engagement,
             context=context,
             source=line_source,
+            ack=ack,
         )
-        # Derived from the answer itself, not signalled out of the funnel: an
-        # empty response IS the empty outcome, so the two cannot drift apart,
-        # and every path that returns "" -- including the funnel's own input
-        # guard -- is recorded honestly without knowing it is being watched.
+        # Derived from the answer itself, not signalled out of the funnel: a
+        # silent turn IS the silent outcome, so the two cannot drift apart, and
+        # every path that returns "" -- including the funnel's own input guard
+        # -- is recorded honestly without knowing it is being watched. Which
+        # KIND of silence comes from the same turn flag the funnel reads.
+        from worker import traces as traces_mod
+        if response:
+            outcome = "responded"
+        elif traces_mod.speech_was_interrupted():
+            # A barge-in, not a failed turn. Recorded apart from "empty" so the
+            # trace agrees with the funnel above, which stays silent for it.
+            outcome = "interrupted"
+        else:
+            outcome = "empty"
         _mark(
             addressed=True,
             wake_kind="reply" if reply_window else "wake",
-            outcome="responded" if response else "empty",
+            outcome=outcome,
         )
         # The window used to be refreshed only `if response`, so a silent turn
         # closed the addressing window and the next follow-up needed the wake
@@ -897,6 +1438,8 @@ async def _handle_audio_turn(
     sleep,
     turn_ownership: TurnOwnership | None = None,
     source: str = "speech",
+    speaking_probe=None,
+    ack: TurnAck | None = None,
     trace_recorder=None,
 ) -> str:
     if trace_recorder is None or not isinstance(text, str) or not text.strip():
@@ -911,6 +1454,8 @@ async def _handle_audio_turn(
             sleep=sleep,
             turn_ownership=turn_ownership,
             source=source,
+            speaking_probe=speaking_probe,
+            ack=ack,
         )
 
     from worker import traces as traces_mod
@@ -930,6 +1475,8 @@ async def _handle_audio_turn(
             sleep=sleep,
             turn_ownership=turn_ownership,
             source=source,
+            speaking_probe=speaking_probe,
+            ack=ack,
             _trace=(trace_recorder, turn),
             _trace_meta=metadata,
         )
@@ -968,6 +1515,7 @@ async def _handle_typed_turn(
     engage,
     sleep,
     turn_ownership: TurnOwnership | None = None,
+    ack: TurnAck | None = None,
     trace_recorder=None,
 ) -> str:
     """Route deliberate UI text through the same guarded turn path as speech."""
@@ -986,6 +1534,7 @@ async def _handle_typed_turn(
         sleep=sleep,
         turn_ownership=turn_ownership,
         source="typed",
+        ack=ack,
         trace_recorder=trace_recorder,
     )
 
@@ -1173,6 +1722,10 @@ async def entrypoint(ctx: JobContext) -> None:
     publisher = state.StatePublisher(voice=cfg.get("active_voice"), user_name=user_name)
     services.registry.set_execution_observer(publisher.set_tool)
     intents = _load_intents()
+    # One TurnAck for the worker, not one per turn: rotating the variants is
+    # the point (see TurnAck), and a fresh object every turn would say the
+    # same word every time.
+    turn_ack = TurnAck(voice_cfg["ack_lines"], voice_cfg["ack_delay_s"])
     loop = asyncio.get_running_loop()
     session: Any | None = None
     session_started = False
@@ -1217,6 +1770,7 @@ async def entrypoint(ctx: JobContext) -> None:
             engage=_engage,
             sleep=_sleep,
             turn_ownership=turn_ownership,
+            ack=turn_ack,
             trace_recorder=_traces(),
         )
 
@@ -1265,12 +1819,30 @@ async def entrypoint(ctx: JobContext) -> None:
             if server is not None:
                 await _flush_store_and_stop_state_server(services.store, server)
         finally:
-            if trace_recorder is not None:
-                try:
-                    await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
-                except TimeoutError:
-                    logger.warning("turn tracing close exceeded shutdown deadline")
-            shutdown_done.set()
+            # Closing the persistent sinks must never be able to leave
+            # shutdown_done unset. Anything waiting on it -- a second
+            # _request_shutdown, the entrypoint's own exit path -- waits
+            # forever if this block raises, so an app that cannot close a
+            # database would hang instead of quitting. The narrow
+            # TimeoutError catch below used to be the only guard, which meant
+            # any OTHER failure here had exactly that effect.
+            try:
+                if trace_recorder is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
+                    except TimeoutError:
+                        logger.warning("turn tracing close exceeded shutdown deadline")
+                transcript_store = getattr(services, "transcript", None)
+                if transcript_store is not None:
+                    # No deadline and no thread: every exchange was committed
+                    # synchronously as it happened, so this closes a
+                    # connection rather than flushing a backlog. Nothing is
+                    # lost if the process dies before it.
+                    transcript_store.close()
+            except Exception as exc:
+                logger.warning("shutdown close failed (type=%s)", type(exc).__name__)
+            finally:
+                shutdown_done.set()
 
     desktop_status = desktopapps.StatusSnapshot()
 
@@ -1559,6 +2131,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 addressing=addressing,
                 sleep=_sleep,
                 turn_ownership=turn_ownership,
+                speaking_probe=agent.echo_guard.within_echo_window,
+                ack=turn_ack,
                 trace_recorder=_traces(),
             )
 
@@ -1616,10 +2190,100 @@ def _console_input_args(
     return ["--input-device", str(index)]
 
 
+WORKER_LOG_MAX_BYTES = 256 * 1024
+WORKER_LOG_BACKUPS = 2
+WORKER_LOG_MESSAGE_LIMIT = 200
+# A token that looks like a path, a URL, or an address. Kept deliberately
+# blunt: "1/3" (a retry count) survives, "C:\Users\...", "~/.claude/projects",
+# "https://host/x" and "someone@example.test" do not.
+_UNSAFE_LOG_TOKEN = re.compile(r"[\\~@]|[A-Za-z]:[\\/]|/[A-Za-z]")
+# Secret shapes are sanitize.secret_shaped -- ONE definition, shared with the
+# conversation store (worker/transcript.py), because two persistent sinks
+# checking two copies of the same pattern is one copy too many. The comment
+# explaining what it covers and why lives with the pattern.
+
+
+class _HostShapedFormatter(logging.Formatter):
+    """Write the host's own sentence and stop where it stops being one.
+
+    A file handler on the whole atlas.* tree persists every WARNING any module
+    raises, including ones this unit does not own and ones not written yet.
+    Most are already host-shaped -- fixed text plus a count, a category, an
+    exception type -- but not all: a traceback carries absolute source paths
+    and the original OSError text, and the file-root warnings interpolate
+    configured paths. Rule 10 is a property of the FILE, so it is enforced
+    here, where every record must pass, instead of trusting 60-odd call sites
+    to stay disciplined.
+
+    This enforces the SHAPE of what is written; it is not a promise that any
+    particular caller is well behaved. Tracebacks never reach the file (the
+    console lane still gets them -- the record is read, never mutated), and
+    every line is capped. Redaction runs to the END of the message rather than
+    over the one offending token: paths with spaces are the norm on Windows,
+    so "root C:\\Users\\d\\Tax Returns 2025 is unavailable" would otherwise
+    keep the half that actually says something about Daniel. The host's fixed
+    prefix survives because it is written before the interpolation.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = " ".join(str(record.getMessage()).split())
+        kept = []
+        for token in message.split(" "):
+            if _UNSAFE_LOG_TOKEN.search(token) or sanitize.secret_shaped(token):
+                kept.append("<redacted>")
+                break
+            kept.append(token)
+        redacted = " ".join(kept)[:WORKER_LOG_MESSAGE_LIMIT]
+        return f"{self.formatTime(record)} {record.levelname} {record.name} {redacted}"
+
+
+def _configure_worker_logging(local_app_data=None):
+    """Persist worker WARNING+ lines to one bounded rotating file.
+
+    These lines existed only in the console the desktop drains, so the ones
+    worth reading after the fact -- a claim the guard refused, a turn that said
+    nothing, a dropped trace record -- were gone by the time anyone asked what
+    happened. What makes keeping them safe is not the call sites' good manners
+    but _HostShapedFormatter above, which every record goes through (rule 10).
+    The file is opened on the first record (delay=True), so a worker that never
+    warns leaves nothing behind.
+    """
+    root = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
+    if not root:
+        return None
+    try:
+        path = Path(root) / "Atlas" / "logs" / "worker.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=WORKER_LOG_MAX_BYTES,
+            backupCount=WORKER_LOG_BACKUPS,
+            encoding="utf-8",
+            delay=True,
+        )
+    except Exception:
+        return None
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(_HostShapedFormatter())
+    handler._atlas_worker_file_handler = True
+    atlas_logger = logging.getLogger("atlas")
+    for existing in list(atlas_logger.handlers):
+        if getattr(existing, "_atlas_worker_file_handler", False):
+            atlas_logger.removeHandler(existing)
+            existing.close()
+    atlas_logger.addHandler(handler)
+    # Only ever lowers the floor to WARNING, never raises it: the console lane
+    # keeps whatever level the worker runtime configured for INFO and below.
+    if atlas_logger.getEffectiveLevel() > logging.WARNING:
+        atlas_logger.setLevel(logging.WARNING)
+    return handler
+
+
 def main() -> int:
     global _worker_exit_code
     _worker_exit_code = 0
     jobobject.assign_current_process()
+    _configure_worker_logging()
     try:
         cfg = _cfg()
         sys.argv.extend(_console_output_args(sys.argv, cfg))

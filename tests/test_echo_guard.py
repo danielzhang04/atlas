@@ -557,3 +557,118 @@ def test_stt_node_notes_speaking_state_even_on_non_transcript_events(monkeypatch
 
     assert result == [events[0]]
     assert agent.echo_guard.dropped_count == 1
+
+
+def test_within_echo_window_reports_the_same_window_should_drop_filters_in():
+    """The reflex lane's gate on destroying a pending action (unit DD-1).
+
+    A one-token "stop" is never dropped as an echo, so the only way to tell a
+    self-echo from a real one is WHEN it arrived: inside the speaking window
+    (or its short tail) it may be Atlas's own voice; after that it cannot be.
+    """
+    guard, clock = _guard(tail_s=1.0)
+
+    # Nothing has been said yet: an utterance now is certainly Daniel's.
+    assert guard.within_echo_window() is False
+
+    guard.record_spoken("the draft is ready, yes or no?")
+    guard.note_speaking(True)
+    assert guard.within_echo_window() is True
+
+    # Speech stops; the tail is still suspect...
+    guard.note_speaking(False)
+    clock.advance(0.5)
+    assert guard.within_echo_window() is True
+
+    # ...and past the tail it is the quiet period again.
+    clock.advance(1.0)
+    assert guard.within_echo_window() is False
+
+
+# --- DD-3: the instant ack is Atlas speech, and the guard has to know it ----
+
+
+def test_the_instant_ack_reaches_the_echo_guard_like_every_other_atlas_line(monkeypatch):
+    """The ack is yielded into the SAME say() as the reply (see
+    _submit_voice_turn), so it goes through tts_node and lands in the guard's
+    buffer. If it did not, Atlas's own "One second." coming back off the
+    laptop speakers would be an unfiltered transcript arriving mid-reply --
+    i.e. the ack would cut short the very answer it was introducing.
+    """
+    agent = _SttWiringAgent(agent_state="speaking")
+
+    async def _fake_default_tts(_agent, text, _model_settings):
+        async for chunk in text:
+            yield chunk
+
+    monkeypatch.setattr(app.Agent.default, "tts_node", _fake_default_tts)
+
+    async def _text():
+        # Exactly what a slow turn speaks: the ack, then the model's reply.
+        yield "One second. "
+        yield "You have sixty five conversations."
+
+    async def _drain():
+        return [chunk async for chunk in agent.tts_node(_text(), None)]
+
+    spoken = asyncio.run(_drain())
+
+    assert spoken[0].strip() == "One second."
+    # Both configured ack variants are short enough to fall under the 2-4
+    # token contiguous rule, which is precisely the rule that needs the
+    # buffer to contain them.
+    assert agent.echo_guard.should_drop("one second", speaking=True)
+    assert agent.echo_guard.should_drop("you have sixty five conversations", speaking=True)
+
+
+def test_every_shipped_ack_line_is_one_the_guard_can_actually_filter(monkeypatch):
+    """MEDIUM-5, measured against the guard rather than asserted about it.
+
+    SpeechEchoGuard passes single-token transcripts straight through by
+    design, so a lone "stop" always interrupts. A one-word ack is therefore an
+    ack that comes back off the speakers UNFILTERED, mid-reply -- Atlas
+    barging in on the answer its own ack introduced. Both the module default
+    and the shipped config/atlas.yaml go through this, because the validator
+    is only as good as the lines it is actually pointed at.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    from worker.app import _VOICE_DEFAULTS
+
+    root = Path(__file__).resolve().parents[1]
+    shipped = yaml.safe_load(
+        (root / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )["voice"]["ack_lines"]
+    lines = [*_VOICE_DEFAULTS["ack_lines"], *shipped]
+    assert len(lines) >= 4
+
+    async def _fake_default_tts(_agent, text, _model_settings):
+        async for chunk in text:
+            yield chunk
+
+    monkeypatch.setattr(app.Agent.default, "tts_node", _fake_default_tts)
+
+    for line in lines:
+        assert len(line.split()) >= 2
+        agent = _SttWiringAgent(agent_state="speaking")
+
+        async def _text(value=line):
+            yield value
+
+        async def _drain(source=_text):
+            return [chunk async for chunk in agent.tts_node(source(), None)]
+
+        asyncio.run(_drain())
+        assert agent.echo_guard.should_drop(line.strip(" .!").casefold(), speaking=True)
+
+
+def test_a_one_word_ack_is_exactly_what_the_guard_cannot_filter():
+    """The counter-example the rule above exists for: these are the shapes a
+    one-word ack would take, and the guard lets every one of them through even
+    with the ack sitting in its buffer."""
+    for word in ("sure", "okay", "yep"):
+        guard = app.SpeechEchoGuard()
+        guard.record_spoken(f"{word}. ")
+        assert guard.should_drop(word, speaking=True) is False

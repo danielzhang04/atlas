@@ -7,6 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from queue import Queue
+import re
 import subprocess
 import sys
 from threading import Event, Thread
@@ -454,8 +455,8 @@ def test_configure_native_window_sets_style_before_refreshing_frame(desktop_log)
     desktop._configure_native_window(
         SimpleNamespace(native=native),
         user32=user32,
-        hook_factory=lambda form, functions: calls.append(
-            ("hook", form, functions)) or hook,
+        hook_factory=lambda form, functions, hover: calls.append(
+            ("hook", form, functions, hover)) or hook,
         set_last_error=lambda value: error.__setitem__(0, value),
         get_last_error=lambda: error[0],
     )
@@ -464,7 +465,7 @@ def test_configure_native_window_sets_style_before_refreshing_frame(desktop_log)
     assert calls[:3] == [
         ("get", 456, desktop.GWL_STYLE),
         ("set", 456, desktop.GWL_STYLE, expected_style),
-        ("hook", native, user32),
+        ("hook", native, user32, None),
     ]
     assert calls[3][0:7] == ("position", 456, None, 0, 0, 0, 0)
     assert calls[3][7] & desktop.SWP_FRAMECHANGED
@@ -623,6 +624,173 @@ def test_client_rect_clamps_only_maximized_windows(proposed, maximized, expected
     assert desktop._client_rect(proposed, (0, 0, 1920, 1040), maximized) == expected
 
 
+UI = Path(desktop.__file__).resolve().parents[1] / "ui"
+STYLES_CSS = (UI / "styles.css").read_text(encoding="utf-8")
+INDEX_HTML = (UI / "index.html").read_text(encoding="utf-8")
+APP_JS = (UI / "app.js").read_text(encoding="utf-8")
+
+
+def css_block(selector: str) -> str:
+    match = re.search(rf"(?m)^{re.escape(selector)}\s*\{{([^}}]*)\}}", STYLES_CSS)
+    assert match is not None, f"ui/styles.css has no `{selector}` rule"
+    return match.group(1)
+
+
+def css_value(selector: str, name: str) -> str:
+    match = re.search(rf"(?m)^\s*{re.escape(name)}\s*:\s*([^;]+);", css_block(selector))
+    assert match is not None, f"ui/styles.css `{selector}` has no `{name}`"
+    return match.group(1).strip()
+
+
+CSS_ROOT_FONT_PX = 16.0  # no rule sets a root font-size, so rem stays the browser default
+
+
+def css_px(selector: str, name: str) -> float:
+    """Resolve a length declaration to CSS pixels, whatever unit the stylesheet writes it in."""
+    value = css_value(selector, name)
+    if value.endswith("px"):
+        return float(value[:-2])
+    if value.endswith("rem"):
+        return float(value[:-3]) * CSS_ROOT_FONT_PX
+    raise AssertionError(f"ui/styles.css `{selector}` `{name}` is not a length: {value}")
+
+
+def test_titlebar_constants_are_pinned_to_the_stylesheet():
+    """The WM_NCHITTEST geometry is hardcoded, so the stylesheet may never drift away from it."""
+    # Compared as resolved lengths, not as strings, so a redesign that restates a value in another
+    # unit still has to agree with the host arithmetic instead of silently misaligning the regions.
+    assert css_px(":root", "--header") == desktop.TITLEBAR_HEIGHT_CSS_PX
+    assert css_px(".window-control", "width") == desktop.TITLEBAR_BUTTON_WIDTH_CSS_PX
+    assert css_px(".brand", "max-width") == desktop.TITLEBAR_BRAND_WIDTH_CSS_PX
+    assert css_px(".topbar nav", "max-width") == desktop.TITLEBAR_NAV_WIDTH_CSS_PX
+    # The padded left edge is the only fractional one; the host rounds it up to a whole pixel.
+    padding = css_px(".topbar", "padding-left")
+    assert padding <= desktop.TITLEBAR_PADDING_LEFT_CSS_PX < padding + 1
+    assert not re.search(r"(?m)^(:root|html)[^{]*\{[^}]*font-size", STYLES_CSS)  # rem stays 16px
+    # Nothing sits right of the window controls, so they tile the window's right edge exactly.
+    assert "padding-right" not in css_block(".topbar")
+    assert "padding" not in css_block(".topbar-actions")
+    assert css_value(".topbar-actions", "justify-self") == "end"
+    assert "gap" not in css_block(".window-controls")
+    assert "margin" not in css_block(".window-control")
+    assert "<button" not in INDEX_HTML.split('id="window-close"')[1].split("</header>")[0]
+
+
+def test_titlebar_button_order_matches_the_markup_and_the_hover_channel():
+    markup_order = re.findall(r'id="window-(minimize|maximize|close)"', INDEX_HTML)
+    assert markup_order == ["minimize", "maximize", "close"]
+    codes = [desktop.NC_HOVER_NAMES[code] for code in desktop.TITLEBAR_BUTTON_CODES]
+    assert codes == list(reversed(markup_order))  # the host walks them right to left
+    assert "is-nc-hover" in STYLES_CSS and "is-nc-hover" in APP_JS
+    assert "__atlasNcHover" in APP_JS
+    # Degraded mode: `.window-controls.no-native` hides the buttons the host hit-tests, which would
+    # leave it claiming invisible rectangles. It is applied only when window.pywebview is absent,
+    # and the host installs the hook only from inside pywebview, so the two cannot coexist.
+    assert "display: none" in css_block(".window-controls.no-native")
+    hides = re.search(r'if \((.*?)\) refs\.windowControls\.classList\.add\("no-native"\)', APP_JS)
+    assert hides is not None and hides.group(1) == "nativeWindowApi() === null"
+
+
+@pytest.mark.parametrize(
+    ("dpi", "expected"),
+    [(96, (40, 44, 173, 280)), (120, (50, 55, 216, 350)), (144, (60, 66, 260, 420)),
+     (192, (80, 88, 346, 560))],
+    ids=["100%", "125%", "150%", "200%"],
+)
+def test_scaled_px_converts_css_lengths_at_every_common_scale(dpi, expected):
+    lengths = (desktop.TITLEBAR_HEIGHT_CSS_PX, desktop.TITLEBAR_BUTTON_WIDTH_CSS_PX,
+               desktop.TITLEBAR_PADDING_LEFT_CSS_PX + desktop.TITLEBAR_BRAND_WIDTH_CSS_PX,
+               desktop.TITLEBAR_NAV_WIDTH_CSS_PX)
+    assert tuple(desktop._scaled_px(length, dpi) for length in lengths) == expected
+
+
+def test_titlebar_button_spans_tile_the_right_edge_without_gaps_or_overlap():
+    spans = desktop._titlebar_button_spans(1100, 96)
+
+    assert spans == [(desktop.HTCLOSE, 1056, 1100), (desktop.HTMAXBUTTON, 1012, 1056),
+                     (desktop.HTMINBUTTON, 968, 1012)]
+    assert desktop._titlebar_button_spans(2200, 192) == [
+        (desktop.HTCLOSE, 2112, 2200), (desktop.HTMAXBUTTON, 2024, 2112),
+        (desktop.HTMINBUTTON, 1936, 2024)]
+
+
+# A 1100x760 window at 100% scale: the strip is y 200..239, the brand zone ends at x 272, the
+# centred nav covers x 517..796, and the controls tile x 1068..1199.
+@pytest.mark.parametrize(
+    ("point", "expected"),
+    [
+        ((273, 200), desktop.HTCAPTION),
+        ((272, 200), None),
+        ((100, 220), None),
+        ((516, 239), desktop.HTCAPTION),
+        ((517, 220), None),
+        ((796, 220), None),
+        ((797, 220), desktop.HTCAPTION),
+        ((1067, 220), desktop.HTCAPTION),
+        ((1068, 220), desktop.HTMINBUTTON),
+        ((1111, 239), desktop.HTMINBUTTON),
+        ((1112, 200), desktop.HTMAXBUTTON),
+        ((1155, 220), desktop.HTMAXBUTTON),
+        ((1156, 220), desktop.HTCLOSE),
+        ((1199, 239), desktop.HTCLOSE),
+        ((400, 240), None),
+        ((1199, 240), None),
+        ((400, 199), None),
+        ((99, 220), None),
+        ((1200, 220), None),
+        ((400, 959), None),
+    ],
+)
+def test_titlebar_hit_test_splits_the_strip_between_caption_page_and_buttons(point, expected):
+    assert desktop._titlebar_hit_test(*point, (100, 200, 1200, 960), 96) == expected
+
+
+@pytest.mark.parametrize(
+    ("dpi", "bounds", "cases"),
+    [
+        (120, (100, 200, 1200, 960),
+         [((316, 249), desktop.HTCAPTION), ((315, 220), None), ((483, 220), desktop.HTCAPTION),
+          ((484, 220), None), ((832, 220), None), ((833, 220), desktop.HTCAPTION),
+          ((1034, 220), desktop.HTCAPTION), ((1035, 220), desktop.HTMINBUTTON),
+          ((1090, 220), desktop.HTMAXBUTTON), ((1145, 220), desktop.HTCLOSE),
+          ((1199, 249), desktop.HTCLOSE), ((400, 250), None)]),
+        (192, (100, 200, 2300, 1160),
+         [((446, 279), desktop.HTCAPTION), ((445, 220), None), ((933, 220), desktop.HTCAPTION),
+          ((934, 220), None), ((1492, 220), None), ((1493, 220), desktop.HTCAPTION),
+          ((2035, 220), desktop.HTCAPTION), ((2036, 220), desktop.HTMINBUTTON),
+          ((2124, 220), desktop.HTMAXBUTTON), ((2212, 220), desktop.HTCLOSE),
+          ((2299, 279), desktop.HTCLOSE), ((400, 280), None)]),
+    ],
+    ids=["125%", "200%"],
+)
+def test_titlebar_hit_test_scales_every_region_with_the_window_dpi(dpi, bounds, cases):
+    """The same window, in physical pixels, at 125% and 200% display scaling."""
+    assert [desktop._titlebar_hit_test(*point, bounds, dpi) for point, _ in cases] == [
+        expected for _, expected in cases]
+
+
+def test_titlebar_hit_test_keeps_a_caption_band_on_both_sides_at_the_minimum_window_size():
+    """800x600 CSS pixels is the window's min_size; drag bands must survive it at every scale."""
+    for dpi in (96, 120, 144, 192):
+        width, height = desktop._scaled_px(800, dpi), desktop._scaled_px(600, dpi)
+        strip = [desktop._titlebar_hit_test(x, 0, (0, 0, width, height), dpi) for x in range(width)]
+        nav_start = strip.index(None, strip.index(desktop.HTCAPTION))
+        left = strip[:nav_start].count(desktop.HTCAPTION)
+        right = strip[nav_start:].count(desktop.HTCAPTION)
+        assert min(left, right) >= desktop._scaled_px(60, dpi), (dpi, left, right)
+        assert strip.count(desktop.HTMINBUTTON) == desktop._scaled_px(44, dpi), dpi
+
+
+def test_window_dpi_falls_back_to_ninety_six_without_a_usable_call():
+    def refuse(_hwnd):
+        raise OSError("no")
+
+    assert desktop._window_dpi(1, SimpleNamespace(GetDpiForWindow=lambda _hwnd: 144)) == 144
+    assert desktop._window_dpi(1, SimpleNamespace()) == desktop.USER_DEFAULT_SCREEN_DPI
+    assert desktop._window_dpi(1, SimpleNamespace(GetDpiForWindow=lambda _hwnd: 0)) == 96
+    assert desktop._window_dpi(1, SimpleNamespace(GetDpiForWindow=refuse)) == 96
+
+
 class _FakeIntPtr:
     def __init__(self, value):
         self.value = value
@@ -711,6 +879,512 @@ def test_native_hook_releases_and_drops_itself_on_destroy(monkeypatch):
     assert hook.released is True
     assert hook.forwarded == [desktop.WM_NCDESTROY]
     assert hwnd not in desktop._native_window_hooks
+
+
+class _FakeForm:
+    """The minimum of a WinForms Form the native hook touches."""
+
+    def __init__(self, hwnd=456, state=_FakeFormWindowState.Normal) -> None:
+        self.Handle = SimpleNamespace(ToInt64=lambda: hwnd)
+        self.WindowState = state
+        self.closed = False
+
+    def Close(self):
+        self.closed = True
+
+
+def _title_bar_user32(bounds=(100, 200, 1200, 960), dpi=96, tracked=None, posts=None, posted=True):
+    rect_prototype = desktop.ctypes.CFUNCTYPE(
+        desktop.wintypes.BOOL, desktop.wintypes.HWND,
+        desktop.ctypes.POINTER(desktop._WindowRect))
+    track_prototype = desktop.ctypes.CFUNCTYPE(
+        desktop.wintypes.BOOL, desktop.ctypes.POINTER(desktop._TrackMouseEvent))
+
+    point_prototype = desktop.ctypes.CFUNCTYPE(
+        desktop.wintypes.BOOL, desktop.wintypes.HWND, desktop.ctypes.POINTER(desktop._Point))
+
+    @rect_prototype
+    def get_window_rect(_hwnd, rect_pointer):
+        rect = rect_pointer.contents
+        rect.left, rect.top, rect.right, rect.bottom = bounds
+        return True
+
+    @rect_prototype
+    def get_client_rect(_hwnd, rect_pointer):
+        rect = rect_pointer.contents
+        rect.left, rect.top = 0, 0
+        rect.right, rect.bottom = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        return True
+
+    @point_prototype
+    def client_to_screen(_hwnd, point_pointer):
+        point = point_pointer.contents
+        point.x, point.y = point.x + bounds[0], point.y + bounds[1]
+        return True
+
+    @track_prototype
+    def track_mouse_event(request_pointer):
+        request = request_pointer.contents
+        if tracked is not None:
+            tracked.append((request.size, request.flags, int(request.track or 0)))
+        return True
+
+    def post_message(*args):
+        if posts is not None:
+            posts.append(args)
+        return posted
+
+    return SimpleNamespace(GetWindowRect=get_window_rect, GetClientRect=get_client_rect,
+                           ClientToScreen=client_to_screen, TrackMouseEvent=track_mouse_event,
+                           GetDpiForWindow=lambda _hwnd: dpi, PostMessageW=post_message)
+
+
+def _nc_message(msg, *, wparam=0, lparam=0):
+    return SimpleNamespace(Msg=msg, WParam=SimpleNamespace(ToInt64=lambda: wparam),
+                           LParam=SimpleNamespace(ToInt64=lambda: lparam), Result=None)
+
+
+def _hit_test(hook, x, y):
+    message = _nc_message(desktop.WM_NCHITTEST, lparam=((y & 0xffff) << 16) | (x & 0xffff))
+    hook.WndProc(message)
+    return message.Result
+
+
+@pytest.mark.parametrize(
+    ("point", "expected"),
+    [
+        ((400, 220), desktop.HTCAPTION),
+        ((1080, 220), desktop.HTMINBUTTON),
+        ((1080, 202), desktop.HTTOP),
+        ((1130, 220), desktop.HTMAXBUTTON),
+        ((1180, 220), desktop.HTCLOSE),
+        ((1199, 203), desktop.HTTOPRIGHT),
+    ],
+    ids=["caption", "minimize", "resize-wins", "maximize", "close", "corner-wins"],
+)
+def test_native_hook_answers_the_title_bar_with_caption_and_button_codes(
+    monkeypatch, point, expected,
+):
+    _install_fake_system(monkeypatch)
+    native = _FakeForm()
+    hook = desktop._native_window_hook(native, _title_bar_user32())
+
+    result = _hit_test(hook, *point)
+
+    assert result.value == expected
+    assert hook.forwarded == []
+
+
+def test_native_hook_leaves_the_page_to_claim_the_brand_and_nav(monkeypatch):
+    _install_fake_system(monkeypatch)
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32())
+
+    for point in ((200, 220), (600, 220), (400, 260)):
+        assert _hit_test(hook, *point) is None
+    assert hook.forwarded == [desktop.WM_NCHITTEST] * 3
+
+
+def test_native_hook_keeps_only_the_buttons_while_maximized(monkeypatch):
+    """Win11 offers Snap Layouts on a maximized window's restore button, so the codes stay live.
+
+    Caption, brand, nav and the resize border all fall through to the page, which is what a
+    maximized window did before: dragging stays on the page's own path.
+    """
+    _install_fake_system(monkeypatch)
+    native = _FakeForm(state=_FakeFormWindowState.Maximized)
+    hook = desktop._native_window_hook(native, _title_bar_user32())
+
+    assert _hit_test(hook, 1130, 220).value == desktop.HTMAXBUTTON
+    assert _hit_test(hook, 1080, 220).value == desktop.HTMINBUTTON
+    assert _hit_test(hook, 1180, 220).value == desktop.HTCLOSE
+    # With no resize border in the way, the buttons own the full strip including the top corner -
+    # the same Fitts-friendly corner a real maximized window gives its close button.
+    assert _hit_test(hook, 1130, 202).value == desktop.HTMAXBUTTON
+    assert _hit_test(hook, 1199, 203).value == desktop.HTCLOSE
+    for point in ((400, 220), (200, 220), (600, 220), (400, 260)):
+        assert _hit_test(hook, *point) is None
+
+
+def test_native_hook_hit_tests_against_the_client_rect_not_the_window_rect(monkeypatch):
+    """While maximized the window rect spills past the client area the stylesheet lays out in."""
+    _install_fake_system(monkeypatch)
+    native = _FakeForm(state=_FakeFormWindowState.Maximized)
+    user32 = _title_bar_user32()
+    spilled = desktop.ctypes.CFUNCTYPE(
+        desktop.wintypes.BOOL, desktop.wintypes.HWND,
+        desktop.ctypes.POINTER(desktop._WindowRect))
+
+    @spilled
+    def get_window_rect(_hwnd, rect_pointer):
+        rect = rect_pointer.contents
+        rect.left, rect.top, rect.right, rect.bottom = 92, 192, 1208, 968  # 8px of frame each side
+        return True
+
+    user32.GetWindowRect = get_window_rect
+    hook = desktop._native_window_hook(native, user32)
+
+    # Regions follow the client rect (100, 200, 1200, 960), so close still ends at client x 1199.
+    assert _hit_test(hook, 1199, 220).value == desktop.HTCLOSE
+    assert _hit_test(hook, 1207, 220) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "state", "expected"),
+    [
+        (desktop.HTMINBUTTON, _FakeFormWindowState.Normal, desktop.SC_MINIMIZE),
+        (desktop.HTMAXBUTTON, _FakeFormWindowState.Normal, desktop.SC_MAXIMIZE),
+        (desktop.HTMAXBUTTON, _FakeFormWindowState.Maximized, desktop.SC_RESTORE),
+        (desktop.HTCLOSE, _FakeFormWindowState.Normal, desktop.SC_CLOSE),
+    ],
+    ids=["minimize", "maximize", "restore", "close"],
+)
+def test_native_hook_posts_a_button_command_on_release_never_inside_the_message(
+    monkeypatch, code, state, expected,
+):
+    """Posting keeps the close confirmation and any state change out of this WndProc frame."""
+    _install_fake_system(monkeypatch)
+    posts = []
+    native = _FakeForm(state=state)
+    hook = desktop._native_window_hook(native, _title_bar_user32(posts=posts))
+
+    press = _nc_message(desktop.WM_NCLBUTTONDOWN, wparam=code)
+    hook.WndProc(press)
+    assert posts == [] and press.Result.value == 0
+
+    release = _nc_message(desktop.WM_NCLBUTTONUP, wparam=code)
+    hook.WndProc(release)
+
+    assert posts == [(456, desktop.WM_SYSCOMMAND, expected, 0)]
+    assert native.closed is False  # the form is never touched from inside the message
+    assert native.WindowState is state
+    assert release.Result.value == 0
+    assert hook.forwarded == []
+
+
+def test_native_hook_ignores_a_release_that_did_not_start_on_that_button(monkeypatch):
+    _install_fake_system(monkeypatch)
+    posts = []
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32(posts=posts))
+
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTMAXBUTTON))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTMAXBUTTON))
+
+    assert posts == []
+
+
+@pytest.mark.parametrize(
+    "cancel",
+    [desktop.WM_NCMOUSELEAVE, desktop.WM_SIZE, desktop.WM_ACTIVATE, desktop.WM_KILLFOCUS,
+     desktop.WM_CANCELMODE],
+    ids=["mouse-leave", "resize", "activation", "focus-loss", "cancel-mode"],
+)
+def test_native_hook_drops_a_latched_press_when_the_gesture_is_cancelled(monkeypatch, cancel):
+    _install_fake_system(monkeypatch)
+    posts = []
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32(posts=posts))
+
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTCLOSE))
+    hook.WndProc(_nc_message(cancel))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE))
+
+    assert posts == []
+    assert cancel in hook.forwarded  # the cancel itself still reaches DefWindowProc
+
+
+def test_native_hook_treats_a_double_click_on_a_button_as_one_command(monkeypatch):
+    """DOWN, UP, DBLCLK, UP must not queue a second SC_CLOSE behind the confirmation dialog."""
+    _install_fake_system(monkeypatch)
+    posts = []
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32(posts=posts))
+
+    for message in (_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTCLOSE),
+                    _nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE),
+                    _nc_message(desktop.WM_NCLBUTTONDBLCLK, wparam=desktop.HTCLOSE),
+                    _nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE)):
+        hook.WndProc(message)
+
+    assert posts == [(456, desktop.WM_SYSCOMMAND, desktop.SC_CLOSE, 0)]
+    # The trailing unmatched release is not ours to swallow, so DefWindowProc still sees it.
+    assert hook.forwarded == [desktop.WM_NCLBUTTONUP]
+
+
+def test_native_hook_lets_defwindowproc_drive_caption_drag_and_the_system_menu(monkeypatch):
+    """The caption's move loop, taskbar drag, shake and snap all come from DefWindowProc."""
+    _install_fake_system(monkeypatch)
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32())
+
+    for message in (_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTCAPTION),
+                    _nc_message(desktop.WM_NCLBUTTONDBLCLK, wparam=desktop.HTCAPTION),
+                    _nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCAPTION)):
+        hook.WndProc(message)
+        assert message.Result is None
+
+    assert hook.forwarded == [desktop.WM_NCLBUTTONDOWN, desktop.WM_NCLBUTTONDBLCLK,
+                              desktop.WM_NCLBUTTONUP]
+
+
+def test_native_hook_mirrors_nonclient_hover_and_asks_for_one_mouse_leave(monkeypatch):
+    _install_fake_system(monkeypatch)
+    hovers, tracked = [], []
+    hook = desktop._native_window_hook(
+        _FakeForm(), _title_bar_user32(tracked=tracked), hovers.append)
+
+    for code in (desktop.HTMAXBUTTON, desktop.HTMAXBUTTON, desktop.HTCLOSE, desktop.HTCAPTION):
+        hook.WndProc(_nc_message(desktop.WM_NCMOUSEMOVE, wparam=code))
+    hook.WndProc(_nc_message(desktop.WM_NCMOUSELEAVE))
+    hook.WndProc(_nc_message(desktop.WM_NCMOUSEMOVE, wparam=desktop.HTMINBUTTON))
+
+    assert hovers == ["maximize", "maximize", "close", "", "", "minimize"]
+    # Re-armed on every move: the caption move loop's mouse capture cancels leave tracking, and a
+    # missed re-arm would latch the last hover on for good.
+    assert len(tracked) == 5
+    assert set(tracked) == {(desktop.ctypes.sizeof(desktop._TrackMouseEvent),
+                             desktop.TME_LEAVE | desktop.TME_NONCLIENT, 456)}
+    assert hook.forwarded == [desktop.WM_NCMOUSEMOVE] * 4 + [desktop.WM_NCMOUSELEAVE,
+                                                             desktop.WM_NCMOUSEMOVE]
+
+
+def test_native_hook_clears_hover_before_a_button_command_and_at_destroy(monkeypatch):
+    _install_fake_system(monkeypatch)
+    hovers = []
+    hwnd = 456
+    hook = desktop._native_window_hook(_FakeForm(hwnd), _title_bar_user32(), hovers.append)
+    desktop._native_window_hooks[hwnd] = hook
+
+    hook.WndProc(_nc_message(desktop.WM_NCMOUSEMOVE, wparam=desktop.HTMINBUTTON))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTMINBUTTON))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTMINBUTTON))
+    hook.WndProc(_nc_message(desktop.WM_NCDESTROY))
+
+    assert hovers == ["minimize", "", None]
+    assert hwnd not in desktop._native_window_hooks
+
+
+def test_native_hook_logs_a_bounded_detail_when_a_button_command_cannot_be_posted(
+    monkeypatch, desktop_log,
+):
+    _install_fake_system(monkeypatch)
+    hook = desktop._native_window_hook(_FakeForm(), _title_bar_user32(posted=False))
+
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONDOWN, wparam=desktop.HTCLOSE))
+    hook.WndProc(_nc_message(desktop.WM_NCLBUTTONUP, wparam=desktop.HTCLOSE))
+
+    logged = desktop_log.getvalue()
+    assert "could not run an Atlas title bar window command: OSError: PostMessageW failed" in logged
+    assert len(max(logged.splitlines(), key=len)) < 320
+
+
+def test_nc_hover_notifier_evaluates_off_the_ui_thread_only_when_the_region_changes():
+    scripts, threads = [], []
+
+    class FakeThread:
+        def __init__(self, target, daemon):
+            self.target, self.daemon, self.started = target, daemon, False
+            threads.append(self)
+
+        def start(self):
+            self.started = True
+
+    notifier = desktop._NcHoverNotifier(scripts.append, thread_factory=FakeThread)
+    notifier.notify("maximize")
+    notifier.notify("maximize")
+    notifier.notify("'); alert(1); //")
+    notifier.notify(None)
+    notifier._pump()
+
+    assert scripts == ["window.__atlasNcHover && window.__atlasNcHover('maximize')",
+                       "window.__atlasNcHover && window.__atlasNcHover('')"]
+    assert len(threads) == 1 and threads[0].daemon is True and threads[0].started is True
+
+
+def test_nc_hover_notifier_swallows_a_dead_page_and_never_starts_a_thread_to_stop():
+    attempted = []
+
+    def refuse(script):
+        attempted.append(script)
+        raise RuntimeError("window is gone")
+
+    def forbidden(**_kwargs):
+        raise AssertionError("stopping must not start a thread")
+
+    stopped = desktop._NcHoverNotifier(refuse, thread_factory=forbidden)
+    stopped.notify(None)
+    assert attempted == [] and stopped._thread is None
+
+    notifier = desktop._NcHoverNotifier(refuse, thread_factory=lambda **_kwargs: SimpleNamespace(
+        start=lambda: None))
+    notifier.notify("close")
+    notifier.notify(None)
+    notifier._pump()  # a raising page must not take the pump down with it
+
+    assert attempted == ["window.__atlasNcHover && window.__atlasNcHover('close')"]
+
+
+def test_nc_hover_notifier_drops_the_update_when_its_thread_will_not_start(desktop_log):
+    """This runs on the WndProc path, so a thread-start failure must never reach the CLR."""
+    def refuse_thread(**_kwargs):
+        raise RuntimeError("can't start new thread")
+
+    notifier = desktop._NcHoverNotifier(lambda _script: None, thread_factory=refuse_thread)
+
+    notifier.notify("close")
+    notifier.notify("minimize")
+
+    assert notifier._thread is None
+    assert notifier._state == ""  # rolled back, so a later working notify still sends
+    assert desktop_log.getvalue().count("could not mirror Atlas title bar hover") == 1
+
+
+def test_nc_hover_notifier_drops_states_instead_of_growing_when_the_page_stops_answering():
+    """`evaluate_js` has no timeout, so a torn-down WebView2 must not leak an unbounded queue."""
+    notifier = desktop._NcHoverNotifier(
+        lambda _script: None, thread_factory=lambda **_kwargs: SimpleNamespace(start=lambda: None))
+    states = ["minimize", "maximize", "close", ""]
+
+    for index in range(desktop.NC_HOVER_QUEUE_LIMIT * 4):
+        notifier.notify(states[index % len(states)])
+
+    assert notifier._queue.qsize() == desktop.NC_HOVER_QUEUE_LIMIT
+    drained = [notifier._queue.get() for _ in range(desktop.NC_HOVER_QUEUE_LIMIT)]
+    assert drained == [states[index % len(states)]
+                       for index in range(desktop.NC_HOVER_QUEUE_LIMIT)]
+    # Every dropped state was rolled back, so the tracked state still matches what the page was
+    # last told and the next real change is sent rather than swallowed as a repeat.
+    assert notifier._state == drained[-1]
+    notifier.notify("close")
+    assert notifier._queue.get() == "close"
+
+
+class _FakeWebViewControl:
+    """The WebView2 control surface `_disable_page_zoom` touches."""
+
+    def __init__(self, core=None) -> None:
+        self.CoreWebView2 = core
+        self.ZoomFactor = 1.75
+        self.handlers = []
+
+    def __iadd__(self, handler):  # CoreWebView2InitializationCompleted += handler
+        self.handlers.append(handler)
+        return self
+
+    @property
+    def CoreWebView2InitializationCompleted(self):
+        return self
+
+    @CoreWebView2InitializationCompleted.setter
+    def CoreWebView2InitializationCompleted(self, value):
+        assert value is self
+
+
+def _zoom_window(core):
+    control = _FakeWebViewControl(core)
+    return SimpleNamespace(native=SimpleNamespace(browser=SimpleNamespace(webview=control))), control
+
+
+def test_page_zoom_is_pinned_off_because_every_region_assumes_one_hundred_percent(desktop_log):
+    core = SimpleNamespace(Settings=SimpleNamespace(IsZoomControlEnabled=True))
+    window, control = _zoom_window(core)
+
+    desktop._disable_page_zoom(window)
+
+    assert core.Settings.IsZoomControlEnabled is False
+    assert control.ZoomFactor == 1.0
+    assert "page zoom control disabled" in desktop_log.getvalue()
+
+
+def test_page_zoom_waits_for_a_webview_that_is_still_initialising(desktop_log):
+    window, control = _zoom_window(None)
+
+    desktop._disable_page_zoom(window)
+
+    assert control.ZoomFactor == 1.75  # nothing touched yet
+    assert len(control.handlers) == 1
+    core = SimpleNamespace(Settings=SimpleNamespace(IsZoomControlEnabled=True))
+    control.CoreWebView2 = core
+    control.handlers[0](control, None)
+
+    assert core.Settings.IsZoomControlEnabled is False
+    assert control.ZoomFactor == 1.0
+
+
+@pytest.mark.parametrize(
+    ("window", "reason"),
+    [
+        (SimpleNamespace(native=SimpleNamespace()), "control"),
+        (SimpleNamespace(native=SimpleNamespace(browser=SimpleNamespace(webview=None))), "control"),
+    ],
+    ids=["no-browser", "no-control"],
+)
+def test_page_zoom_skip_is_a_bounded_log_line_and_never_raises(window, reason, desktop_log):
+    desktop._disable_page_zoom(window)
+
+    logged = desktop_log.getvalue()
+    assert f"page zoom control left enabled: {reason}" in logged
+    assert len(max(logged.splitlines(), key=len)) < 320
+
+
+def test_page_zoom_reports_a_refusing_settings_object_without_raising(desktop_log):
+    class Refusing:
+        @property
+        def Settings(self):
+            raise OSError("x" * 500)
+
+    window, _control = _zoom_window(Refusing())
+
+    desktop._disable_page_zoom(window)
+
+    logged = desktop_log.getvalue()
+    assert "page zoom control left enabled: OSError:" in logged
+    assert len(max(logged.splitlines(), key=len)) < 320
+
+
+def test_window_shown_pins_page_zoom_alongside_the_native_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(desktop, "_set_window_icon", lambda *_a, **_k: calls.append("icon"))
+    monkeypatch.setattr(desktop, "_configure_native_window", lambda *_a, **_k: calls.append("native"))
+    monkeypatch.setattr(desktop, "_disable_page_zoom", lambda *_a, **_k: calls.append("zoom"))
+    monkeypatch.setattr(desktop, "_watch_child", lambda *_a, **_k: calls.append("watch"))
+    monkeypatch.setitem(sys.modules, "System", SimpleNamespace(Action=lambda action: action))
+
+    class Native:
+        def Invoke(self, action):
+            action()
+
+    window = SimpleNamespace(
+        native=Native(),
+        events=SimpleNamespace(shown=SimpleNamespace(wait=lambda timeout: True)))
+    desktop._on_window_shown(object(), window, object(), None)
+
+    assert calls == ["icon", "native", "zoom", "watch"]
+
+
+def test_configure_native_window_gives_the_hook_the_pages_hover_channel():
+    desktop._native_window_hooks.clear()
+    captured = []
+    native = SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 456))
+    user32 = SimpleNamespace(
+        GetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowLongW=lambda *_args: desktop.WS_CAPTION,
+        SetWindowPos=lambda *_args: True,
+    )
+    scripts = []
+
+    desktop._configure_native_window(
+        SimpleNamespace(native=native, evaluate_js=scripts.append), user32=user32,
+        hook_factory=lambda _form, _functions, hover: captured.append(hover) or object())
+
+    # Drive the real channel end to end: hover state in, one evaluate_js on the window out.
+    captured[0]("maximize")
+    captured[0](None)
+    notifier = captured[0].__self__
+    notifier._thread.join(10)
+
+    assert isinstance(notifier, desktop._NcHoverNotifier)
+    assert notifier._thread.daemon is True and notifier._thread.is_alive() is False
+    assert scripts == ["window.__atlasNcHover && window.__atlasNcHover('maximize')"]
+    desktop._native_window_hooks.clear()
 
 
 def test_configure_native_window_replaces_the_existing_hook_for_an_hwnd():
@@ -1868,3 +2542,27 @@ def test_webview_occlusion_patch_rewrites_the_installed_pywebview_constructor():
         assert desktop.WEBVIEW_BROWSER_ARGUMENTS not in constants
     finally:
         module.EdgeChrome.__init__ = original
+
+
+def test_the_pending_confirmation_card_keeps_the_readbacks_line_breaks():
+    """2026-09-01 re-review, R1. The confirm readback is one field per line,
+    and that line break is the only thing a value provably cannot contain --
+    it is what makes the field boundaries unforgeable (worker/tools.py
+    _READBACK_LINE_SEPARATOR). ui/app.js sets the card with textContent, which
+    preserves the newlines in the DOM, but HTML collapses them on render: the
+    card would show one run-on line and a value carrying "; to: someone.else"
+    would look like a field of its own again. pre-line is what stops that, so
+    it is pinned here rather than left to survive the next restyle by luck.
+    """
+    assert css_value(".pending-confirmation p", "white-space") == "pre-line"
+    # ...and what survives the readback's own field bound has to stay ON
+    # SCREEN. The card is anchored to the top of the window with no natural
+    # ceiling, so a long readback ran off the bottom -- hiding fields the host
+    # deliberately kept IN the summary.
+    assert css_value(".pending-confirmation", "overflow-y") == "auto"
+    assert css_value(".pending-confirmation", "max-height") == "min(60vh, 20rem)"
+    # And the card is narrow (16rem), so a long path has to wrap inside its
+    # own line instead of widening the card off-screen.
+    assert css_value(".pending-confirmation p", "overflow-wrap") == "anywhere"
+    # The projection really is the multi-line summary, not a flattened copy.
+    assert "textContent = readback" in APP_JS

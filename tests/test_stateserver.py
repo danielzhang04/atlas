@@ -173,12 +173,29 @@ def test_state_signal_assets_and_security_headers():
     # with a persistent soft-trail layer, instead of many small pinpricks
     # with no trail. Tuning constants grouped in one block for one-line
     # Daniel-driven edits.
-    assert "const PARTICLE_COUNT = 16;" in script[2]
+    # DD-6: Daniel's follow-up after seeing CC6 on screen -- "smaller, more,
+    # and less bright and behind" -- turns the same knobs back the other way
+    # (count up, size/glow down, sprite + trail-layer alpha softened).
+    assert "const PARTICLE_COUNT = 28;" in script[2]
+    assert "const PARTICLE_COUNT = 16;" not in script[2]
     assert "const PARTICLE_COUNT = 42;" not in script[2]
-    assert "const PARTICLE_SIZE_BASE = 4.4;" in script[2]
-    assert "const PARTICLE_SIZE_STEP = 2.6;" in script[2]
-    assert "const PARTICLE_GLOW_RADIUS_PX = 48;" in script[2]
-    assert "const TRAIL_FADE_ALPHA = .12;" in script[2]
+    assert "const PARTICLE_SIZE_BASE = 2.6;" in script[2]
+    assert "const PARTICLE_SIZE_BASE = 4.4;" not in script[2]
+    assert "const PARTICLE_SIZE_STEP = 1.6;" in script[2]
+    assert "const PARTICLE_SIZE_STEP = 2.6;" not in script[2]
+    assert "const PARTICLE_GLOW_RADIUS_PX = 32;" in script[2]
+    assert "const PARTICLE_GLOW_RADIUS_PX = 48;" not in script[2]
+    assert "const TRAIL_FADE_ALPHA = .16;" in script[2]
+    assert "const TRAIL_FADE_ALPHA = .12;" not in script[2]
+    # DD-6: layer-level dim on the trail blit (the "behind" half of "less
+    # bright and behind" -- see particleGlow gradient-stop softening below
+    # for the per-particle "less bright" half).
+    assert "const TRAIL_LAYER_ALPHA = .6;" in script[2]
+    assert "context.globalAlpha = TRAIL_LAYER_ALPHA;" in script[2]
+    assert 'particleGlow.addColorStop(0, "rgb(255 255 255 / 0.55)");' in script[2]
+    assert 'particleGlow.addColorStop(.18, "rgb(255 255 255 / 0.34)");' in script[2]
+    assert 'particleGlow.addColorStop(.55, "rgb(255 255 255 / 0.09)");' in script[2]
+    assert 'particleGlow.addColorStop(0, "rgb(255 255 255 / 1)");' not in script[2]
     # ...and it is spent per 60fps frame, not per frame: a flat alpha made
     # trail length a function of frame rate (long comet at 30fps, short at
     # 120). Same 1 - (1-k)^(dt/16.67) idiom as drawWaveform.
@@ -744,6 +761,10 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
             self.mcp = FakeMcp()
             self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+            # Mirrors the real Runtime: persistence ships dark, so the field
+            # exists and is None. A fake missing it entirely hides the
+            # shutdown path that reads it.
+            self.transcript = None
 
         def warm_model_client(self):
             assert not build_active
@@ -1099,6 +1120,10 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
                 self.mcp = FakeMcp()
                 self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
                 self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+                # Mirrors the real Runtime: persistence ships dark, so the field
+                # exists and is None. A fake missing it entirely hides the
+                # shutdown path that reads it.
+                self.transcript = None
 
             def warm_model_client(self):
                 if failure == "warm":
@@ -1234,6 +1259,10 @@ def test_entrypoint_early_shutdown_is_registered_and_idempotent(monkeypatch):
             self.mcp = FakeMcp()
             self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+            # Mirrors the real Runtime: persistence ships dark, so the field
+            # exists and is None. A fake missing it entirely hides the
+            # shutdown path that reads it.
+            self.transcript = None
 
     class FakeServer:
         port = 4321
@@ -1539,9 +1568,14 @@ def test_text_turn_response_projects_existing_pending_confirmation():
 
     response = asyncio.run(scenario())
 
+    # The readback is projected to the desktop card exactly as it is spoken:
+    # one field per line. ui/styles.css sets white-space: pre-line on the card
+    # so the browser keeps those breaks instead of collapsing them into a
+    # single line, which would let a value forge a field boundary visually
+    # even though it cannot forge one audibly.
     assert json.loads(response[2]) == {
         "ok": True,
-        "pending": {"readback": "confirm_action - target: report"},
+        "pending": {"readback": "confirm_action\ntarget: report"},
     }
 
 
