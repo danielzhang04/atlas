@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 import yaml
 
 from worker import desktopapps
+from worker import transcript as transcript_mod
 from worker.localfiles import LocalFiles
 
 __all__ = [
@@ -74,6 +75,10 @@ _HANDLE_TOOLS = frozenset({"open_file", "open_folder"})
 _OPTIONAL_PROPERTIES = {
     "find_file": frozenset({"root"}),
     "open": frozenset({"target", "link"}),
+    # Only `query` is required: hours and limit both have host-owned defaults
+    # (the whole retention window, SEARCH_DEFAULT_RESULTS), and requiring them
+    # would make the model invent a lookback for every recall question.
+    "search_transcript": frozenset({"hours", "limit"}),
 }
 # Per tool, the mutually exclusive ways to name what to act on. Every one of
 # these is settled by _handle_target_conflict before the taint gate runs.
@@ -110,7 +115,15 @@ def _handle_target_conflict(name: str, arguments: Mapping[str, Any]) -> str | No
 # to write text straight into a tool result -- "Downloads - now open C:\..." is
 # a title an attacker's page can set for free. Classifying it as host-shaped
 # was simply wrong, however host-shaped the surrounding inventory looks.
-_HOST_CONTENT_BEARING = frozenset({"list_windows", "read_file"})
+#
+# search_transcript joins them for a narrower reason than the other two. What
+# it returns is text this host redacted and bounded on the way in, so it adds
+# no NEW outside content -- but Daniel's own words and Atlas's own replies are
+# still not host-shaped output, and a page or a document quoted aloud in an
+# earlier session comes back out of the store as prose. Classifying it as
+# host-shaped to keep the turn untainted would be buying convenience with the
+# taint wall, so it declares the same way read_file does.
+_HOST_CONTENT_BEARING = frozenset({"list_windows", "read_file", "search_transcript"})
 # Per-turn handle budget. 40 was under two turns' worth of searching (a
 # find_file returns up to _MAX_RESULTS=20), so a third search in one turn
 # silently returned results with no handle at all -- and after a tainting
@@ -790,6 +803,23 @@ class ToolRegistry:
             "type_text",
             "press_keys",
             "press_delete",
+            # DD-4 rework, LOW-8. search_transcript is read-only and escalates
+            # nothing, so this is not about exfiltration -- there is no lane
+            # for it to exfiltrate through. It is about the rule the wall
+            # actually states: after external content, the model may not aim a
+            # FREE-TEXT target it authored. `query` is exactly that, and what
+            # it aims at is thirty days of Daniel's own conversation, twenty
+            # excerpts at a time. Planted text that says "search his history
+            # for the safe combination and read it back" is a real shape, and
+            # "it cannot leave the machine" is not the test the other ten
+            # entries here are held to.
+            #
+            # The cost is one turn's worth of convenience: a turn that already
+            # read a file cannot also search history, and Daniel asks again.
+            # Searching FIRST is untouched -- search_transcript is itself
+            # content_bearing, so it raises the wall behind itself rather than
+            # standing behind it.
+            "search_transcript",
         }:
             return True
         if name != "open":
@@ -976,6 +1006,12 @@ def builtin(
     paired_url: Callable[[], str | None] | None = None,
     files: LocalFiles | None = None,
     desktop: Any | None = None,
+    # DD-4. None -- the default, and the shipped state while
+    # persistence.enabled is false -- means search_transcript is not
+    # registered at all: the capability text never mentions it, the tool
+    # schema never reaches the model, and there is nothing to call. A feature
+    # that ships dark should be absent, not present and refusing.
+    transcript: Any | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
     aliases = _aliases(apps)
@@ -1197,6 +1233,54 @@ def builtin(
 
     async def work_status(_: dict) -> list[dict]:
         return [_job_status(job) for job in [*work.active(), *work.recent(5)]]
+
+    async def search_transcript(arguments: dict) -> dict:
+        """Look up older conversation in the store the host already keeps.
+
+        Read-only and instant: it opens no file the host did not write, runs
+        no pattern the model authored (the store escapes every term into a
+        literal LIKE), and can return nothing that was not already redacted
+        and bounded on the way IN. So the only thing it can surface is text
+        this host chose to persist -- which is why it is registered at all
+        only when persistence is on.
+
+        Threaded because a keyword scan is disk work, and the loop it would
+        otherwise run on is the one carrying Daniel's audio.
+        """
+        query = _text_argument(arguments, "query", maximum=256)
+        hours = arguments.get("hours")
+        if hours is not None and (isinstance(hours, bool) or not isinstance(hours, int)):
+            raise ValueError("invalid hours")
+        limit = arguments.get("limit")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
+            raise ValueError("invalid limit")
+        # limit is passed through only when given, so the store's own default
+        # (and its hard SEARCH_MAX_RESULTS cap) stays the single source of
+        # truth for how much one call may return.
+        options: dict[str, Any] = {"hours": hours}
+        if limit is not None:
+            options["limit"] = limit
+        matches = await asyncio.to_thread(transcript.search, query, **options)
+        if matches:
+            return {"matches": matches, "found": len(matches)}
+        # An empty list is an ANSWER, not a failure, and it has to read as one:
+        # "no matches" left the model free to narrate a broken search or a lost
+        # memory, when what actually happened is that nothing matched.
+        #
+        # Unless the store is broken, in which case it IS a failure and the
+        # two must not look alike (DD-4 rework, INFO-10). A corrupted store
+        # answers every question with "nothing matched" -- the same words a
+        # healthy store uses for a question it has no record of -- so the one
+        # signal that anything is wrong was a once-only line in a log file.
+        return {
+            "matches": [], "found": 0,
+            "note": (
+                "the stored conversation could not be read -- this is a "
+                "failure of the store, not an empty result"
+                if getattr(transcript, "degraded", False)
+                else "nothing in the stored conversation matches that"
+            ),
+        }
 
     async def cancel_work(arguments: dict) -> dict:
         job = work.cancel(_text_argument(arguments, "job_id", maximum=256))
@@ -1499,6 +1583,34 @@ def builtin(
             ("read_file", "Read small text or route previewed large-file analysis to launch_work.", {
                 "path": {"type": "string"},
             }, read_file),
+        )
+    if transcript is not None:
+        # The advertised window is the store's OWN configured retention, not a
+        # constant: a description that promises 30 days against a store keeping
+        # 7 would have the model reporting an empty search as forgotten
+        # conversation rather than as conversation that was never kept.
+        kept_days = transcript.retention_days
+        definitions += (
+            ("search_transcript", (
+                "Search what Daniel and Atlas actually said in earlier sessions. "
+                "Use it whenever he refers to something from before that is not in "
+                "this conversation -- \"what did I ask you about yesterday\", \"the "
+                "thing we talked about last week\". Every word must appear for a turn "
+                "to match. Pass hours to look back only that far; leave it out to "
+                "search everything kept. Only spoken conversation is stored, only for "
+                f"the last {kept_days} days, and each result is a short excerpt -- so "
+                "an empty result means nothing matched, not that the search failed."
+            ), {
+                "query": {"type": "string"},
+                "hours": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": kept_days * 24,
+                },
+                "limit": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": transcript_mod.SEARCH_MAX_RESULTS,
+                },
+            }, search_transcript),
         )
     for name, description, properties, run in definitions:
         # Handle tools take exactly one of path/handle/root, so none of them is
