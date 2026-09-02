@@ -26,7 +26,7 @@ from .statusdetail import STATUS_DETAIL_RENDERERS, render_status_detail, status_
 # tools.py (budget note, https predicate) and this module is its only other
 # half. Re-stating either here would let the mint site and the open site
 # disagree about what a handle costs or what a URL is.
-from .tools import _HANDLE_BUDGET_NOTE, _direct_https
+from .tools import _HANDLE_BUDGET_NOTE, _direct_https, _unpinned_argument_names
 from .tools import McpToolError, Policy, Tool
 
 if TYPE_CHECKING:
@@ -519,6 +519,9 @@ def _exposed_tools(server_cfg: Mapping) -> frozenset[str] | None:
 
 
 _MISSING_EXPOSE_WARNING_LIMIT = 500
+# Same bound, for the allow_args warnings. Both directions are server-supplied
+# property NAMES, so they are bounded rather than trusted to be short.
+_UNPINNED_WARNING_LIMIT = 500
 
 
 def _missing_exposed_tools(exposed: frozenset[str] | None, listed_tools: Any) -> tuple[str, ...]:
@@ -871,6 +874,72 @@ def _server_domain(server_cfg: Mapping) -> str | None:
     if domain is not None and (not isinstance(domain, str) or not domain):
         raise ValueError("invalid MCP domain")
     return domain
+
+
+
+def _tool_allowed_arguments(
+    server_cfg: Mapping, remote_tool_name: str,
+) -> frozenset[str] | None:
+    """The pinned allowlist of property names this tool may carry.
+
+    ``allow_args:`` is the inverse of ``strip_args:``, and it exists because
+    strip_args only ever catches what a reviewer already named. A mirrored
+    schema is the remote server's own, passed through, so what the model sees
+    is whatever upstream decided to offer that day. strip_args notices a
+    RENAME -- a configured name absent from the offered properties raises a
+    connect-time warning -- but nothing noticed an ADDITION. chrome-devtools is
+    spawned from ~/.claude.json and is NOT version-pinned, so an upstream
+    release adding a property to any exposed tool was mirrored straight into
+    the model's snapshot with nothing refusing it. That already happened once,
+    unnoticed: it is how ``filePath`` (an instant-tier arbitrary file write)
+    and ``initScript`` (arbitrary JavaScript in Daniel's logged-in browser)
+    reached the model in the first place.
+
+    REFUSE, not silently strip, when a non-allowlisted name arrives anyway --
+    the same choice strip_args made, for the same reason: dropping an argument
+    reports success for a call Atlas quietly changed, and here the host does
+    not even know what the argument would have done. In practice the refusal is
+    close to unreachable, because the property is not in the model's schema
+    either; it is what holds for call_raw and for a model being driven by page
+    text it just read.
+
+    The failure this mechanism must NOT have is a silent capability loss when
+    upstream legitimately adds something benign. That is answered by the
+    connect-time warning in _mirror_tool -- the new property is named, loudly,
+    in the log -- and by a human then deciding, rather than by letting the
+    property through by default. There is no ordering that lets a benign
+    addition in without also letting a dangerous one in.
+    """
+    configured = server_cfg.get("allow_args", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP allow_args map")
+    if remote_tool_name not in configured:
+        return None
+    names = configured[remote_tool_name]
+    if (
+        isinstance(names, (str, bytes))
+        or not isinstance(names, (list, tuple))
+        # An EMPTY list is legal here, unlike every other list in this file.
+        # "This tool takes no arguments" is a real, useful statement -- it is
+        # the only way to pin a zero-property tool like list_pages, which
+        # otherwise has nothing for a future upstream property to be checked
+        # against. The reason the convention flips is the direction of the
+        # failure: an empty strip_args or readback_keys silently disables a
+        # protection, while an empty allow_args is the strictest setting there
+        # is, and a mistaken one shows up immediately as a refused call.
+        or not all(isinstance(name, str) and name for name in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("invalid MCP allow_args value")
+    allowed = frozenset(names)
+    # A name that is both stripped and allowed is a config edit that quietly
+    # re-permits exactly what strip_args exists to remove. It cannot be
+    # resolved by precedence -- whichever wins, the other line is a lie -- so
+    # it is a load error.
+    overlap = allowed & _tool_stripped_arguments(server_cfg, remote_tool_name)
+    if overlap:
+        raise ValueError("invalid MCP allow_args value: also in strip_args")
+    return allowed
 
 
 def _compile_instant_when(server_cfg: Mapping, remote_tool_name: str) -> Callable[[Mapping], bool] | None:
@@ -1488,6 +1557,7 @@ class McpServers:
     ) -> Tool:
         timeout_s = float(defaults.get("call_timeout_s", 8))
         stripped = _tool_stripped_arguments(server_cfg, remote_tool.name)
+        allowed = _tool_allowed_arguments(server_cfg, remote_tool.name)
         # Enforcement point 1: the dangerous property never reaches the model
         # snapshot. Applied to the same schema object the account parameter is
         # removed from, so a stripped name is gone from `properties` AND from
@@ -1499,6 +1569,45 @@ class McpServers:
             ),
             stripped,
         )
+        if allowed is not None:
+            # Same enforcement point, opposite direction: whatever the server
+            # offered that nobody pinned is gone from the snapshot too. The
+            # account parameter is excluded from the comparison because the
+            # host fills it in itself and has already removed it above.
+            offered = schema.get("properties")
+            if isinstance(offered, Mapping):
+                schema = _without_arguments(
+                    schema, [name for name in offered if name not in allowed],
+                )
+            unpinned = sorted(
+                name for name in (remote_tool.inputSchema.get("properties") or {})
+                if name not in allowed
+                and name not in stripped
+                and name != server_cfg.get("account_param")
+            )
+            if unpinned:
+                # The loud half of the mechanism. A benign upstream addition is
+                # not lost silently: it is named here, and a human decides
+                # whether to pin it. Names only, bounded by the server's own
+                # schema (rule 10).
+                _LOGGER.warning(
+                    "MCP server %s offers unpinned properties on %s: %s",
+                    server_name, remote_tool.name,
+                    ", ".join(unpinned)[:_UNPINNED_WARNING_LIMIT],
+                )
+            missing = sorted(
+                allowed - frozenset(remote_tool.inputSchema.get("properties") or {})
+            )
+            if missing:
+                # The inverse, and the one that actually breaks a capability:
+                # an allowlisted name the server no longer offers means an
+                # upstream rename, and the renamed property is now being
+                # refused with nothing else saying so.
+                _LOGGER.warning(
+                    "MCP server %s allow_args names not offered by %s: %s",
+                    server_name, remote_tool.name,
+                    ", ".join(missing)[:_UNPINNED_WARNING_LIMIT],
+                )
         # A strip_args entry the server does not actually offer is the same
         # failure mode expose: warns about, and a worse one: chrome-devtools is
         # spawned from ~/.claude.json and is NOT version-pinned, so an upstream
@@ -1555,6 +1664,7 @@ class McpServers:
             escalate=_compile_instant_when(server_cfg, remote_tool.name),
             readback_keys=_tool_readback_keys(server_cfg, remote_tool.name),
             refused_arguments=stripped,
+            allowed_arguments=allowed,
         )
 
     async def call_raw(
@@ -1595,6 +1705,23 @@ class McpServers:
             supplied = sorted(stripped.intersection(arguments))
             if supplied:
                 raise McpToolError(f"argument not available: {', '.join(supplied)}")
+        # The pinned allowlist, enforced at the same authoritative boundary and
+        # returning the same sentence. The account parameter is exempt: the
+        # host appends it itself a few lines below, so a caller that already
+        # carries it (count_mail's own search arguments do not, but a future
+        # one might) is not refused for a key Atlas is about to overwrite.
+        allowed = _tool_allowed_arguments(server_cfg, tool)
+        if allowed is not None:
+            account_name = server_cfg.get("account_param")
+            unpinned = _unpinned_argument_names(
+                {
+                    name: value for name, value in arguments.items()
+                    if name != account_name
+                },
+                allowed,
+            )
+            if unpinned:
+                raise McpToolError(f"argument not available: {', '.join(unpinned)}")
         call_arguments = dict(arguments)
         account_param = server_cfg.get("account_param")
         if account_param is not None:

@@ -3821,3 +3821,88 @@ def test_the_registry_publishes_a_tools_tier():
     assert registry.policy("quick") == "instant"
     assert registry.policy("careful") == "confirm"
     assert registry.policy("never-registered") is None
+
+
+# --- DD-8 Part B: the pinned property allowlist, host side ------------------
+
+
+def _allowlisted(name="remote__write", allowed=("path", "content"), policy="instant"):
+    return Tool(
+        name=name,
+        description="Remote tool",
+        input_schema={"type": "object", "properties": {}},
+        run=lambda _: _return({"ok": True}),
+        policy=policy,
+        allowed_arguments=frozenset(allowed),
+    )
+
+
+def test_an_unpinned_argument_is_refused_before_any_policy_branch_runs():
+    """Enforcement point two, host side. The refusal must beat the confirm
+    branch, or Daniel would be read back an argument the host already ruled
+    out."""
+    registry = ToolRegistry()
+    registry.register(_allowlisted(policy="confirm"))
+
+    result = _call(registry, "remote__write", {"path": "x", "mode": "append"})
+
+    assert result.status == "error"
+    assert result.content == "argument not available: mode"
+    assert registry.pending is None
+
+
+def test_an_allowlisted_call_is_untouched():
+    registry = ToolRegistry()
+    registry.register(_allowlisted())
+    assert _call(registry, "remote__write", {"path": "x", "content": "y"}).status == "ok"
+
+
+def test_no_allowlist_at_all_leaves_a_tool_accepting_whatever_its_schema_says():
+    """None means unreviewed, not empty. A `frozenset()` default would have
+    refused every argument on every unpinned tool."""
+    registry = ToolRegistry()
+    registry.register(_tool("plain"))
+    assert registry._tools["plain"].allowed_arguments is None
+    assert _call(registry, "plain", {"anything": 1}).status == "ok"
+
+
+def test_an_empty_allowlist_means_this_tool_takes_no_arguments():
+    registry = ToolRegistry()
+    registry.register(_allowlisted(allowed=()))
+    assert _call(registry, "remote__write", {}).status == "ok"
+    assert _call(registry, "remote__write", {"path": "x"}).status == "error"
+
+
+def test_the_refusal_echoes_only_identifier_shaped_names_and_bounds_the_list():
+    """The one refusal whose contents Atlas did not author: the names come
+    from the model. Rule 10's discipline, applied to what is spoken back."""
+    from worker.tools import _unpinned_argument_names
+
+    allowed = frozenset({"path"})
+    assert _unpinned_argument_names({"path": 1}, allowed) == []
+    assert _unpinned_argument_names({"mode": 1}, allowed) == ["mode"]
+    assert _unpinned_argument_names({"a b\nc": 1}, allowed) == ["..."]
+    assert _unpinned_argument_names({"x" * 41: 1}, allowed) == ["..."]
+    many = {f"arg{index}": 1 for index in range(9)}
+    listed = _unpinned_argument_names(many, allowed)
+    assert listed == ["arg0", "arg1", "arg2", "arg3", "arg4", "and 4 more"]
+
+
+def test_strip_args_and_the_allowlist_answer_the_same_sentence():
+    """Which of the two walls stopped a call is Atlas's business, not
+    something the model should have to reason about."""
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="remote__snap",
+        description="Remote tool",
+        input_schema={"type": "object", "properties": {}},
+        run=lambda _: _return({"ok": True}),
+        refused_arguments=frozenset({"filePath"}),
+        allowed_arguments=frozenset({"verbose"}),
+    ))
+
+    stripped = _call(registry, "remote__snap", {"filePath": "C:/x"})
+    unpinned = _call(registry, "remote__snap", {"newThing": 1})
+
+    assert stripped.content == "argument not available: filePath"
+    assert unpinned.content == "argument not available: newThing"

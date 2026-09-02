@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -49,6 +50,7 @@ except ModuleNotFoundError:
 
 import worker.mcp_client as mcp_client
 import worker.tools as tools
+from worker import mcp_client as _mcp
 from worker.mcp_client import McpServers, load_mcp_config, policy_for
 from worker.tools import McpToolError
 from worker.tools import ToolRegistry
@@ -1035,6 +1037,9 @@ def test_checked_in_config_registered_tool_count_is_at_or_under_budget(tmp_path)
     # The 2026-09-01 security rework gives one back: handle_dialog is dropped
     # (F6 -- an unanswerable readback), taking chrome-devtools to 13 and the
     # total to 85, and the serialized prefix to 70,132.
+    # DD-8 Part B registers no tools and removes none, so DD-7's count is
+    # unchanged: allow_args narrows what a tool may be CALLED with, never how
+    # many tools exist.
     assert builtin_count == 20
     assert total == 85
     assert total < 116  # still net negative against the pre-C0 baseline
@@ -4124,6 +4129,27 @@ def _dd7_browser_server() -> FastMCP:
     The four tools that carry a strip_args: argument declare it with its real
     upstream name and type, so the schema strip and the host-side refusal are
     exercised against the shape they actually meet.
+
+    Every signature below matches the REAL chrome-devtools-mcp tools/list
+    output, taken from the five versions cached in this machine's npx store by
+    composing each tool's schema the way build/src/ToolHandler.js does. Two
+    corrections DD-8 had to make to its own first attempt are baked in here:
+
+      * `pageId` is REQUIRED on every page-scoped tool -- click, fill,
+        fill_form, navigate_page, press_key, take_screenshot, take_snapshot,
+        type_text, wait_for. It is not in the tool's own `schema`; the server
+        injects it (ToolHandler composes {...pageIdSchema, ...tool.schema} and
+        pageIdSchema declares zod.number() with no .optional()). DD-8 read the
+        raw schema, concluded this fixture had invented the argument, removed
+        it, and deleted the assertion that proved it -- which is how an
+        allow_args list that broke nine of the thirteen tools passed a green
+        suite. The parameter and the assertion are both back.
+      * `type_text` has NO includeSnapshot in any released version. That one
+        really was invented, by DD-8's allow_args rather than by this fixture.
+
+    select_page, new_page, close_page and list_pages are NOT page-scoped: the
+    first three carry a pageId in their own schema and list_pages takes
+    nothing, so none of them gets the injected one.
     """
     server = FastMCP("test-dd7-browser")
 
@@ -4136,38 +4162,65 @@ def _dd7_browser_server() -> FastMCP:
         return f"selected {pageId} front={bringToFront}"
 
     @server.tool(description="Take a text snapshot of the target page.")
-    def take_snapshot(pageId: int, filePath: str = "", verbose: bool = False) -> str:
-        return f"WROTE-SNAPSHOT-TO:{filePath}"
+    def take_snapshot(
+        pageId: int, filePath: str = "", verbose: bool = False,
+    ) -> str:
+        return f"SNAPSHOT-OF-PAGE:{pageId}:WROTE-SNAPSHOT-TO:{filePath}"
 
     @server.tool(description="Take a screenshot of the page or element.")
-    def take_screenshot(pageId: int, filePath: str = "") -> str:
+    def take_screenshot(
+        pageId: int, filePath: str = "", format: str = "png",
+        fullPage: bool = False, quality: int = 0, uid: str = "",
+    ) -> str:
         return f"WROTE-SCREENSHOT-TO:{filePath}"
 
     @server.tool(description="Go to a URL, or back, forward, or reload.")
     def navigate_page(
-        pageId: int, url: str = "", initScript: str = "",
+        pageId: int, type: str = "url", url: str = "",
+        ignoreCache: bool = False, timeout: int = 0, initScript: str = "",
         handleBeforeUnload: str = "accept",
     ) -> str:
         return f"RAN-INIT-SCRIPT:{initScript}"
 
     @server.tool(description="Wait for the specified text to appear.")
-    def wait_for(text: str) -> str:
+    def wait_for(pageId: int, text: str = "", timeout: int = 0) -> str:
         return "waited"
 
+    @server.tool(description="Click on an element on the page.")
+    def click(
+        pageId: int, uid: str = "", dblClick: bool = False,
+        includeSnapshot: bool = False,
+    ) -> str:
+        return f"clicked {uid} on page {pageId}"
+
+    @server.tool(description="Fill out an input on the page.")
+    def fill(
+        pageId: int, uid: str = "", value: str = "",
+        includeSnapshot: bool = False,
+    ) -> str:
+        return f"filled {uid}"
+
     @server.tool(description="Fill out multiple form elements at once.")
-    def fill_form(elements: str) -> str:
+    def fill_form(
+        pageId: int, elements: str = "", includeSnapshot: bool = False,
+    ) -> str:
         return "filled"
 
     @server.tool(description="Press a key or key combination.")
-    def press_key(key: str) -> str:
+    def press_key(
+        pageId: int, key: str = "", includeSnapshot: bool = False,
+    ) -> str:
         return f"pressed {key}"
 
     @server.tool(description="Type text using keyboard into a focused input.")
-    def type_text(text: str) -> str:
+    def type_text(pageId: int, text: str = "", submitKey: str = "") -> str:
         return "typed"
 
     @server.tool(description="Open a new tab and load a URL.")
-    def new_page(url: str) -> str:
+    def new_page(
+        url: str, background: bool = False, isolatedContext: str = "",
+        timeout: int = 0,
+    ) -> str:
         return "opened"
 
     @server.tool(description="Closes the page by its index.")
@@ -4229,6 +4282,9 @@ def test_function_proof_dd7_browser_tranche_lands_with_the_intended_policies():
             "list_pages", "select_page", "take_snapshot", "take_screenshot",
             "navigate_page", "wait_for", "fill_form", "press_key",
             "type_text", "new_page", "close_page",
+            # click and fill were missing from this fixture entirely, so their
+            # allow_args entries were never exercised by anything.
+            "click", "fill",
         )
     }
     for name in (
@@ -4274,6 +4330,10 @@ def test_function_proof_dd7_browser_tranche_lands_with_the_intended_policies():
     assert set(registered["chrome-devtools__take_snapshot"].input_schema["properties"]) == {
         "pageId", "verbose",
     }
+    # DD-7's assertion, restored. Deleting it is what let DD-8 ship an
+    # allow_args list that stripped this required property off nine tools:
+    # with no test naming pageId, removing it from the fixture and removing it
+    # from the allowlist agreed with each other and the suite stayed green.
     assert registered["chrome-devtools__take_snapshot"].input_schema["required"] == ["pageId"]
 
 
@@ -4374,8 +4434,9 @@ def test_a_call_without_the_stripped_argument_still_works_normally():
     snapshot, selected = asyncio.run(scenario())
 
     assert snapshot.status == "ok"
-    # No filePath reached the server, so nothing was written anywhere.
-    assert snapshot.content == "WROTE-SNAPSHOT-TO:"
+    # No filePath reached the server, so nothing was written anywhere --
+    # and pageId, which IS required, went through untouched.
+    assert snapshot.content == "SNAPSHOT-OF-PAGE:1:WROTE-SNAPSHOT-TO:"
     assert selected.status == "ok"
     assert selected.content == "selected 3 front=False"
 
@@ -4577,3 +4638,405 @@ def test_blocked_browser_tools_are_unreachable_through_call_raw_too():
             await servers.close()
 
     asyncio.run(scenario())
+
+
+# --- DD-8 Part B: allow_args ------------------------------------------------
+
+
+def _allow_server() -> FastMCP:
+    """A server that offers MORE than the allowlist pins -- the upstream
+    addition strip_args could never have caught."""
+    server = FastMCP("test-allow")
+
+    @server.tool(description="Snapshot the page.")
+    def take_snapshot(verbose: bool = False, newUpstreamThing: str = "") -> str:
+        return f"snapshot verbose={verbose} new={newUpstreamThing}"
+
+    return server
+
+
+def _allow_config(allow=("verbose",)):
+    return {
+        "servers": {"demo": {
+            "command": "unused",
+            "expose": ["take_snapshot"],
+            "instant": ["take_snapshot"],
+            "allow_args": {"take_snapshot": list(allow)},
+        }},
+        "defaults": {"call_timeout_s": 5, "connect_timeout_s": 1},
+    }
+
+
+def test_a_property_the_allowlist_does_not_pin_never_reaches_the_model_snapshot():
+    """Enforcement point one. schemas() is exactly what Brain serializes into
+    the prompt prefix, so this is the assertion that the model never learns
+    the new property exists."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _allow_config(), session_factory=_memory_factory(_allow_server()),
+        )
+        await servers.connect(registry)
+        try:
+            return registry.schemas()
+        finally:
+            await servers.close()
+
+    schemas = asyncio.run(scenario())
+
+    properties = schemas[0]["input_schema"]["properties"]
+    assert set(properties) == {"verbose"}
+
+
+def test_an_unpinned_property_supplied_anyway_is_refused_not_dropped():
+    """Refuse, not silently strip, for the reason strip_args already gave:
+    dropping an argument reports success for a call Atlas quietly changed --
+    and here the host does not even know what the argument would have done."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _allow_config(), session_factory=_memory_factory(_allow_server()),
+        )
+        await servers.connect(registry)
+        try:
+            through_registry = await registry.call(
+                "demo__take_snapshot", {"newUpstreamThing": "x"},
+            )
+            with pytest.raises(McpToolError, match="argument not available"):
+                await servers.call_raw(
+                    "demo", "take_snapshot", {"newUpstreamThing": "x"},
+                )
+            clean = await registry.call("demo__take_snapshot", {"verbose": True})
+        finally:
+            await servers.close()
+        return through_registry, clean
+
+    refused, clean = asyncio.run(scenario())
+
+    assert refused.status == "error"
+    assert refused.content == "argument not available: newUpstreamThing"
+    assert clean.status == "ok"
+    assert "new=" in clean.content  # the server ran, with its own default
+
+
+def test_an_upstream_addition_is_named_loudly_rather_than_lost_silently(caplog):
+    """The failure this mechanism must not have is a silent capability LOSS
+    when upstream adds something benign. That is answered by this warning and
+    a human deciding -- not by letting the property through, because there is
+    no ordering that admits a benign addition without admitting a dangerous
+    one."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _allow_config(), session_factory=_memory_factory(_allow_server()),
+        )
+        await servers.connect(registry)
+        await servers.close()
+
+    with caplog.at_level(logging.WARNING, logger="worker.mcp_client"):
+        asyncio.run(scenario())
+
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any(
+        "offers unpinned properties on take_snapshot" in message
+        and "newUpstreamThing" in message
+        for message in warnings
+    ), warnings
+
+
+def test_an_allowlisted_name_the_server_stopped_offering_is_named_too(caplog):
+    """The inverse, and the one that actually breaks a capability: an upstream
+    RENAME means the renamed property is now refused with nothing else saying
+    so."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _allow_config(allow=("verbose", "renamedAway")),
+            session_factory=_memory_factory(_allow_server()),
+        )
+        await servers.connect(registry)
+        await servers.close()
+
+    with caplog.at_level(logging.WARNING, logger="worker.mcp_client"):
+        asyncio.run(scenario())
+
+    assert any(
+        "allow_args names not offered by take_snapshot" in record.getMessage()
+        and "renamedAway" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_the_account_parameter_is_exempt_because_the_host_supplies_it_itself():
+    cfg = {"account_param": "user_google_email", "allow_args": {"send": ["to"]}}
+    tool = _mcp.McpServers({"servers": {}, "defaults": {}})._mirror_tool(
+        "google", cfg, {}, SimpleNamespace(),
+        SimpleNamespace(
+            name="send", description="Send.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_google_email": {"type": "string"},
+                    "to": {"type": "string"},
+                    "bcc": {"type": "string"},
+                },
+                "required": ["user_google_email", "to"],
+            },
+        ),
+    )
+    assert set(tool.input_schema["properties"]) == {"to"}
+    assert tool.input_schema["required"] == ["to"]
+    assert tool.allowed_arguments == frozenset({"to"})
+
+
+def test_a_name_in_both_strip_args_and_allow_args_is_a_load_error():
+    """A config edit that quietly re-permits exactly what the strip exists to
+    remove. It cannot be resolved by precedence -- whichever wins, the other
+    line is a lie."""
+    cfg = {
+        "strip_args": {"take_snapshot": ["filePath"]},
+        "allow_args": {"take_snapshot": ["verbose", "filePath"]},
+    }
+    with pytest.raises(ValueError, match="also in strip_args"):
+        _mcp._tool_allowed_arguments(cfg, "take_snapshot")
+
+
+def test_a_tool_with_no_allow_args_entry_is_unpinned_rather_than_locked_shut():
+    assert _mcp._tool_allowed_arguments({}, "anything") is None
+    assert _mcp._tool_allowed_arguments(
+        {"allow_args": {"other": ["x"]}}, "anything",
+    ) is None
+
+
+def test_an_empty_allow_args_list_is_legal_and_pins_a_zero_property_tool():
+    """The one list in this file where empty is legal. It is the only way to
+    pin list_allowed_directories or list_pages, which otherwise have nothing
+    for a future upstream property to be checked against."""
+    assert _mcp._tool_allowed_arguments(
+        {"allow_args": {"list_pages": []}}, "list_pages",
+    ) == frozenset()
+
+
+@pytest.mark.parametrize("value", ["path", 7, ["path", "path"], ["", "x"], [7]])
+def test_a_malformed_allow_args_value_raises(value):
+    with pytest.raises(ValueError, match="allow_args"):
+        _mcp._tool_allowed_arguments({"allow_args": {"x": value}}, "x")
+
+
+def test_a_malformed_allow_args_map_raises():
+    with pytest.raises(ValueError, match="allow_args"):
+        _mcp._tool_allowed_arguments({"allow_args": ["x"]}, "x")
+
+
+# --- DD-8 Part B: the checked-in configuration ------------------------------
+
+
+def test_the_checked_in_chrome_config_pins_every_exposed_tool():
+    """chrome-devtools is spawned from ~/.claude.json and is NOT
+    version-pinned, so an upstream release adding a property to any exposed
+    tool is mirrored into the model's snapshot with nothing refusing it. That
+    already happened once, unnoticed, and is how filePath and initScript
+    reached the model. Every exposed tool must therefore carry an allowlist --
+    including the ones that take no arguments today."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["chrome-devtools"]
+    exposed = set(server["expose"])
+    assert set(server["allow_args"]) == exposed, sorted(
+        exposed ^ set(server["allow_args"])
+    )
+
+
+def test_the_checked_in_files_config_pins_every_exposed_tool():
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["files"]
+    assert set(server["allow_args"]) == set(server["expose"])
+
+
+def test_the_checked_in_google_config_pins_the_two_sends_and_says_why():
+    """PARTIAL by decision: google is version-pinned, so the allowlist is
+    spent where the blast radius is -- the two tools that put mail in the
+    world. Notably from_email, a Send-As alias that readback_keys never
+    names."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    server = config["servers"]["google"]
+    assert set(server["allow_args"]) == {
+        "send_gmail_message", "draft_gmail_message",
+    }
+    for tool in ("send_gmail_message", "draft_gmail_message"):
+        allowed = set(server["allow_args"][tool])
+        assert "from_email" not in allowed
+        assert "from_name" not in allowed
+        assert "references" not in allowed
+        # ...and every argument the host's own describe: text teaches is kept,
+        # or the description would be promising an argument the host refuses.
+        assert {"to", "cc", "subject", "body", "thread_id", "in_reply_to",
+                "quote_original", "attachments"} <= allowed
+
+
+def test_the_kb_bridge_is_deliberately_left_unpinned():
+    """First-party, version-locked to the checkout Daniel controls, curated
+    server-side with no expose:. An allowlist for 32 first-party tools would
+    be config with no adversary."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    assert "allow_args" not in config["servers"]["kb"]
+
+
+def test_the_checked_in_chrome_allowlist_matches_the_real_server_exactly(caplog):
+    """The pin, checked against the fixture that mirrors chrome-devtools-mcp
+    1.4.0's real tools/list output. If either side drifts -- someone edits
+    allow_args, or upstream's shape changes and the fixture is updated to
+    match -- one of the two connect-time warnings fires and this fails."""
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _dd7_browser_config(),
+            session_factory=_memory_factory(_dd7_browser_server()),
+        )
+        await servers.connect(registry)
+        await servers.close()
+
+    with caplog.at_level(logging.WARNING, logger="worker.mcp_client"):
+        asyncio.run(scenario())
+
+    drift = [
+        record.getMessage() for record in caplog.records
+        if "unpinned properties" in record.getMessage()
+        or "allow_args names not offered" in record.getMessage()
+    ]
+    assert drift == [], drift
+
+
+# --- DD-8 rework: the allowlist must not amputate a REQUIRED property -------
+
+
+def test_a_page_scoped_tool_is_callable_end_to_end_with_the_allowlist_applied():
+    """The test whose absence was the real defect.
+
+    Every other allow_args test asserted on what the allowlist REMOVES. None
+    asserted that what it keeps is still enough to make a call, so an
+    allowlist that stripped `pageId` -- required on nine of the thirteen
+    browser tools -- passed a green suite. This goes the whole way: the
+    property survives into the model-facing schema, the model can supply it,
+    the host does not refuse it, and the server accepts and answers.
+    """
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _dd7_browser_config(),
+            session_factory=_memory_factory(_dd7_browser_server()),
+        )
+        await servers.connect(registry)
+        try:
+            schema = registry._tools["chrome-devtools__take_snapshot"].input_schema
+            return schema, await registry.call(
+                "chrome-devtools__take_snapshot", {"pageId": 7, "verbose": True},
+            )
+        finally:
+            await servers.close()
+
+    schema, result = asyncio.run(scenario())
+
+    # The model can see the argument it is required to send...
+    assert "pageId" in schema["properties"]
+    assert schema["required"] == ["pageId"]
+    # ...the host does not refuse it...
+    assert result.status == "ok", result.content
+    # ...and it reached the server, which is the half a schema assertion alone
+    # can never prove.
+    assert result.content.startswith("SNAPSHOT-OF-PAGE:7:")
+
+
+def test_a_confirm_tier_page_scoped_tool_survives_the_whole_readback_and_yes():
+    """The worse failure mode, pinned separately.
+
+    On an instant tool a broken allowlist is a refusal Daniel hears
+    immediately. On a confirm-tier one the host mints a pending action, reads
+    it back, takes Daniel's yes, and only THEN does the server reject the call
+    for a missing required argument -- an action he approved that never
+    happened. So the confirm path gets its own end-to-end proof.
+    """
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _dd7_browser_config(),
+            session_factory=_memory_factory(_dd7_browser_server()),
+        )
+        await servers.connect(registry)
+        try:
+            proposed = await registry.call(
+                "chrome-devtools__press_key", {"pageId": 3, "key": "Enter"},
+            )
+            pending = registry.pending
+            confirmed = await registry.confirm(pending.confirm_id)
+            return proposed, pending, confirmed
+        finally:
+            await servers.close()
+
+    proposed, pending, confirmed = asyncio.run(scenario())
+
+    assert proposed.status == "needs_confirmation"
+    # The readback names the page as well as the key: an approval that did not
+    # say which page it acts on is not an approval Daniel could have checked.
+    assert "pageId: 3" in pending.summary and "key: Enter" in pending.summary
+    assert confirmed.status == "ok", confirmed.content
+    assert confirmed.content == "pressed Enter"
+
+
+def test_no_allowlist_anywhere_amputates_a_property_its_server_requires():
+    """The general invariant, applied to every mirrored tool on every server.
+
+    This is the assertion that generalises the pageId bug instead of just
+    fixing it. An allow_args entry that omits a name the server marks
+    `required` produces a tool the model is structurally unable to call
+    correctly -- the property is cut from the schema it reads AND refused if
+    it sends it anyway -- and no amount of testing what the allowlist removes
+    will ever notice.
+    """
+    async def scenario():
+        registry = ToolRegistry()
+        servers = McpServers(
+            _dd7_browser_config(),
+            session_factory=_memory_factory(_dd7_browser_server()),
+        )
+        await servers.connect(registry)
+        offered = {
+            tool.name: tool.inputSchema
+            for tool in (await servers._sessions["chrome-devtools"].list_tools()).tools
+        }
+        registered = dict(registry._tools)
+        await servers.close()
+        return offered, registered
+
+    offered, registered = asyncio.run(scenario())
+
+    for name, tool in registered.items():
+        allowed = tool.allowed_arguments
+        if allowed is None:
+            continue
+        remote = name.split("__", 1)[1]
+        required = set(offered[remote].get("required", []))
+        # strip_args removing a required property would be the same amputation
+        # by the other mechanism, so it is checked here too rather than
+        # trusted to be deliberate.
+        assert not (required - allowed), (name, sorted(required - allowed))
+        assert not (required & tool.refused_arguments), name
+
+
+def test_the_checked_in_browser_allowlist_covers_page_id_on_every_scoped_tool():
+    """A config-level restatement, so the nine names are pinned by list and a
+    future edit that drops one is a visible diff rather than a live failure."""
+    config = load_mcp_config(Path(__file__).parents[1] / "config" / "mcp.yaml")
+    allow = config["servers"]["chrome-devtools"]["allow_args"]
+    page_scoped = (
+        "click", "fill", "fill_form", "navigate_page", "press_key",
+        "take_screenshot", "take_snapshot", "type_text", "wait_for",
+    )
+    for name in page_scoped:
+        assert "pageId" in allow[name], name
+    # The four that are NOT page-scoped must not gain a phantom pageId: three
+    # carry one in their own schema and list_pages takes nothing at all.
+    assert "pageId" in allow["select_page"] and "pageId" in allow["close_page"]
+    assert "pageId" not in allow["new_page"]
+    assert allow["list_pages"] == []
+    # And the name no released version offers stays out.
+    assert "includeSnapshot" not in allow["type_text"]

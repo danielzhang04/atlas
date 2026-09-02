@@ -138,6 +138,35 @@ _TAINT_REFUSAL_HANDLE = (
     "refused after external content; use a handle from an earlier find_file "
     "result in this turn, or ask Daniel again next turn"
 )
+# A non-allowlisted argument name comes from the MODEL, not from config, so it
+# is the one refusal message whose contents Atlas did not author. Echoing it is
+# worth doing -- the model has to know which key to drop -- but only through a
+# closed shape: identifier characters, bounded length, bounded count, and a
+# plain "..." for anything that fails. Rule 10 applies to what is logged; this
+# is the same discipline applied to what is spoken back.
+_ARGUMENT_NAME_SHAPE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+_UNPINNED_NAME_LIMIT = 5
+
+
+def _unpinned_argument_names(
+    arguments: Mapping[str, Any],
+    allowed: frozenset[str],
+) -> list[str]:
+    """Supplied argument names that are not on the pinned allowlist."""
+    offending = sorted(
+        str(name) for name in arguments if str(name) not in allowed
+    )
+    if not offending:
+        return []
+    listed = [
+        name if _ARGUMENT_NAME_SHAPE.match(name) else "..."
+        for name in offending[:_UNPINNED_NAME_LIMIT]
+    ]
+    if len(offending) > _UNPINNED_NAME_LIMIT:
+        listed.append(f"and {len(offending) - _UNPINNED_NAME_LIMIT} more")
+    return listed
+
+
 _UNKNOWN_HANDLE = (
     "unknown handle; call find_file first and use a handle from its results"
 )
@@ -262,6 +291,24 @@ class Tool:
     # for the authoritative refusal at the session boundary, which covers
     # call_raw too.
     refused_arguments: frozenset[str] = frozenset()
+    # The pinned, reviewed set of argument names this tool may be called with
+    # (config/mcp.yaml allow_args:). None means no allowlist is configured and
+    # the tool accepts whatever its schema describes -- the pre-DD-8 behavior,
+    # and the right default for a tool nobody has reviewed property-by-property.
+    #
+    # This is the INVERSE of refused_arguments, and it exists because that set
+    # only catches what a reviewer already named. strip_args notices upstream
+    # RENAMING a dangerous property (the connect-time "names not offered"
+    # warning), but nothing noticed upstream ADDING one -- which is exactly how
+    # filePath and initScript reached the model in the first place, on a server
+    # that is spawned from ~/.claude.json and is not version-pinned.
+    #
+    # Enforced twice, like refused_arguments: the non-allowlisted property is
+    # filtered out of the mirrored schema, and refused here before the policy
+    # branch. See mcp_client._tool_allowed_arguments for the authoritative
+    # refusal at the session boundary, which covers call_raw too, and for why
+    # this refuses rather than silently drops.
+    allowed_arguments: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,6 +689,15 @@ class ToolRegistry:
                 if refused:
                     return ToolResult(
                         "error", f"argument not available: {', '.join(refused)}",
+                    )
+            # The allowlist runs immediately after, and returns the SAME
+            # sentence: which of the two walls stopped a call is Atlas's
+            # business, not something the model needs to reason about.
+            if tool.allowed_arguments is not None:
+                unpinned = _unpinned_argument_names(arguments, tool.allowed_arguments)
+                if unpinned:
+                    return ToolResult(
+                        "error", f"argument not available: {', '.join(unpinned)}",
                     )
             if tool.policy == "confirm" and self.pending is not None:
                 _record_refusal(name, "collision")
