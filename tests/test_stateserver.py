@@ -1556,9 +1556,14 @@ def test_text_turn_response_projects_existing_pending_confirmation():
 
     response = asyncio.run(scenario())
 
+    # The readback is projected to the desktop card exactly as it is spoken:
+    # one field per line. ui/styles.css sets white-space: pre-line on the card
+    # so the browser keeps those breaks instead of collapsing them into a
+    # single line, which would let a value forge a field boundary visually
+    # even though it cannot forge one audibly.
     assert json.loads(response[2]) == {
         "ok": True,
-        "pending": {"readback": "confirm_action - target: report"},
+        "pending": {"readback": "confirm_action\ntarget: report"},
     }
 
 

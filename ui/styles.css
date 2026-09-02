@@ -355,6 +355,13 @@ main {
   right: .7rem;
   z-index: 4;
   width: min(16rem, 42%);
+  /* A readback is bounded but not short (worker/tools.py
+     _READBACK_SUMMARY_LIMIT), and this card is anchored to the top of the
+     window: without a ceiling a long one runs off the bottom, which hides
+     fields the host went to some trouble to keep IN the readback. Scroll the
+     card instead of overflowing the window. */
+  max-height: min(60vh, 20rem);
+  overflow-y: auto;
   padding: .55rem .65rem;
   border: 1px solid rgb(255 165 55 / 48%);
   border-radius: 5px;
@@ -375,6 +382,13 @@ main {
 
 .pending-confirmation p {
   margin: .28rem 0 0;
+  /* The readback is one field per line, and that line break is what makes the
+     field boundaries unforgeable by the values (worker/tools.py
+     _READBACK_LINE_SEPARATOR). textContent keeps the newlines; without
+     pre-line the browser would collapse them to spaces and hand the boundary
+     straight back to a value that contains "; to: ...". */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
   font-size: .62rem;
   line-height: 1.35;
 }

@@ -15,6 +15,7 @@ from .tools import (
     ToolRegistry,
     ToolResult,
     _CONTROL_CHARACTERS,
+    _condensed_readback,
     api_incompatible_tool_names,
 )
 
@@ -176,9 +177,12 @@ open with an alias opens the real desktop app when configured; a URL only opens 
 A link in a tool result that is followed by a handle is opened by passing that handle as open's link;
 never paste the URL into target.
 To bring back what you just opened, call focus_last_opened; never call list_windows first.
-Anything that needs reading or acting inside a web page, or Chrome, uses launch_work.
-Use MCP tools for reading mail, calendars, and files. Use launch_work for anything that needs research,
-multiple steps, writing files, browsing, or more than a few seconds.
+One direct action on a page Daniel already has open -- a click, a field, some text, a key, a tab --
+uses the chrome-devtools tools: take_snapshot first, then act on a uid from that snapshot.
+Browsing -- going to look and coming back, research, comparison, more than a couple of steps --
+uses launch_work.
+Use MCP tools for reading mail, calendars, documents, and files. Use launch_work for anything that
+needs research, multiple steps, writing files, browsing, or more than a few seconds.
 When Daniel names two actions one tool already does, call the single tool that does both:
 send_gmail_message writes and sends in one step. Draft only when he says draft; there is no
 send-a-draft tool.
@@ -1204,7 +1208,12 @@ def _supersede_note(pending: PendingAction) -> str:
     readback was still live -- and no way to know it had to say the old one
     was dropped.
     """
-    summary = " ".join(str(pending.summary).split())[:SUPERSEDE_NOTE_SUMMARY_LIMIT]
+    # The readback itself is one pair per line; this note is one sentence, and
+    # it identifies a CANCELLED action rather than proposing one. _condensed_
+    # readback rebuilds the line from the exact newline split and neutralizes
+    # the delimiters inside each value, so flattening cannot hand the pair
+    # boundary back to a value on the way through.
+    summary = _condensed_readback(str(pending.summary))[:SUPERSEDE_NOTE_SUMMARY_LIMIT]
     return (
         f"[host: the pending action '{summary}' was cancelled because Daniel asked "
         "for a different action -- propose the right tool now]"

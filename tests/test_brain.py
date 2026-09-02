@@ -2137,7 +2137,21 @@ def test_base_system_routes_file_analysis_and_mail_counts_to_the_safe_tools():
         "call launch_work with the exact path."
     ) in BASE_SYSTEM
     assert "closes every window" in BASE_SYSTEM
-    assert "reading or acting inside a web page, or Chrome, uses launch_work" in BASE_SYSTEM
+    # DD-7 replaced "anything ... inside a web page, or Chrome, uses
+    # launch_work" with the boundary the connector tranche actually draws.
+    # The old sentence contradicted the seven browser actions now exposed --
+    # the model would have been told to route every one of them away. The new
+    # split is: ONE direct action on a page Daniel already has open goes
+    # through chrome-devtools; BROWSING (go look, come back, multiple steps)
+    # still goes to launch_work, which is rule 2 -- there is no agentic browse
+    # loop in the worker and the model must not build one out of these tools.
+    assert (
+        "One direct action on a page Daniel already has open -- a click, a field, some text, a key, a tab --\n"
+        "uses the chrome-devtools tools: take_snapshot first, then act on a uid from that snapshot.\n"
+        "Browsing -- going to look and coming back, research, comparison, more than a couple of steps --\n"
+        "uses launch_work."
+    ) in BASE_SYSTEM
+    assert "or Chrome, uses launch_work" not in BASE_SYSTEM
     assert "unless the tool result for that call" in BASE_SYSTEM
     assert "do not narrate between tool calls" in BASE_SYSTEM
     assert "read every summary field back" in BASE_SYSTEM

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -541,6 +541,20 @@ def _tool_description(server_cfg: Mapping, remote_tool_name: str, remote_descrip
         override = describe[remote_tool_name]
         if not isinstance(override, str) or not override:
             raise ValueError("invalid MCP describe value")
+        if len(override) > _DESCRIPTION_LIMIT:
+            # _mirror_tool truncates to _DESCRIPTION_LIMIT, and for a REMOTE
+            # description that is fine -- upstream prose is padding past the
+            # first sentence. A host-authored override is not padding: every
+            # one of these ends with the confirm-gate promise ("the host reads
+            # those back and waits for Daniel's yes"), so a silent cut removes
+            # exactly the sentence that tells the model the tool is gated, in
+            # the description of the most dangerous tool on the server. An
+            # override that does not fit is a config bug and says so here
+            # rather than shipping half a sentence.
+            raise ValueError(
+                f"MCP describe override for {remote_tool_name} exceeds "
+                f"{_DESCRIPTION_LIMIT} characters"
+            )
         return override
     return remote_description
 
@@ -773,6 +787,83 @@ def _tool_content_bearing(server_cfg: Mapping, remote_tool_name: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError("invalid MCP content_bearing value")
     return value
+
+
+def _tool_readback_keys(server_cfg: Mapping, remote_tool_name: str) -> tuple[str, ...]:
+    """Argument names this tool's confirm readback must always name, in order.
+
+    See Tool.readback_keys. Declared per tool here rather than derived from the
+    remote schema's ``required`` list on purpose: the keys that matter to a
+    spoken yes (a send's recipient and subject) are exactly the ones
+    workspace-mcp leaves OPTIONAL, because it can derive them from a thread or
+    from the message being forwarded. Absent for a tool means no key is forced,
+    which is every tool but the Gmail sends today.
+    """
+    configured = server_cfg.get("readback_keys", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP readback_keys map")
+    if remote_tool_name not in configured:
+        return ()
+    keys = configured[remote_tool_name]
+    if (
+        isinstance(keys, (str, bytes))
+        or not isinstance(keys, (list, tuple))
+        or not keys  # an empty list is a config mistake, not "no keys"
+        or not all(isinstance(key, str) and key for key in keys)
+        or len(set(keys)) != len(keys)
+    ):
+        raise ValueError("invalid MCP readback_keys value")
+    return tuple(keys)
+
+
+def _tool_stripped_arguments(server_cfg: Mapping, remote_tool_name: str) -> frozenset[str]:
+    """Argument names removed from this tool's mirrored schema and refused.
+
+    ``strip_args:`` is the companion of ``blocked:``. blocked: removes a whole
+    remote TOOL; this removes a named ARGUMENT from a tool that is otherwise
+    worth having. It exists because a mirrored schema is passed through from
+    the remote server essentially untouched, so an upstream argument that
+    Atlas would never have designed rides in with it -- and the model sees it,
+    and can use it:
+
+      * take_snapshot/take_screenshot carry ``filePath``, "an absolute path to
+        save to instead of attaching it to the response". Both are instant, so
+        a single model assertion writes page-controlled text to any path on
+        the machine, around file_write_roots, around the files server's
+        write-only confinement and around localfiles' credential shield.
+      * navigate_page carries ``initScript``, JavaScript run in Daniel's
+        logged-in browser before any page script -- the same capability
+        evaluate_script is blocked: for, arriving as an argument instead of as
+        a tool. Confirm tier does not hold it: the readback would be a real
+        URL followed by a truncated wall of JavaScript, which is exact and
+        unanswerable.
+      * navigate_page carries ``handleBeforeUnload``, and select_page carries
+        ``bringToFront`` -- real-world side effects the model has no business
+        choosing.
+
+    Two enforcement points, both required. The schema strip (see _mirror_tool)
+    keeps the name out of the model's snapshot, which is what stops a
+    well-behaved model. This set is also handed to the Tool and re-checked at
+    _call_session, so a name supplied anyway -- by a model steered by content
+    it just read, or through call_raw -- is refused rather than forwarded.
+    Silently dropping it would be worse than refusing: the model would be told
+    the call succeeded as asked.
+    """
+    configured = server_cfg.get("strip_args", {})
+    if not isinstance(configured, Mapping):
+        raise ValueError("invalid MCP strip_args map")
+    if remote_tool_name not in configured:
+        return frozenset()
+    names = configured[remote_tool_name]
+    if (
+        isinstance(names, (str, bytes))
+        or not isinstance(names, (list, tuple))
+        or not names  # an empty list is a config mistake, not "strip nothing"
+        or not all(isinstance(name, str) and name for name in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("invalid MCP strip_args value")
+    return frozenset(names)
 
 
 def _server_domain(server_cfg: Mapping) -> str | None:
@@ -1396,10 +1487,33 @@ class McpServers:
         self, server_name, server_cfg, defaults, session, remote_tool, registry=None,
     ) -> Tool:
         timeout_s = float(defaults.get("call_timeout_s", 8))
-        schema = _without_account_parameter(
-            remote_tool.inputSchema,
-            server_cfg.get("account_param"),
+        stripped = _tool_stripped_arguments(server_cfg, remote_tool.name)
+        # Enforcement point 1: the dangerous property never reaches the model
+        # snapshot. Applied to the same schema object the account parameter is
+        # removed from, so a stripped name is gone from `properties` AND from
+        # `required` before Brain.schemas() ever serializes it.
+        schema = _without_arguments(
+            _without_account_parameter(
+                remote_tool.inputSchema,
+                server_cfg.get("account_param"),
+            ),
+            stripped,
         )
+        # A strip_args entry the server does not actually offer is the same
+        # failure mode expose: warns about, and a worse one: chrome-devtools is
+        # spawned from ~/.claude.json and is NOT version-pinned, so an upstream
+        # rename (filePath -> path) would silently un-strip the argument and
+        # put the capability back with nothing saying so. Names only, bounded
+        # by the config itself (rule 10).
+        if stripped:
+            offered = remote_tool.inputSchema.get("properties")
+            if isinstance(offered, Mapping):
+                absent = sorted(stripped - frozenset(offered))
+                if absent:
+                    _LOGGER.warning(
+                        "MCP server %s strip_args names not offered by %s: %s",
+                        server_name, remote_tool.name, ", ".join(absent),
+                    )
         description = _tool_description(server_cfg, remote_tool.name, remote_tool.description or "")
         transform = _tool_transform(server_cfg, remote_tool.name)
         links = _link_extraction(server_cfg) if registry is not None else None
@@ -1439,6 +1553,8 @@ class McpServers:
             domain=_server_domain(server_cfg),
             content_bearing=_tool_content_bearing(server_cfg, remote_tool.name),
             escalate=_compile_instant_when(server_cfg, remote_tool.name),
+            readback_keys=_tool_readback_keys(server_cfg, remote_tool.name),
+            refused_arguments=stripped,
         )
 
     async def call_raw(
@@ -1470,6 +1586,15 @@ class McpServers:
     ) -> str:
         if tool in _blocked_tools(server_cfg):
             raise McpToolError("unknown MCP tool")
+        # Enforcement point 2, and the authoritative one: nothing reaches a
+        # remote server except through here, call_raw included. A stripped
+        # argument that arrived anyway is REFUSED, never dropped -- dropping it
+        # would report success for a call Atlas quietly changed.
+        stripped = _tool_stripped_arguments(server_cfg, tool)
+        if stripped:
+            supplied = sorted(stripped.intersection(arguments))
+            if supplied:
+                raise McpToolError(f"argument not available: {', '.join(supplied)}")
         call_arguments = dict(arguments)
         account_param = server_cfg.get("account_param")
         if account_param is not None:
@@ -1666,14 +1791,31 @@ def _normalize_recipients(arguments: Mapping[str, Any], account: str) -> dict[st
     return normalized
 
 
-def _without_account_parameter(schema: dict, account_param: Any) -> dict:
+def _without_arguments(schema: dict, names: Iterable[str]) -> dict:
+    """Drop named properties from a mirrored input schema, and from `required`.
+
+    One helper for both callers that need it: the account parameter the host
+    fills in itself, and strip_args' dangerous-argument removals. Removing a
+    name from `required` matters as much as removing the property -- a schema
+    that demands a property it no longer defines is one the model cannot
+    satisfy, which would take the whole tool down rather than just the
+    argument.
+    """
     mirrored = deepcopy(schema)
-    if not isinstance(account_param, str) or not account_param:
+    dropped = frozenset(name for name in names if isinstance(name, str) and name)
+    if not dropped:
         return mirrored
     properties = mirrored.get("properties")
     if isinstance(properties, dict):
-        properties.pop(account_param, None)
+        for name in dropped:
+            properties.pop(name, None)
     required = mirrored.get("required")
     if isinstance(required, list):
-        mirrored["required"] = [name for name in required if name != account_param]
+        mirrored["required"] = [name for name in required if name not in dropped]
     return mirrored
+
+
+def _without_account_parameter(schema: dict, account_param: Any) -> dict:
+    if not isinstance(account_param, str) or not account_param:
+        return deepcopy(schema)
+    return _without_arguments(schema, (account_param,))
