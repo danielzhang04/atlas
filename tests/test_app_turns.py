@@ -2186,7 +2186,9 @@ def test_a_reflex_open_reaches_the_models_history_so_later_pronouns_resolve():
     remembered = []
 
     brain = ReflexBrain(registry)
-    brain.remember_host_exchange = lambda said, spoken: remembered.append((said, spoken))
+    brain.remember_host_exchange = (
+        lambda said, spoken, tools=(): remembered.append((said, spoken, tools))
+    )
 
     session = FakeSession()
     engagement = Engagement(120)
@@ -2203,7 +2205,9 @@ def test_a_reflex_open_reaches_the_models_history_so_later_pronouns_resolve():
     ))
 
     assert brain.calls == []
-    assert remembered == [("atlas, open gmail", "Opening gmail. ")]
+    # DD-wave review, LOW-5: the tool this lane really ran travels with the
+    # exchange, so the filed turn is not an open with an empty tools column.
+    assert remembered == [("atlas, open gmail", "Opening gmail. ", ("open",))]
 
 
 def test_the_remembered_reflex_exchange_tells_the_model_it_did_not_act():

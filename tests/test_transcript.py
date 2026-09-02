@@ -971,6 +971,91 @@ def test_the_cancel_lane_raises_no_taint_of_its_own(tmp_path):
     assert rows[-1] == ("assistant", "Cancelled.", 0)
 
 
+def test_an_exchange_that_ends_with_a_live_pending_is_not_persisted(tmp_path):
+    """Amendment 6f. DD-wave review, MEDIUM-2.
+
+    PRIOR_SESSION_FRAME asserts as FACT that every line in the seed "was
+    already answered and already acted on". A turn that ends with the host's
+    single pending action still standing is the one shape where that is false:
+    Daniel heard a readback and never answered it, and the pending dies with
+    the process, so nothing ran. Nothing else catches it either -- the host
+    confirm-tier tools are not in _HOST_CONTENT_BEARING, so the row is
+    untainted and fully seed-eligible. The next boot would hand the model the
+    readback under an "already acted on" frame, and "did you delete it?" gets
+    a confident yes about a deletion that never happened.
+    """
+    store, _clock = _store(tmp_path, tool_names=lambda: ["press_delete"])
+    registry = ToolRegistry()
+
+    async def press_delete(_arguments):
+        return {"ok": True}
+
+    registry.register(Tool(
+        name="press_delete", description="d",
+        input_schema={"type": "object", "properties": {}},
+        run=press_delete, policy="confirm", content_bearing=False,
+    ))
+
+    async def readback_turn():
+        brain = Brain(FakeClient(
+            FakeStream([], content=[tool_block(name="press_delete", arguments={})],
+                       stop_reason="tool_use"),
+            FakeStream(["Delete the note in Notepad -- yes or no? "],
+                       content=[text_block("x")]),
+        ), registry, model="m", persona="", transcript_store=store)
+        return brain, [chunk async for chunk in brain.respond("delete that")]
+
+    brain, spoken = asyncio.run(readback_turn())
+
+    # The premise: a readback was produced and Daniel never answered it.
+    assert registry.pending is not None
+    assert "yes or no" in "".join(spoken)
+    # It is in THIS session's history, where the pending it refers to is real...
+    assert brain._history[0]["content"] == "delete that"
+    # ...and nowhere on disk, so it cannot come back under the frame's claim.
+    # Nothing was written at all: the store creates its file on first write,
+    # and this turn never reached one.
+    store.close()
+    assert not (tmp_path / "transcript.db").exists()
+    reopened, _clock = _store(tmp_path, tool_names=lambda: ["press_delete"])
+    assert reopened.seed_text() == ""
+    assert reopened.search("delete") == []
+    reopened.close()
+
+
+def test_the_reflex_host_note_never_reaches_the_store(tmp_path):
+    """Amendment 6g. DD-wave review, LOW-6.
+
+    REFLEX_HOST_NOTE is framing for a model about to read the next few turns.
+    Persisted, it came back at the next boot nested inside
+    PRIOR_SESSION_FRAME -- a framing about a framing -- out of a row labelled
+    'user' holding 60 words Daniel never said.
+    """
+    from worker.brain import REFLEX_HOST_NOTE
+
+    store, _clock = _store(tmp_path)
+    brain = Brain(object(), ToolRegistry(), model="m", persona="",
+                  transcript_store=store)
+
+    brain.remember_host_exchange("open gmail", "Opening gmail. ", ("open",))
+
+    # In memory, the note is there: the model must not read "Opening gmail."
+    # as a sentence it chose to say.
+    assert REFLEX_HOST_NOTE in brain._history[0]["content"]
+    store.close()
+    rows = _rows(tmp_path / "transcript.db")
+    assert [(role, text, tools) for _at, role, text, tools in rows] == [
+        ("user", "open gmail", ""),
+        # DD-wave review, LOW-5: the lane really did run a tool, and the
+        # store's contract is the names of the tools the turn touched.
+        ("assistant", "Opening gmail.", "open"),
+    ]
+    reopened, _clock = _store(tmp_path)
+    assert "host note" not in reopened.seed_text()
+    assert "open gmail" in reopened.seed_text()
+    reopened.close()
+
+
 def test_search_transcript_is_refused_after_external_content(tmp_path):
     """DD-4 rework, LOW-8: a free-text target does not survive the wall.
 

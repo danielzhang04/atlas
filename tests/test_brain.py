@@ -2652,7 +2652,8 @@ def test_supersede_cancels_the_pending_and_runs_the_ordinary_tool_lane(monkeypat
 
     result = asyncio.run(collect(brain, "Create the draft and send it"))
 
-    assert result == ["Sent."]
+    # The host's own cancellation clause leads, then the model's answer.
+    assert result == [brain_mod.SUPERSEDE_CANCELLED_CLAUSE, "Sent."]
     # The pending draft was dropped by the host, never executed...
     assert drafted == []
     assert registry.pending is None
@@ -2852,6 +2853,104 @@ def test_supersede_tells_the_model_what_the_host_did_without_touching_the_transc
     }
 
 
+def _supersede_registry(monkeypatch):
+    """A live registry holding one pending draft, ready to be superseded."""
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__draft_gmail_message",
+        lambda arguments: return_value("drafted"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value("sent"),
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe", lambda _length: "confirm-123",
+    )
+    asyncio.run(registry.call(
+        "google__draft_gmail_message", {"recipient": "d@example.test"},
+    ))
+    assert registry.pending is not None
+    return registry
+
+
+@pytest.mark.parametrize("said", [
+    # The model volunteers nothing about the dropped draft (live run 2)...
+    "Sending it now.",
+    # ...and the model says its own version of it (live run 1). Neither
+    # changes whether Daniel is told, and neither doubles the host's clause.
+    "Your draft request was cancelled since you'd rather send it outright.",
+])
+def test_the_host_speaks_the_supersede_cancellation_itself(monkeypatch, said):
+    """DD-wave review, MEDIUM-4.
+
+    Superseding destroys a readback Daniel is mid-answering. Two live runs of
+    the same scenario against the real model disclosed it once and skipped it
+    once, which is the whole argument: this wave's posture is that if the host
+    knows it, the host says it -- the same reason the reflex cancel branch in
+    worker/app.py speaks PENDING_CANCELLED_REPLY itself instead of asking for
+    it in the prompt.
+    """
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream([said], content=[text_block(said)]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    spoken = asyncio.run(collect(brain, "Create the draft and send it"))
+
+    # Said, first, before anything the model produced.
+    assert spoken[0] == brain_mod.SUPERSEDE_CANCELLED_CLAUSE
+    # And said exactly once: the host clause is not repeated, whatever the
+    # model chose to say after it.
+    assert spoken.count(brain_mod.SUPERSEDE_CANCELLED_CLAUSE) == 1
+    assert "".join(spoken).count(brain_mod.SUPERSEDE_CANCELLED_CLAUSE) == 1
+    # It is Daniel's to hear and the model's to have said, so it is what the
+    # next turn's history says Atlas said.
+    assert brain._history[1]["content"].startswith(
+        brain_mod.SUPERSEDE_CANCELLED_CLAUSE,
+    )
+
+
+def test_a_supersede_whose_model_says_nothing_is_still_an_empty_turn(monkeypatch):
+    """The host clause is a disclosure, not an answer.
+
+    It is deliberately kept out of `spoken` -- which is this generator's
+    record of what the MODEL said -- so a supersede that drops the pending
+    and then produces no reply still speaks EMPTY_TURN_REPLY. Daniel asked
+    for a new action and got none; hearing only "I've cancelled the action I
+    was waiting on" would leave that silence looking deliberate.
+    """
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream([], content=[text_block("")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    spoken = asyncio.run(collect(brain, "Create the draft and send it"))
+
+    assert spoken == [brain_mod.SUPERSEDE_CANCELLED_CLAUSE, EMPTY_TURN_REPLY]
+    # Both are in history, in the order Daniel heard them.
+    assert brain._history[1]["content"] == (
+        brain_mod.SUPERSEDE_CANCELLED_CLAUSE + EMPTY_TURN_REPLY
+    )
+
+
+def test_an_ordinary_turn_never_speaks_the_supersede_clause(monkeypatch):
+    """The other side of it: a plain confirm is not a supersede, and a turn
+    with no pending action at all must not apologise for cancelling one."""
+    registry = _supersede_registry(monkeypatch)
+    client = FakeClient(FakeStream(["Sent."], content=[text_block("Sent.")]))
+    brain = Brain(client, registry, model="fast", persona="")
+
+    # A yes to the pending draft: the narration lane, no cancellation.
+    spoken = asyncio.run(collect(brain, "yes go ahead and create the draft"))
+    assert brain_mod.SUPERSEDE_CANCELLED_CLAUSE not in spoken
+
+    client_two = FakeClient(FakeStream(["Sure."], content=[text_block("Sure.")]))
+    brain_two = Brain(client_two, ToolRegistry(), model="fast", persona="")
+    assert brain_mod.SUPERSEDE_CANCELLED_CLAUSE not in asyncio.run(
+        collect(brain_two, "what time is it"),
+    )
+
+
 def test_supersede_note_is_bounded():
     pending = _pending("mutate", {})
     oversized = PendingAction(
@@ -2864,22 +2963,49 @@ def test_supersede_note_is_bounded():
     assert len(quoted) == brain_mod.SUPERSEDE_NOTE_SUMMARY_LIMIT
 
 
-def test_supersede_records_the_cancellation_in_the_turn_trace(tmp_path):
-    """H3(b): a host decision that destroys a pending action leaves a row."""
+def test_supersede_records_exactly_one_cancellation_row(tmp_path, monkeypatch):
+    """H3(b) plus the DD-wave review's MEDIUM-1.
+
+    A host decision that destroys a pending action leaves a row -- ONE row,
+    written by ToolRegistry.cancel_pending, naming the tool that was dropped
+    and carrying detail='cancelled'.
+
+    The brain used to add a second row of its own for the same event, and it
+    was wrong three ways at once. `cancel_pending` is host-only, so it is not
+    in the recorder's tool allowlist: the row landed as name='other' (the
+    value a real boundary breach writes) with a NULL detail (the marker that
+    means "a real tool executed", so the health rollup counted a tool that
+    does not exist as a successful call), and it burned the once-per-process
+    boundary warning, leaving the next genuine breach silent.
+    """
     from worker import traces as traces_mod
 
-    registry = FakeRegistry(ToolResult("ok", "cancelled"))
-    registry._pending = PendingAction(
-        confirm_id="confirm-1",
-        name="google__draft_gmail_message",
-        arguments={"recipient": "d@example.test"},
-        summary="draft to d@example.test",
-        expires=float("inf"),
+    registry = ToolRegistry()
+    registry.register(registry_tool(
+        "google__draft_gmail_message",
+        lambda arguments: return_value("drafted"),
+        policy="confirm",
+    ))
+    registry.register(registry_tool(
+        "google__send_gmail_message",
+        lambda arguments: return_value("sent"),
+    ))
+    monkeypatch.setattr(
+        "worker.tools.secrets.token_urlsafe", lambda _length: "confirm-123",
     )
+    # Minted OUTSIDE the traced turn, so the only pending row below is the
+    # cancellation this turn causes.
+    asyncio.run(registry.call(
+        "google__draft_gmail_message", {"recipient": "d@example.test"},
+    ))
+    assert registry.pending is not None
+
     client = FakeClient(FakeStream(["Sending."], content=[text_block("Sending.")]))
     brain = Brain(client, registry, model="fast", persona="")
     recorder = traces_mod.TraceRecorder(
-        tmp_path / "traces.db", tool_names=("cancel_pending",), model_names=("fast",),
+        tmp_path / "traces.db",
+        tool_names=tuple(registry.names()),
+        model_names=("fast",),
     )
     turn = recorder.begin_turn(wake_kind="wake")
 
@@ -2896,8 +3022,14 @@ def test_supersede_records_the_cancellation_in_the_turn_trace(tmp_path):
 
     with sqlite3.connect(tmp_path / "traces.db") as connection:
         steps = connection.execute(
-            "SELECT kind,name FROM steps ORDER BY seq"
+            "SELECT kind,name,detail FROM steps WHERE kind='TOOL_CALL' ORDER BY seq"
         ).fetchall()
-    # Recorded under its real registered name, not the "other" bucket an
-    # unknown host string would fall into.
-    assert ("TOOL_CALL", "cancel_pending") in steps
+    # Exactly one row for one event, under the dropped tool's own registered
+    # name, and marked as a lifecycle event rather than an execution.
+    assert steps == [
+        ("TOOL_CALL", "google__draft_gmail_message", "cancelled"),
+    ]
+    assert not any(name == "other" for _kind, name, _detail in steps)
+    # And the one-shot boundary warning is still unspent, so the next genuine
+    # breach still logs.
+    assert recorder._warned_boundary is False

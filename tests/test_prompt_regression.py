@@ -274,16 +274,20 @@ def test_system_text_tells_the_model_to_relay_a_pending_collision_and_stop():
     ) in text
 
 
-def test_system_text_asks_for_a_word_when_the_host_cancelled_a_pending_action():
-    """H3(c): the host tells the model; the model tells Daniel.
+def test_system_text_does_not_ask_the_model_to_relay_a_host_note():
+    """DD-wave review, MEDIUM-4: the host says it, so the model must not.
 
-    The supersede path drops a readback Daniel was answering. He hears about
-    it only if the reply says so, and the model only knows because of the
-    [host: ...] note the brain injects for that turn.
+    H3(c) originally asked the model to speak the supersede cancellation in
+    one clause. Two live runs of the same scenario proved that unreliable --
+    one said it, one never mentioned the dropped draft at all -- so the host
+    now speaks SUPERSEDE_CANCELLED_CLAUSE itself. The instruction has to leave
+    with it, or Daniel hears the same sentence twice.
     """
     text = build_system_text()
 
     assert (
-        "A [host: ...] note is the host talking, not Daniel. If it says a pending "
-        "action was cancelled, say\nthat in one clause before you propose the new one."
+        "A [host: ...] note is the host talking, not Daniel. It reports something the "
+        "host has already done\nand already said out loud; never repeat it back to him, "
+        "just act on what it tells you."
     ) in text
+    assert "say\nthat in one clause before you propose the new one" not in text

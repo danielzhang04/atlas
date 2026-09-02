@@ -1067,8 +1067,16 @@ def _match_reflex_open(text: str, registry) -> router.OpenReflex | None:
     return match
 
 
-async def _run_reflex_open(match: router.OpenReflex, registry) -> str:
-    """Run one host-resolved open and return the sentence to say about it."""
+async def _run_reflex_open(match: router.OpenReflex, registry) -> tuple[str, str]:
+    """Run one host-resolved open; return the tool it ran and what to say.
+
+    The NAME comes back with the sentence because the turn is filed into
+    history and into the transcript store by the caller, and the store's
+    contract is the names of the tools the turn touched (worker/transcript
+    module docstring). A reflex turn really did run one -- reporting an empty
+    tools column for it would make an open indistinguishable from small talk
+    (DD-wave review, LOW-5).
+    """
     # A reflex turn is still a turn. brain.respond is what normally resets the
     # per-turn handle table, and skipping the brain must not quietly extend a
     # previous turn's handles across this one -- "handles live for exactly one
@@ -1080,10 +1088,10 @@ async def _run_reflex_open(match: router.OpenReflex, registry) -> str:
     result = await registry.call(name, arguments)
     if match.kind == "last":
         if result.status == "ok":
-            return REFLEX_BROUGHT_BACK
+            return name, REFLEX_BROUGHT_BACK
         if result.content == tools_mod.NOTHING_RECENTLY_OPENED:
-            return REFLEX_NOTHING_TO_BRING_BACK
-        return REFLEX_BRING_BACK_FAILED
+            return name, REFLEX_NOTHING_TO_BRING_BACK
+        return name, REFLEX_BRING_BACK_FAILED
     if result.status != "ok":
         # The host refused or failed, so nothing is on screen and saying
         # "Opening X" would be a lie. The turn does NOT fall through to the
@@ -1091,10 +1099,10 @@ async def _run_reflex_open(match: router.OpenReflex, registry) -> str:
         # a worse answer than an honest short one, and the trace already
         # carries the failed TOOL_CALL row for anyone asking why.
         logger.info("reflex open did not succeed (kind=%s)", match.kind)
-        return REFLEX_OPEN_FAILED.format(name=match.name)
+        return name, REFLEX_OPEN_FAILED.format(name=match.name)
     if result.content == tools_mod.FOCUSED_EXISTING_WINDOW:
-        return REFLEX_ALREADY_OPEN.format(name=match.name)
-    return REFLEX_OPENING.format(name=match.name)
+        return name, REFLEX_ALREADY_OPEN.format(name=match.name)
+    return name, REFLEX_OPENING.format(name=match.name)
 
 
 async def _handle_reflex(
@@ -1128,14 +1136,15 @@ async def _handle_reflex(
         # previous answer.
         session.interrupt()
         publisher.add_line("user", text, source=source)
-        line = await _run_reflex_open(open_match, registry)
+        tool_name, line = await _run_reflex_open(open_match, registry)
         await session.say(line, add_to_chat_ctx=False)
         publisher.add_line("atlas", line)
         # The model never saw this turn (see Brain.remember_host_exchange):
         # without the exchange in its history, the next "close that" resolves
-        # to the turn BEFORE this one.
+        # to the turn BEFORE this one. The tool name travels with it so the
+        # filed turn says which tool it ran, the same as every model turn.
         if remember is not None:
-            remember(text, line)
+            remember(text, line, (tool_name,))
         if on_spoken is not None:
             on_spoken()
         return True

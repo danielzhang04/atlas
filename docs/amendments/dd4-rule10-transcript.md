@@ -34,7 +34,10 @@ Two rows per exchange, in one SQLite file:
 | `tainted` | whether that turn had read outside content — see §6b                        |
 
 `text` is the utterance as the brain already remembers it: what Daniel said, and the concatenation
-of what Atlas actually spoke back. Nothing more is derived from it and nothing else is written.
+of what Atlas actually spoke back. Nothing more is derived from it and nothing else is written. The
+one place the store deliberately holds **less** than the brain's own history is the reflex-open
+lane, whose host-authored framing note stays in memory (§6g); and one shape is not written at all,
+the turn that ended with an unanswered readback (§6f).
 
 `tools` is names only. The name in a turn's evidence is the name the *model* asked for — a refused
 call still leaves one behind — so each is checked against `ToolRegistry.names()` at write time and
@@ -590,6 +593,57 @@ conversation could not be read — this is a failure of the store, not an empty 
 the failure in front of Daniel in the channel he is actually using. Pinned by
 `test_a_broken_store_says_so_instead_of_answering_nothing_matched`.
 
+### 6f. An UNCONFIRMED readback is not persisted at all
+
+The seed frame does not merely present prior conversation, it makes a **claim** about it: "every
+line was already answered and already acted on". For almost every turn that is true, because a turn
+ends when Atlas has finished doing the thing. It is false for exactly one shape — a turn that ended
+with the host's single pending action still standing.
+
+The shape, end to end. Daniel says "delete that". A confirm-tier tool returns `needs_confirmation`,
+the host mints the pending, Atlas reads the action back and asks for a yes or no. Daniel closes the
+window without answering. Rule 5 holds perfectly: the pending is in memory, it dies with the
+process, and **nothing was executed**. But the exchange was already filed, and — for the host
+confirm-tier tools — filed clean: `_HOST_CONTENT_BEARING` is `{list_windows, read_file,
+search_transcript}`, so `press_delete` and `window_action(close)` raise no taint, `context` is
+normally `None` so `tainted=bool(context)` is `False`, and §6b's wall lets it through. At the next
+boot the model is handed "delete that" and Atlas's readback of it, under a frame asserting both
+were already acted on. Ask "did you delete it?" and get a confident yes about a deletion that never
+happened — which is worse than an admitted gap, because it is the model's own history telling it so.
+
+**The host already knows.** At `Brain._remember` time, `registry.pending` is either set or it is
+not, and set means precisely "this turn ended in a question Daniel has not answered". So the
+exchange is **not written to the store**. It stays in this session's in-memory history, where the
+pending it refers to is still real, and it is gone at the next boot along with the pending itself —
+which is the honest state of affairs, because the two only make sense together.
+
+Not persisted rather than persisted-and-flagged, deliberately. A flag has to be read correctly by
+`seed_text`, by `search_transcript`, and by whatever reads the store next; an unanswered readback
+has no content that survives the session anyway; and the failure mode of a missed flag is the
+confident-false-yes above. This is a small, deliberate hole in the record — a readback Daniel never
+answered leaves no trace on disk — and it is listed in the sign-off as such.
+
+Pinned by `test_an_exchange_that_ends_with_a_live_pending_is_not_persisted`.
+
+### 6g. The reflex host note is not persisted
+
+`REFLEX_HOST_NOTE` (§ `Brain.remember_host_exchange`) is a ~60-word block the host appends to the
+user side of a reflex-open turn, telling the model that the host answered this one from its own
+vocabulary, that the reply is the host's words and not the model's, and that it may never say a
+line like it without calling the tool. It is framing for a model about to read the next few turns.
+
+It is **in-memory only**. Persisting it put a paragraph Daniel never said into a row labelled
+`user`, and returned it at the next boot nested inside `PRIOR_SESSION_FRAME` — a framing wrapped in
+another framing, describing a session that had already ended. The store is handed his words alone.
+
+The same lane also now files the **name of the tool it ran** (`open`, `open_folder`,
+`focus_last_opened`). §1 says `tools` holds the names of the tools the turn touched, and a reflex
+open touches one; an empty column there made a turn that opened a window look like small talk. It
+stays **untainted** — all three are host tools and none is content-bearing.
+
+Pinned by `test_the_reflex_host_note_never_reaches_the_store` and
+`test_a_reflex_open_reaches_the_models_history_so_later_pronouns_resolve`.
+
 ## 7. The flag
 
 `config/atlas.yaml`:
@@ -724,6 +778,11 @@ for extra lazily-initialised state, which is not a trade worth making inside a r
       reads: `search_transcript` cannot share a turn with an action tool in either order.
 - [ ] Daniel has read **§6d** and accepts that file NAMES from disk stay untainting, and therefore
       seedable into the next boot, for thirty days rather than one turn.
+- [ ] Daniel has read **§6f** and accepts that a turn ending with an unanswered readback is not
+      stored at all — nothing was executed, and the seed frame's "already acted on" must not be
+      allowed to become true of it — so that exchange is also not searchable later.
+- [ ] Daniel has read **§6g** and accepts that a reflex-open turn stores his words and the tool's
+      name, and that the host note framing it stays in memory only.
 - [ ] Daniel has read **§3d** and accepts that ordinary paths, email addresses and URLs are stored
       as spoken (the worker log redacts them; this store deliberately does not).
 - [ ] Daniel has read **§4** and accepts the real disk envelope (~5 MB English, up to ~20 MB
