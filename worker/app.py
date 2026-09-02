@@ -1336,12 +1336,30 @@ async def entrypoint(ctx: JobContext) -> None:
             if server is not None:
                 await _flush_store_and_stop_state_server(services.store, server)
         finally:
-            if trace_recorder is not None:
-                try:
-                    await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
-                except TimeoutError:
-                    logger.warning("turn tracing close exceeded shutdown deadline")
-            shutdown_done.set()
+            # Closing the persistent sinks must never be able to leave
+            # shutdown_done unset. Anything waiting on it -- a second
+            # _request_shutdown, the entrypoint's own exit path -- waits
+            # forever if this block raises, so an app that cannot close a
+            # database would hang instead of quitting. The narrow
+            # TimeoutError catch below used to be the only guard, which meant
+            # any OTHER failure here had exactly that effect.
+            try:
+                if trace_recorder is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.to_thread(trace_recorder.close), 2.1)
+                    except TimeoutError:
+                        logger.warning("turn tracing close exceeded shutdown deadline")
+                transcript_store = getattr(services, "transcript", None)
+                if transcript_store is not None:
+                    # No deadline and no thread: every exchange was committed
+                    # synchronously as it happened, so this closes a
+                    # connection rather than flushing a backlog. Nothing is
+                    # lost if the process dies before it.
+                    transcript_store.close()
+            except Exception as exc:
+                logger.warning("shutdown close failed (type=%s)", type(exc).__name__)
+            finally:
+                shutdown_done.set()
 
     desktop_status = desktopapps.StatusSnapshot()
 
@@ -1695,12 +1713,10 @@ WORKER_LOG_MESSAGE_LIMIT = 200
 # blunt: "1/3" (a retry count) survives, "C:\Users\...", "~/.claude/projects",
 # "https://host/x" and "someone@example.test" do not.
 _UNSAFE_LOG_TOKEN = re.compile(r"[\\~@]|[A-Za-z]:[\\/]|/[A-Za-z]")
-# Secret shapes, as defense in depth: nothing in the atlas.* tree is supposed
-# to log one, and rule 1 keeps them out of reach in the first place, but a
-# persistent file is the wrong place to find out that something did.
-_SECRET_LOG_TOKEN = re.compile(
-    r"(?:sk-|bearer|eyJ)|\b[0-9a-fA-F]{16,}\b", re.IGNORECASE,
-)
+# Secret shapes are sanitize.secret_shaped -- ONE definition, shared with the
+# conversation store (worker/transcript.py), because two persistent sinks
+# checking two copies of the same pattern is one copy too many. The comment
+# explaining what it covers and why lives with the pattern.
 
 
 class _HostShapedFormatter(logging.Formatter):
@@ -1729,7 +1745,7 @@ class _HostShapedFormatter(logging.Formatter):
         message = " ".join(str(record.getMessage()).split())
         kept = []
         for token in message.split(" "):
-            if _UNSAFE_LOG_TOKEN.search(token) or _SECRET_LOG_TOKEN.search(token):
+            if _UNSAFE_LOG_TOKEN.search(token) or sanitize.secret_shaped(token):
                 kept.append("<redacted>")
                 break
             kept.append(token)

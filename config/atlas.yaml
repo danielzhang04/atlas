@@ -73,6 +73,51 @@ voice:
   min_overlap_ratio: 0.8
 
 traces: {enabled: true, path: "%LOCALAPPDATA%/Atlas/traces.db", retention_days: 30}
+
+# CLI-style conversation persistence (DD-4). Atlas forgot everything when its
+# window closed; with this on, the recent tail is seeded back into the brain at
+# boot and older conversation is reachable through the search_transcript tool
+# on demand -- never the whole 30 days in the prefix.
+#
+# SHIPS DARK. enabled is false and stays false until Daniel signs off on
+# docs/amendments/dd4-rule10-transcript.md, because this is the first thing
+# Atlas writes to disk that holds what was SAID rather than host-shaped
+# metadata (rule 10). While it is false there is no store object in the
+# process, nothing is written, transcript.db is never created, and
+# search_transcript is not registered -- the model is not told it exists.
+#
+# Unlike traces above, `enabled` must be exactly true: absent, null, or
+# anything else reads as off.
+#
+# Bounds, all enforced at write time and on the boot sweep, oldest-first:
+#   retention_days     30, matching traces.
+#   max_rows           20,000 rows = 10,000 exchanges. Over a month at a heavy
+#                      300 turns a day, so retention normally binds first.
+#   max_content_bytes  4,194,304 CHARACTERS, measured as SUM(LENGTH(text)) --
+#                      SQLite's LENGTH counts characters, so this is not a
+#                      disk budget. On disk that is ~5MB for English and up to
+#                      ~20MB for CJK/emoji, plus up to ~4MB of write-ahead log
+#                      while a session is open (amendment §4). File size is
+#                      the wrong thing to cap against: SQLite does not give
+#                      pages back on DELETE, so an eviction loop measured
+#                      against it would never converge. ~13,000 turns; the
+#                      backstop against a pathological run, not a working
+#                      limit.
+#   seed_token_budget  1500 tokens against a ~25K prefix -- roughly the last
+#                      ten exchanges. Small enough to stay noise against the
+#                      cached prefix; a bigger tail is what search is for.
+#   seed_max_turns     20 rows = 10 exchanges.
+#   seed_max_age_hours 24. A three-day-old tail is not context, it is a wrong
+#                      assumption carried into the first live turn.
+persistence:
+  enabled: false
+  path: "%LOCALAPPDATA%/Atlas/transcript.db"
+  retention_days: 30
+  max_rows: 20000
+  max_content_bytes: 4194304
+  seed_token_budget: 1500
+  seed_max_turns: 20
+  seed_max_age_hours: 24
 pricing:
   # Source: https://docs.anthropic.com/en/docs/about-claude/pricing
   # Mode: standard; cache writes below are the default 5-minute rate.

@@ -761,6 +761,10 @@ def test_entrypoint_warms_model_only_after_build_and_state_server_start(monkeypa
             self.mcp = FakeMcp()
             self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+            # Mirrors the real Runtime: persistence ships dark, so the field
+            # exists and is None. A fake missing it entirely hides the
+            # shutdown path that reads it.
+            self.transcript = None
 
         def warm_model_client(self):
             assert not build_active
@@ -1116,6 +1120,10 @@ def test_entrypoint_cleans_up_every_startup_failure(monkeypatch):
                 self.mcp = FakeMcp()
                 self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
                 self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+                # Mirrors the real Runtime: persistence ships dark, so the field
+                # exists and is None. A fake missing it entirely hides the
+                # shutdown path that reads it.
+                self.transcript = None
 
             def warm_model_client(self):
                 if failure == "warm":
@@ -1251,6 +1259,10 @@ def test_entrypoint_early_shutdown_is_registered_and_idempotent(monkeypatch):
             self.mcp = FakeMcp()
             self.registry = SimpleNamespace(set_execution_observer=lambda _observer: None)
             self.store = SimpleNamespace(events=lambda *_args: [], result=lambda *_args: None)
+            # Mirrors the real Runtime: persistence ships dark, so the field
+            # exists and is None. A fake missing it entirely hides the
+            # shutdown path that reads it.
+            self.transcript = None
 
     class FakeServer:
         port = 4321
