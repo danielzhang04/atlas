@@ -341,3 +341,181 @@ def test_speech_was_interrupted_reads_the_active_turn(tmp_path: Path):
         recorder.close()
 
     assert traces.speech_was_interrupted() is False
+
+
+# --- DD-3: refusals and pending-action events were invisible ----------------
+#
+# A turn where the taint wall or the pending-collision rule stopped every call
+# looked, in the database, exactly like a turn where the model simply chose to
+# say something. These rows are the difference, and they carry the allowlisted
+# tool name plus one closed word -- never the arguments that were refused.
+
+
+def test_refusal_rows_carry_the_tool_name_and_a_closed_reason(tmp_path: Path):
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    for reason in ("taint", "handle", "collision", "conflict"):
+        recorder.refusal(turn, "find_file", reason=reason)
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        assert connection.execute(
+            "SELECT kind,name,ms,ok,detail FROM steps ORDER BY seq"
+        ).fetchall() == [
+            ("TOOL_CALL", "find_file", 0, 0, "taint"),
+            ("TOOL_CALL", "find_file", 0, 0, "handle"),
+            ("TOOL_CALL", "find_file", 0, 0, "collision"),
+            ("TOOL_CALL", "find_file", 0, 0, "conflict"),
+        ]
+
+
+def test_pending_rows_cover_the_whole_lifecycle(tmp_path: Path):
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    for event in ("created", "confirmed", "cancelled", "unmatched"):
+        recorder.pending(turn, "find_file", event=event)
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        assert connection.execute(
+            "SELECT kind,name,ok,detail FROM steps ORDER BY seq"
+        ).fetchall() == [
+            ("TOOL_CALL", "find_file", 1, "created"),
+            ("TOOL_CALL", "find_file", 1, "confirmed"),
+            ("TOOL_CALL", "find_file", 0, "cancelled"),
+            ("TOOL_CALL", "find_file", 0, "unmatched"),
+        ]
+
+
+def test_an_unknown_reason_or_tool_becomes_other_like_every_other_enum(tmp_path):
+    sentinel = "ReasonSentinel55182"
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.refusal(turn, sentinel, reason=sentinel)
+    recorder.pending(turn, sentinel, event=sentinel)
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        assert connection.execute(
+            "SELECT name,detail FROM steps ORDER BY seq"
+        ).fetchall() == [("other", "other"), ("other", "other")]
+    assert sentinel.encode("ascii") not in (tmp_path / "traces.db").read_bytes()
+
+
+def test_refusal_and_pending_rows_do_not_inflate_the_tool_call_rollup(tmp_path):
+    """`tool_calls` counted executions before these rows existed and counts
+    exactly the same executions after -- detail IS NULL is what says so."""
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.tool_call(turn, "find_file", ms=5, ok=True)
+    recorder.refusal(turn, "find_file", reason="taint")
+    recorder.pending(turn, "find_file", event="created")
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    summary = recorder.summary(days=1)
+    recorder.close()
+
+    assert summary["tool_calls"] == 1
+
+
+def test_a_database_written_before_the_detail_column_is_migrated(tmp_path: Path):
+    """Daniel HAS a traces.db, written by the shipped schema. It must keep
+    working -- which is also why these rows reuse the TOOL_CALL kind instead
+    of adding one the old CHECK constraint would reject."""
+    path = tmp_path / "traces.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+CREATE TABLE turns (
+    turn_id TEXT PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL NOT NULL,
+    total_ms INTEGER NOT NULL, addressed INTEGER NOT NULL, wake_kind TEXT,
+    outcome TEXT, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL, model TEXT
+);
+CREATE TABLE steps (
+    turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('ROUTE','GENERATE','TOOL_CALL','RESPOND')), name TEXT,
+    ms INTEGER NOT NULL, ok INTEGER NOT NULL, tokens_in INTEGER NOT NULL,
+    tokens_out INTEGER NOT NULL, interrupted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (turn_id, seq)
+);
+""")
+
+    recorder = _recorder(path)
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.refusal(turn, "find_file", reason="taint")
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    summary = recorder.summary(days=1)
+    recorder.close()
+
+    assert summary["turns"] == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT kind,name,detail FROM steps"
+        ).fetchall() == [("TOOL_CALL", "find_file", "taint")]
+
+
+def test_module_level_refusal_and_pending_helpers_reach_the_active_turn(tmp_path):
+    from worker import traces
+
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+
+    # No active turn (the text lane, tests): recording is a no-op, never a
+    # crash and never a row on somebody else's turn.
+    traces.record_current_refusal("find_file", "taint")
+    assert turn.steps == []
+
+    token = traces.activate(recorder, turn)
+    try:
+        traces.record_current_refusal("find_file", "taint")
+        traces.record_current_pending("find_file", "created")
+    finally:
+        traces.reset(token)
+        recorder.close()
+
+    assert [(step["kind"], step["detail"]) for step in turn.steps] == [
+        ("TOOL_CALL", "taint"), ("TOOL_CALL", "created"),
+    ]
+
+
+def test_a_nameless_pending_row_is_null_and_does_not_burn_the_boundary_warning(
+    tmp_path: Path, caplog,
+):
+    """LOW-7. A confirm arriving with nothing pending is routine -- Daniel says
+    "yes" a beat after the readback expired -- and it has no action to name.
+    Passing "" pushed that through the tool-name allowlist, which recorded it
+    as 'other' (indistinguishable from a real boundary breach) AND set the
+    once-per-process warning flag, so the NEXT genuine violation logged
+    nothing at all."""
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    with caplog.at_level(logging.WARNING, logger="atlas.traces"):
+        recorder.pending(turn, None, event="unmatched")
+        assert "unknown trace metadata" not in caplog.text
+
+        # ...so a real breach right after it still gets its one warning.
+        recorder.pending(turn, "NotARegisteredTool", event="created")
+        assert "unknown trace metadata replaced with other" in caplog.text
+
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    recorder.close()
+
+    with sqlite3.connect(tmp_path / "traces.db") as connection:
+        assert connection.execute(
+            "SELECT name,detail FROM steps ORDER BY seq"
+        ).fetchall() == [(None, "unmatched"), ("other", "created")]
+
+
+def test_a_nameless_pending_row_still_stays_out_of_the_tool_call_rollup(tmp_path: Path):
+    recorder = _recorder(tmp_path / "traces.db")
+    turn = recorder.begin_turn(wake_kind="wake")
+    recorder.tool_call(turn, "find_file", ms=5, ok=True)
+    recorder.pending(turn, None, event="unmatched")
+    recorder.end_turn(turn, addressed=True, wake_kind="wake", outcome="responded")
+    summary = recorder.summary(days=1)
+    recorder.close()
+
+    assert summary["tool_calls"] == 1

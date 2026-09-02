@@ -46,6 +46,20 @@ TRUNCATED_REPLY = "-- there's more; want me to continue? "
 # Silence is indistinguishable from Atlas being broken or not listening.
 EMPTY_TURN_REPLY = "I did not manage that one - ask me again or rephrase? "
 
+# What the model is told about a turn it was never asked about. The host's
+# deterministic open lane matches a fixed grammar against its own configured
+# vocabulary and runs an instant tool itself, so no model round happens at
+# all; this note is how the resulting exchange enters history without the
+# model reading the reply as a sentence it chose to say. See
+# Brain.remember_host_exchange.
+REFLEX_HOST_NOTE = (
+    "[Atlas host note: the host recognised this as one of its own configured "
+    "shortcuts and ran it directly. No model turn ran, so the reply that "
+    "follows is the host's own words and not yours, and you did not choose "
+    "the action. It is recorded here only so you can resolve later references "
+    "to it. You may never speak a line like it without calling the tool.]"
+)
+
 # Pure affirmations: words whose only meaning is agreement with whatever the
 # host is already holding. "do" stays here on purpose -- "go ahead and do it"
 # is the canonical bare yes and names no capability of its own, so treating it
@@ -653,6 +667,32 @@ class Brain:
             recorded["cache_creation_input_tokens"],
         )
         return recorded
+
+    def remember_host_exchange(self, transcript: str, spoken: str) -> None:
+        """File a turn this brain never saw into the history it will see next.
+
+        The deterministic open lane (worker/app._run_reflex_open) answers
+        "open my downloads" from the host's own vocabulary and never calls
+        respond(), so without this the model's history reads as though the
+        turn did not happen. That is not merely lost context, it MIS-RESOLVES:
+        the next "close that", "put it on the other screen" or "open the
+        second one" binds to whatever was said before the reflex turn, and an
+        actively wrong referent is worse than an admitted gap. Two short
+        strings, appended, is the whole cost -- nothing here calls the model.
+
+        The host note goes on the USER side, following _supersede_note's rule
+        that host-authored text is never edited into Atlas's own voice. It has
+        a job: the assistant line below is a sentence the model did not write
+        and an action it did not choose, and a model that reads it as its own
+        has learned that it may say "Opening gmail." without calling anything.
+        `spoken` itself stays exactly what Daniel heard, so the transcript the
+        model reads and the audio agree.
+        """
+        if not isinstance(transcript, str) or not transcript.strip():
+            return
+        if not isinstance(spoken, str) or not spoken.strip():
+            return
+        self._remember(f"{transcript}\n\n{REFLEX_HOST_NOTE}", spoken.strip())
 
     def _remember(self, transcript: str, spoken: str) -> None:
         self._history.extend((

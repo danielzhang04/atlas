@@ -23,8 +23,10 @@ from worker.localfiles import LocalFiles
 
 __all__ = [
     "AppEntry",
+    "FOCUSED_EXISTING_WINDOW",
     "Handle",
     "McpToolError",
+    "NOTHING_RECENTLY_OPENED",
     "PendingAction",
     "Policy",
     "Tool",
@@ -36,6 +38,13 @@ __all__ = [
     "load_apps",
     "register_count_mail",
 ]
+
+# Two host results the reflex lane in worker/app.py has to tell apart in order
+# to say something true out loud ("Opening chrome" vs "chrome was already
+# open"). Named constants rather than string literals repeated at both ends,
+# so the two sites cannot drift.
+FOCUSED_EXISTING_WINDOW = "focused existing window"
+NOTHING_RECENTLY_OPENED = "nothing recently opened"
 
 Policy = Literal["instant", "confirm"]
 _Status = Literal["ok", "error", "needs_confirmation"]
@@ -165,6 +174,18 @@ _NEXT_PAGE_TOKEN = re.compile(
 # counting DISTINCT thread ids across pages gets the UI-matching number
 # without a second API surface.
 _THREAD_ID = re.compile(r"^[ \t]*Thread ID[ \t]*:[ \t]*(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+# The pagination line is the LAST line the server writes, but _NEXT_PAGE_TOKEN
+# is an unanchored MULTILINE alternation, so searching the whole page scans
+# every one of a 500-message page's ~142 KB. Measured on the real page shape:
+# 17.9 ms over the full page vs 0.27 ms over the last 2 KB -- 91% of the entire
+# per-page parse cost (19.5 ms) spent looking in the wrong 140 KB. The tail
+# window is a FAST PATH, never a narrowing: a page whose tail carries no token
+# falls back to the full search, so a token written anywhere else (the two
+# legacy line-anchored shapes) is still found. See _next_page_token for the
+# one and only way this differs from always searching the whole page. Sized
+# well above the real line (~120 chars) so a longer token or a couple of
+# trailing lines still land inside it.
+_NEXT_PAGE_TOKEN_TAIL = 2048
 
 logger = logging.getLogger("atlas.tools")
 
@@ -227,6 +248,29 @@ class PendingAction:
     summary: str
     expires: float
     host_state: Any = None
+
+
+def _record_refusal(name: str, reason: str) -> None:
+    """Trace a call the host refused before running it (rule 10: the tool
+    NAME and a closed reason word, never the arguments that were refused).
+
+    Imported inside the function for the same reason every other traces
+    import in this file is: worker.traces must stay off the startup path
+    (rule 11), and a refusal is not a hot loop.
+    """
+    from worker import traces as traces_mod
+    traces_mod.record_current_refusal(name, reason)
+
+
+def _record_pending(name: str | None, event: str) -> None:
+    """`name` is None when there is genuinely no action to name -- a confirm
+    that arrived with nothing pending. Not the empty string: an unnamed row
+    must not go through the tool-name allowlist, which would file it as
+    'other' (indistinguishable from a real boundary breach) AND burn the
+    once-per-process "unknown trace metadata" warning on a routine event, so
+    the next genuine violation would log nothing at all."""
+    from worker import traces as traces_mod
+    traces_mod.record_current_pending(name, event)
 
 
 _PENDING_COLLISION_SUMMARY_LIMIT = 120
@@ -501,6 +545,19 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def policy(self, name: str) -> Policy | None:
+        """A registered tool's tier, or None if the name is not registered.
+
+        Published for the same reason content_bearing is: a caller that has to
+        know whether a tool runs inline or produces a readback must ask the
+        registry rather than keep its own list, because rule 4 is decided
+        here. The deterministic open lane in worker/app.py is the one caller
+        -- it may only ever reach instant tools, since it speaks without a
+        model round and would otherwise swallow a readback.
+        """
+        tool = self._tools.get(name)
+        return None if tool is None else tool.policy
+
     def content_bearing(self, name: str) -> bool | None:
         """Whether a registered tool's output taints the turn.
 
@@ -537,6 +594,7 @@ class ToolRegistry:
             return ToolResult("error", "unknown tool")
         try:
             if tool.policy == "confirm" and self.pending is not None:
+                _record_refusal(name, "collision")
                 return ToolResult("error", _pending_collision(self.pending))
             copied = deepcopy(dict(arguments))
             # Exactly-one(path/handle/root) is settled BEFORE the taint gate,
@@ -549,11 +607,18 @@ class ToolRegistry:
             # both the gate and the executor enforce it independently.
             conflict = _handle_target_conflict(name, copied)
             if conflict is not None:
+                _record_refusal(name, "conflict")
                 return ToolResult("error", conflict)
             if tainted and self._refused_after_external_content(name, copied):
+                handle_tool = name in _HANDLE_TOOLS
+                # "handle" and "taint" are the same wall, recorded apart:
+                # a handle-tool refusal still had a way through this turn
+                # (a handle from an earlier find_file) and a plain taint
+                # refusal did not, and only the first is worth chasing.
+                _record_refusal(name, "handle" if handle_tool else "taint")
                 return ToolResult(
                     "error",
-                    _TAINT_REFUSAL_HANDLE if name in _HANDLE_TOOLS else _TAINT_REFUSAL,
+                    _TAINT_REFUSAL_HANDLE if handle_tool else _TAINT_REFUSAL,
                 )
             if tool.prepare is not None:
                 prepared = tool.prepare(copied)
@@ -588,6 +653,7 @@ class ToolRegistry:
                 # "instant" going in (rule 5: one expiring, single-use
                 # pending action).
                 if self.pending is not None:
+                    _record_refusal(name, "collision")
                     return ToolResult("error", _pending_collision(self.pending))
                 # Large arguments CONDENSE the readback; they never refuse
                 # the call (BB-wave review, finding 5). The old refusal
@@ -625,6 +691,7 @@ class ToolRegistry:
                     host_state=host_state,
                 )
                 self._pending = pending
+                _record_pending(name, "created")
                 return ToolResult(
                     "needs_confirmation",
                     _bound_content(
@@ -638,10 +705,21 @@ class ToolRegistry:
             return ToolResult("error", type(exc).__name__)
 
     def _configure_open_aliases(self, aliases: Mapping[str, Any]) -> None:
+        # Raises on a normalize-collision (two configured words that are the
+        # same word once spoken -- "vs-code" and "vs code"). The alias loader
+        # below only rejects exact casefold duplicates, so without this a
+        # colliding pair loads happily and then resolves to whichever one the
+        # frozenset yielded first, which changes with PYTHONHASHSEED. See
+        # router.check_open_vocabulary. Local import: worker.router is not on
+        # this module's import graph and this runs once, at startup.
+        from worker import router as router_mod
+        router_mod.check_open_vocabulary(aliases, field="apps.yaml words")
         self._open_aliases = frozenset(aliases)
 
     def _configure_root_names(self, names: Any) -> None:
         """Host-only: the closed root vocabulary the taint carve-out rests on."""
+        from worker import router as router_mod
+        router_mod.check_open_vocabulary(names, field="file roots")
         self._root_names = frozenset(names)
 
     def _refused_after_external_content(
@@ -726,18 +804,43 @@ class ToolRegistry:
 
     async def confirm(self, confirm_id: str) -> ToolResult:
         pending = self.pending
-        if pending is None:
-            return ToolResult("error", "nothing to confirm")
-        if pending.confirm_id != confirm_id:
+        if pending is None or pending.confirm_id != confirm_id:
+            # An expired pending and a mismatched id are one refusal to the
+            # model on purpose (it must not learn which it was); the trace
+            # records the tool name only when there IS one to name.
+            _record_pending(pending.name if pending is not None else None, "unmatched")
             return ToolResult("error", "nothing to confirm")
         self._pending = None
+        _record_pending(pending.name, "confirmed")
         return await self._execute(
             self._tools[pending.name], pending.arguments, host_state=pending.host_state,
         )
 
     def cancel_pending(self) -> ToolResult:
+        pending = self._pending
         self._pending = None
+        if pending is not None:
+            _record_pending(pending.name, "cancelled")
         return ToolResult("ok", "cancelled")
+
+    @property
+    def open_aliases(self) -> frozenset[str]:
+        """Host-only, read-only: the configured `open` alias vocabulary.
+
+        Published so the deterministic reflex lane in worker/app.py can match
+        an utterance against the SAME closed set this registry will resolve
+        against a moment later, rather than keeping a second copy that could
+        drift from config/apps.yaml. Read-only by construction: the value is a
+        frozenset, and nothing outside this module writes it (see
+        _configure_open_aliases, called by builtin()).
+        """
+        return self._open_aliases
+
+    @property
+    def root_names(self) -> frozenset[str]:
+        """Host-only, read-only: the configured named-root vocabulary, for the
+        same reason as open_aliases above."""
+        return self._root_names
 
     async def _execute(
         self,
@@ -922,7 +1025,7 @@ def builtin(
                         and opened.get("focused") is True
                         and opened.get("existing") is True
                     ):
-                        return ToolResult("ok", "focused existing window")
+                        return ToolResult("ok", FOCUSED_EXISTING_WINDOW)
                     return {"opened": name, "via": "desktop"}
             elif app.url is not None:
                 dynamic_url = paired_url() if name == "atlas" and paired_url is not None else None
@@ -944,7 +1047,7 @@ def builtin(
         # which is why it appears in no taint list below.
         record = registry._recent_open()
         if record is None:
-            return ToolResult("error", "nothing recently opened")
+            return ToolResult("error", NOTHING_RECENTLY_OPENED)
         if (
             record._handle is None
             and record.pid is None
@@ -1496,11 +1599,7 @@ def register_count_mail(
                 if page_count > 0 and not page_threads:
                     return ToolResult("error", "unexpected mail search result")
                 threads.update(page_threads)
-                token_match = _NEXT_PAGE_TOKEN.search(content)
-                page_token = (
-                    (token_match.group(1) or token_match.group(2))
-                    if token_match is not None else None
-                )
+                page_token = _next_page_token(content)
                 if page_token is None:
                     return len(threads), True
                 if page_count < 500:
@@ -1510,14 +1609,42 @@ def register_count_mail(
                 seen_tokens.add(page_token)
             return len(threads), page_token is None
 
-        inbox_count = await bounded_count(query)
-        if isinstance(inbox_count, ToolResult):
-            return inbox_count
+        primary_query = None
         if re.search(r"(?:^|\s)in:inbox(?:\s|$)", query, re.IGNORECASE):
             primary_query = query
             if not re.search(r"(?:^|\s)category:primary(?:\s|$)", query, re.IGNORECASE):
                 primary_query += " category:primary"
-            primary_count = await bounded_count(primary_query)
+        if primary_query is None:
+            inbox_count = await bounded_count(query)
+        else:
+            # DD-3 (speed), measured: "how many emails" is the common ask, it
+            # always takes this branch, and the two walks used to run one
+            # after the other even though neither reads the other's result.
+            # Sequential cost, at a measured ~900ms per google search page:
+            # 1841ms for a one-page inbox, and 7.4s in the 4-page worst case
+            # -- against ToolRegistry's own 8s tool timeout, i.e. the honest
+            # count was one slow page away from being killed by the clock.
+            # Concurrent: 920ms and 3.7s. The two queries are independent by
+            # construction (primary is a narrower SEARCH, not a filter over
+            # the inbox result), and mcp_client.call_raw holds no per-session
+            # lock, so both pages are genuinely in flight at once.
+            #
+            # return_exceptions=True rather than bare gather: a bare gather
+            # raises the moment the first walk fails and leaves the sibling
+            # running with nobody to retrieve its exception. Both are awaited
+            # to completion here, and the inbox failure is re-raised first so
+            # the model sees the same error it saw before this change.
+            inbox_count, primary_count = await asyncio.gather(
+                bounded_count(query),
+                bounded_count(primary_query),
+                return_exceptions=True,
+            )
+            for value in (inbox_count, primary_count):
+                if isinstance(value, BaseException):
+                    raise value
+        if isinstance(inbox_count, ToolResult):
+            return inbox_count
+        if primary_query is not None:
             if isinstance(primary_count, ToolResult):
                 return primary_count
             inbox_total, inbox_exact = inbox_count
@@ -1541,6 +1668,29 @@ def register_count_mail(
         "the count Daniel's Gmail UI shows (not a raw message count).",
         schema, count_mail,
     ))
+
+
+def _next_page_token(content: str) -> str | None:
+    """The next page's token, looked for where the server actually writes it.
+
+    See _NEXT_PAGE_TOKEN_TAIL for the measurement. The tail is trimmed to a
+    whole line before matching, so MULTILINE `^` cannot anchor to a line this
+    slice cut in half and invent a token the full page does not contain; a
+    tail with no token falls back to the whole page, so nothing is ever
+    missed. The one difference from always searching the whole page is which
+    token wins if a page ever carried two -- this takes the later one, which
+    is the one that actually paginates.
+    """
+    tail = content[-_NEXT_PAGE_TOKEN_TAIL:]
+    if len(content) > _NEXT_PAGE_TOKEN_TAIL:
+        newline = tail.find("\n")
+        tail = tail[newline + 1:] if newline >= 0 else ""
+    match = _NEXT_PAGE_TOKEN.search(tail)
+    if match is None and len(content) > _NEXT_PAGE_TOKEN_TAIL:
+        match = _NEXT_PAGE_TOKEN.search(content)
+    if match is None:
+        return None
+    return match.group(1) or match.group(2)
 
 
 def _aliases(apps: Mapping[str, AppEntry]) -> dict[str, tuple[str, AppEntry]]:

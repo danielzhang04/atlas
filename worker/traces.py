@@ -27,6 +27,32 @@ _OUTCOMES = frozenset({
     "interrupted", "responded", "speech_failed",
 })
 _UNRESOLVED = re.compile(r"%(?:[^%]+)%|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})")
+# A TOOL_CALL step's `detail` says why the call never ran, or what happened to
+# the host's single pending action. NULL means the row is a real execution --
+# which is what keeps the health rollup's `tool_calls` counting exactly what it
+# counted before this column existed (see _read_summary).
+#
+# Both vocabularies are closed and host-authored, like every other trace enum:
+# a refusal row carries the allowlisted tool NAME and one of these words, never
+# the arguments that were refused (rule 10).
+_REFUSALS = frozenset({
+    # The turn had already read outside content and the call named a
+    # model-authored target.
+    "taint",
+    # Same, on a tool where a host-minted handle would still have worked.
+    "handle",
+    # A confirm-tier call arrived while another action was still awaiting
+    # Daniel's yes or no.
+    "collision",
+    # More than one of path/handle/root (or target/link) was supplied.
+    "conflict",
+})
+_PENDING_EVENTS = frozenset({
+    "created",    # a readback was produced and the pending action stored
+    "confirmed",  # a matching confirm consumed it (the execution row follows)
+    "cancelled",  # dropped without executing
+    "unmatched",  # a confirm arrived with nothing pending, or the wrong id
+})
 _STOP = object()
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns (
@@ -41,6 +67,7 @@ CREATE TABLE IF NOT EXISTS steps (
     kind TEXT NOT NULL CHECK(kind IN ('ROUTE','GENERATE','TOOL_CALL','RESPOND')), name TEXT,
     ms INTEGER NOT NULL, ok INTEGER NOT NULL, tokens_in INTEGER NOT NULL,
     tokens_out INTEGER NOT NULL, interrupted INTEGER NOT NULL DEFAULT 0,
+    detail TEXT,
     PRIMARY KEY (turn_id, seq)
 );
 CREATE INDEX IF NOT EXISTS turns_started_at ON turns(started_at);
@@ -108,6 +135,18 @@ def record_current_tool_call(name: str, **metrics) -> None:
     _current("tool_call", name, **metrics)
 def record_current_respond(**metrics) -> None:
     _current("respond", **metrics)
+def record_current_refusal(name: str, reason: str) -> None:
+    """Record a tool call the host refused before it ever ran.
+
+    Refusals were the one class of tool event that left no trace at all: a
+    turn where the taint wall or the pending-collision rule stopped every
+    call looked, in the database, exactly like a turn where the model simply
+    chose to say something. See TraceRecorder.refusal."""
+    _current("refusal", name, reason=reason)
+def record_current_pending(name: str | None, event: str) -> None:
+    """Record what happened to the host's single pending confirm action.
+    `name` is None only when there was no pending action to name."""
+    _current("pending", name, event=event)
 class TraceRecorder:
     """Queue complete turn inserts on one bounded private database thread."""
     def __init__(self, path: str | Path | None = None, *, enabled: bool = True,
@@ -161,6 +200,35 @@ class TraceRecorder:
                    cache_write_tokens=cache_write_tokens)
     def tool_call(self, turn: _Turn, name: str, *, ms: int, ok: bool) -> None:
         self._step(turn, "TOOL_CALL", self._name(name, self._tool_names), ms=ms, ok=ok)
+    def refusal(self, turn: _Turn, name: str, *, reason: str) -> None:
+        """A call the host refused before executing it: ok=0, ms=0, detail set.
+
+        Deliberately kind='TOOL_CALL' rather than a new kind. `steps.kind`
+        carries a CHECK constraint that CREATE TABLE IF NOT EXISTS leaves
+        untouched on an existing database, so a new kind would make every
+        INSERT fail on any traces.db written before this change -- silently
+        turning tracing off for the one person who has one. The `detail`
+        column is a plain ALTER TABLE ADD COLUMN (the `interrupted`
+        precedent) and separates these rows from real executions instead.
+        """
+        self._step(turn, "TOOL_CALL", self._name(name, self._tool_names), ms=0, ok=False,
+                   detail=self._enum(reason, _REFUSALS))
+    def pending(self, turn: _Turn, name: str | None, *, event: str) -> None:
+        """One pending-action lifecycle event. `ok` follows whether the
+        pending did what it was for: created and confirmed are the healthy
+        path, cancelled and unmatched are not.
+
+        `name=None` is the one honest answer for a confirm that arrived with
+        nothing pending: there is no action to name. It is written as a NULL
+        name (the ROUTE and RESPOND rows already do) rather than run through
+        the allowlist, which would record it as 'other' -- the same value a
+        real boundary breach writes -- and spend the once-per-process
+        boundary warning on a routine event, leaving the next genuine
+        violation silent."""
+        self._step(turn, "TOOL_CALL",
+                   self._name(name, self._tool_names) if name else None, ms=0,
+                   ok=event in ("created", "confirmed"),
+                   detail=self._enum(event, _PENDING_EVENTS))
     def respond(self, turn: _Turn, *, ms: int, ok: bool) -> None:
         self._step(turn, "RESPOND", None, ms=ms, ok=ok, interrupted=turn.speech_interrupted)
     def end_turn(self, turn: _Turn, *, addressed: bool, wake_kind: str,
@@ -194,7 +262,8 @@ class TraceRecorder:
         thread.join(max(0.0, min(float(timeout_s), 2.0)))
     def _step(self, turn: _Turn, kind: str, name: str | None, *, ms: int, ok: bool,
               tokens_in: int = 0, tokens_out: int = 0, cache_read_tokens: int = 0,
-              cache_write_tokens: int = 0, interrupted: bool = False) -> None:
+              cache_write_tokens: int = 0, interrupted: bool = False,
+              detail: str | None = None) -> None:
         if not self.enabled or turn.ended or len(turn.steps) >= 64:
             return
         turn.steps.append({
@@ -203,6 +272,7 @@ class TraceRecorder:
             "cache_read": self._count(cache_read_tokens),
             "cache_write": self._count(cache_write_tokens),
             "interrupted": int(interrupted is True),
+            "detail": detail,
         })
     def _enqueue(self, item, *, after_close: bool = False) -> bool:
         with self._lock:
@@ -255,6 +325,11 @@ class TraceRecorder:
                 connection.execute(
                     "ALTER TABLE steps ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0",
                 )
+            # Same reason, same shape: rows written before refusal/pending
+            # tracing existed were all real executions, and NULL is exactly
+            # what this column means for them.
+            if "detail" not in columns:
+                connection.execute("ALTER TABLE steps ADD COLUMN detail TEXT")
             cutoff = self._clock() - self._retention_days * 86_400
             connection.execute("DELETE FROM turns WHERE started_at < ?", (cutoff,))
             connection.commit()
@@ -266,9 +341,10 @@ class TraceRecorder:
             with connection:
                 connection.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
                 connection.executemany(
-                    "INSERT INTO steps VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO steps VALUES (?,?,?,?,?,?,?,?,?,?)",
                     ((row[0], seq, step["kind"], step["name"], step["ms"], step["ok"],
-                      step["tokens_in"], step["tokens_out"], step.get("interrupted", 0))
+                      step["tokens_in"], step["tokens_out"], step.get("interrupted", 0),
+                      step.get("detail"))
                      for seq, step in enumerate(steps, 1)),
                 )
             cutoff = self._local_midnight()
@@ -287,9 +363,11 @@ class TraceRecorder:
                 "COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(cost_usd),0) "
                 "FROM turns WHERE started_at >= ?", (cutoff,),
             ).fetchone()
+            # detail IS NULL keeps this counting exactly what it counted
+            # before refusal/pending rows existed: calls that really ran.
             tools = connection.execute(
                 "SELECT COUNT(*) FROM steps JOIN turns USING(turn_id) "
-                "WHERE kind='TOOL_CALL' AND started_at >= ?", (cutoff,),
+                "WHERE kind='TOOL_CALL' AND detail IS NULL AND started_at >= ?", (cutoff,),
             ).fetchone()[0]
         except Exception as exc:
             self._database_error(exc)

@@ -31,10 +31,16 @@ _ECHO_DEFAULTS = {
     "max_words": 500,
     "min_overlap_ratio": 0.8,
 }
+# DD-3 instant ack: same section, same validate-or-raise treatment.
+_ACK_DEFAULTS = {
+    "ack_delay_s": 1.8,
+    "ack_lines": ("One second. ", "Still with you. "),
+}
 _DEFAULTS = {
     "min_interruption_words": 2,
     "min_interruption_duration_s": 0.8,
     "aec_warmup_duration_s": 4.0,
+    **_ACK_DEFAULTS,
     "echo_guard": _ECHO_DEFAULTS,
 }
 
@@ -57,6 +63,7 @@ def test_voice_config_overrides_are_used_when_present():
         "min_interruption_words": 3,
         "min_interruption_duration_s": 1.2,
         "aec_warmup_duration_s": 5.0,
+        **_ACK_DEFAULTS,
         "echo_guard": _ECHO_DEFAULTS,
     }
 
@@ -428,7 +435,7 @@ def test_speech_created_handler_marks_the_active_turn_when_interrupted(monkeypat
     assert turn.steps[-1] == {
         "kind": "RESPOND", "name": None, "ms": 5, "ok": 1,
         "tokens_in": 0, "tokens_out": 0, "cache_read": 0, "cache_write": 0,
-        "interrupted": 1,
+        "interrupted": 1, "detail": None,
     }
 
 
@@ -510,3 +517,197 @@ def test_dismiss_and_repeat_reflex_speech_sets_the_flag_but_never_persists_it(mo
 
     recorder.end_turn(turn, addressed=False, wake_kind="reflex", outcome="dismissed", total_ms=1)
     assert turn.steps == []  # ...but never persisted: no RESPOND step exists
+
+
+# --- DD-3: the instant ack knobs, validated like everything else here ------
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, "1.8", True, None])
+def test_voice_config_rejects_an_invalid_ack_delay(bad):
+    with pytest.raises(ValueError, match="ack_delay_s"):
+        app._voice_config({"voice": {"ack_delay_s": bad}})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "One second.",                 # a bare string is not a list of them
+        ["One second.", ""],           # blank variant
+        ["One second.", "   "],
+        ["One second.", 7],
+        ["x y " * 16],                 # every word here is a word Daniel waits through
+        ["a b"] * 9,                   # a hundred ways to be wrong is not a feature
+    ],
+)
+def test_voice_config_rejects_invalid_ack_lines(bad):
+    with pytest.raises(ValueError, match="ack_lines"):
+        app._voice_config({"voice": {"ack_lines": bad}})
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        # The line that shipped into review, and the bug.
+        "On it.",
+        "I'm on it.",
+        "Working on it.",    # asserts work on a task the host has not identified
+        "Doing that now.",
+        "Getting that.",
+        "Let me check.",
+        "Right away.",
+        "Opening that.",
+        "Almost done.",
+        # R1: every one of these passed the first, blocklist-shaped version of
+        # this check -- plain English naming no verb the list happened to
+        # carry. They are why the check is an allowlist now: the ways to claim
+        # an action are not enumerable.
+        "It's underway.",
+        "Under way.",
+        "In progress.",     # config/atlas.yaml literally says not to say this
+        "Executing that.",
+        "Taking care of it.",
+        "Consider it handled.",
+        "Already handled.",
+        "Task accepted.",
+        "Request received.",
+        "Queued up.",
+        "Being handled.",
+        "Firing that off.",
+        "Almost there.",
+        "Nearly finished.",
+        "Halfway there.",
+        "Sure thing.",
+        # ...and the blocklist knew exactly one language.
+        "En cours.",
+        "Sofort erledigt.",
+    ],
+)
+def test_voice_config_refuses_an_ack_that_claims_an_action(claim):
+    """HIGH-1. The ack fires while the model is still in its FIRST round, so
+    the host cannot yet know whether the turn ends in work or in a
+    confirm-tier readback for work that has NOT happened -- the pending does
+    not exist yet and cannot be consulted. An action-claiming line is
+    therefore false on every confirm turn, whatever the code does, so the
+    config refuses it instead."""
+    with pytest.raises(ValueError, match="ack_lines"):
+        app._voice_config({"voice": {"ack_lines": [claim]}})
+
+
+@pytest.mark.parametrize(
+    "disguised",
+    [
+        "Оn it.",              # Cyrillic capital O
+        "οn it.",              # Greek small omicron
+        "On​ it.",             # zero-width space between the words
+        "Опенинг.",   # not even pretending
+        "One second now.",  # non-breaking spaces where real ones belong
+    ],
+)
+def test_voice_config_refuses_an_ack_hiding_behind_a_homoglyph(disguised):
+    """R1, the seam: the validator used to inspect router.normalize(value) and
+    then speak value.strip(), which are different strings the moment the line
+    leaves ASCII. normalize() drops non-[a-z0-9], so "Оn it." with a Cyrillic
+    О checked as "n it" -- clearing every word rule -- and went to the speaker
+    as the literal "Оn it.", restoring the exact line HIGH-1 removed with one
+    invisible character.
+
+    Both halves of the fix are pinned here. The character gate refuses
+    anything outside plain ASCII before tokenizing, and every check now reads
+    the string that will actually be spoken.
+    """
+    with pytest.raises(ValueError, match="ack_lines"):
+        app._voice_config({"voice": {"ack_lines": [disguised]}})
+
+
+def test_the_validator_reads_the_string_it_is_about_to_speak():
+    """The general form of R1, independent of any character trick: whatever
+    _ack_lines returns for TTS is what it checked. Asserted by feeding back
+    every accepted line and requiring it to be accepted again unchanged --
+    a validator that inspected some other projection of the input could not
+    keep that promise."""
+    accepted = app._voice_config({"voice": {"ack_lines": [
+        "One second.", "Still with you.", "Just a moment", "  Hang on!  ",
+    ]}})["ack_lines"]
+
+    assert accepted == ("One second. ", "Still with you. ", "Just a moment ", "Hang on! ")
+    for line in accepted:
+        # The spoken string, minus the trailing space this function adds, is
+        # itself a valid ack line -- so the check and the speech agree.
+        again = app._voice_config({"voice": {"ack_lines": [line]}})["ack_lines"]
+        assert again == (line,)
+
+
+@pytest.mark.parametrize("short", ["Sure.", "Okay.", "Yep!"])
+def test_voice_config_refuses_a_one_word_ack_the_echo_guard_cannot_filter(short):
+    """MEDIUM-5. SpeechEchoGuard passes single tokens by design so a lone
+    "stop" always interrupts; a one-word ack coming back off the speakers is
+    therefore an unfiltered transcript arriving mid-reply, and Atlas barges in
+    on the answer its own ack introduced."""
+    with pytest.raises(ValueError, match="ack_lines"):
+        app._voice_config({"voice": {"ack_lines": [short]}})
+
+
+def test_the_shipped_ack_lines_survive_their_own_validator():
+    """Belt and braces on the two rules above: the lines in config/atlas.yaml
+    are not merely accepted today, they are accepted BY the checks -- so a
+    future edit cannot loosen a check and keep the suite green."""
+    from worker.app import _VOICE_DEFAULTS
+
+    shipped = yaml.safe_load(
+        (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )["voice"]["ack_lines"]
+    for lines in (shipped, [line.strip() for line in _VOICE_DEFAULTS["ack_lines"]]):
+        resolved = app._voice_config({"voice": {"ack_lines": lines}})
+        assert len(resolved["ack_lines"]) == len(lines)
+        for line in resolved["ack_lines"]:
+            assert len(line.split()) >= 2
+            with pytest.raises(ValueError, match="ack_lines"):
+                app._voice_config({"voice": {"ack_lines": [line, "On it."]}})
+
+
+def test_ack_lines_get_one_trailing_space_like_every_other_host_line():
+    """Without it the ack and the model's first sentence run together into
+    one word at the speaker."""
+    resolved = app._voice_config(
+        {"voice": {"ack_lines": ["One second.", " Still here. "]}},
+    )
+
+    assert resolved["ack_lines"] == ("One second. ", "Still here. ")
+
+
+def test_an_empty_ack_list_is_how_the_ack_is_turned_off():
+    """A valid choice, not an error -- so it must not fall back to the
+    defaults either, which would make the setting unreachable."""
+    resolved = app._voice_config({"voice": {"ack_lines": []}})
+
+    assert resolved["ack_lines"] == ()
+    assert app.TurnAck(resolved["ack_lines"], resolved["ack_delay_s"]).enabled is False
+
+
+def test_the_ack_knobs_are_written_out_in_the_production_config():
+    """Same rule as the echo-guard knobs: a value that decides what Daniel
+    hears has to be reachable without editing Python."""
+    raw = yaml.safe_load(
+        (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    )["voice"]
+
+    assert raw["ack_delay_s"] == 1.8
+    # Neither line claims an action, and neither is one word. See
+    # test_voice_config_refuses_an_ack_that_claims_an_action.
+    assert raw["ack_lines"] == ["One second.", "Still with you."]
+
+
+def test_the_production_ack_delay_sits_between_its_two_bounds():
+    """The threshold is a measurement, not a taste: below ~1.5s it starts
+    prefixing replies that were about to arrive anyway, and above ~2s it
+    lands after Daniel has already repeated himself. See TurnAck."""
+    resolved = app._voice_config(yaml.safe_load(
+        (ROOT / "config" / "atlas.yaml").read_text(encoding="utf-8"),
+    ))
+
+    assert 1.5 <= resolved["ack_delay_s"] <= 2.0
+
+
+def test_turn_ack_is_disabled_by_a_non_positive_delay_even_with_lines():
+    assert app.TurnAck(("One second. ",), 0).enabled is False
+    assert app.TurnAck(("One second. ",), 1.8).enabled is True

@@ -61,6 +61,59 @@ stt_keyterms: [Atlas]
 #   - min_overlap_ratio: for 5+ word transcripts only, the share of words that
 #     must appear in the buffer for a scattered/reordered fragment to count as
 #     an echo. Shorter transcripts require a contiguous match and ignore this.
+# The last two knobs are the instant ack (DD-3): what Atlas says while a slow
+# turn is still thinking, so a model turn stops feeling like a dead microphone.
+#   - ack_delay_s: how long the first spoken chunk may take before the ack goes
+#     out. At most one ack per turn. 1.8s was picked from this machine's own
+#     traces.db:
+#     over single-round turns (no tool call, so the whole wait is one model
+#     round) the round took 1.0-8.1s, median 2.9s, and only 8% finished inside
+#     1.6s -- while tool turns spent 4.4-12.6s in their first round alone,
+#     before the tool even started. Below ~1.5s the ack would start prefixing
+#     replies that were about to arrive anyway (Atlas speaks its first whole
+#     SENTENCE, so audio starts before the round ends); above ~2s the silence
+#     has already read as "it didn't hear me" and the ack lands into Daniel
+#     repeating himself.
+#   - ack_lines: the variants, spoken in rotation rather than at random. Keep
+#     them short -- every word here is a word Daniel waits through. An empty
+#     list turns the ack off; more than 8, or one over 60 characters, raises.
+#
+#     AN ACK MAY NEVER CLAIM AN ACTION. This is not a style note. The ack is
+#     spoken when the first chunk has not arrived in ack_delay_s, and that
+#     deadline passes while the model is still in its FIRST round -- 4.4-12.6s
+#     on turns that call a tool. So at the moment the line goes out, nothing
+#     has run, no tool has been chosen, and a confirm-tier pending action does
+#     not exist yet: the host cannot tell "how many emails do I have" apart
+#     from a mutating request whose next words will be "NOT EXECUTED. Read
+#     this back to Daniel and wait for his yes or no." Put "On it." in front
+#     of that readback -- which is exactly what shipped before review -- and
+#     Atlas is announcing it is doing the thing it is about to ask permission
+#     for. There is no code fix for this, because at ack time the information
+#     needed to make the judgement does not exist anywhere; the only fix is
+#     lines that are true whatever the turn turns out to be. Say Atlas is here
+#     and time is passing, and nothing else. Do not say work is underway
+#     ("Working on it.", "In progress.", "Consider it handled." are all just
+#     as wrong), do not promise, and do not name what you are doing.
+#
+#     Enforced as an ALLOWLIST, so this is not advice you can talk your way
+#     around: worker.app._ACK_WORDS is the complete vocabulary an ack line may
+#     be built from -- about thirty words of time and presence, with no
+#     first-person word in it at all -- and every token of every line must
+#     come from it. A line using any other word raises on load, whatever it
+#     means. That is deliberate: the ways to claim an action are endless (an
+#     earlier blocklist here was broken seventeen ways by plain English and
+#     twice more by other languages), while the ways to say only "I am here
+#     and time is passing" are countable. Adding a word is a reviewed code
+#     change, which is the right friction for a sentence Atlas says in front
+#     of a mutating readback.
+#
+#     Also: ASCII letters and simple punctuation only (a Cyrillic "О" in
+#     "Оn it." is invisible in a diff and would otherwise slip any word
+#     check), and at least two words each -- the echo guard lets single
+#     tokens through on purpose so a lone "stop" always interrupts, so a
+#     one-word ack would come back off the speakers unfiltered and barge in
+#     on its own reply. worker.app._ack_lines refuses all of these on load,
+#     against the exact string it is about to speak.
 # Every value is validated on load by worker.app._voice_config; an out-of-range
 # one raises rather than falling back.
 voice:
@@ -71,6 +124,8 @@ voice:
   buffer_window_s: 10.0
   max_words: 500
   min_overlap_ratio: 0.8
+  ack_delay_s: 1.8
+  ack_lines: ["One second.", "Still with you."]
 
 traces: {enabled: true, path: "%LOCALAPPDATA%/Atlas/traces.db", retention_days: 30}
 pricing:

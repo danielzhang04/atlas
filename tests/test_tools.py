@@ -2859,3 +2859,357 @@ def test_pending_collision_refusal_names_the_action_and_stays_bounded():
     # The pending action is untouched by the refusal.
     assert registry.pending is not None
     assert registry.pending.name == "first"
+
+
+# --- DD-3: what the registry now writes into the trace, and what it does not -
+
+
+class _TraceSpy:
+    """Stands in for the module-level record_current_* helpers, so these tests
+    pin what the REGISTRY reports rather than re-testing worker/traces.py."""
+
+    def __init__(self) -> None:
+        self.refusals = []
+        self.pendings = []
+
+
+@pytest.fixture
+def trace_spy(monkeypatch):
+    from worker import tools as tools_mod
+
+    spy = _TraceSpy()
+    monkeypatch.setattr(
+        tools_mod, "_record_refusal",
+        lambda name, reason: spy.refusals.append((name, reason)),
+    )
+    monkeypatch.setattr(
+        tools_mod, "_record_pending",
+        lambda name, event: spy.pendings.append((name, event)),
+    )
+    return spy
+
+
+def _taint_registry():
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "open", "Open it.",
+        {"type": "object", "properties": {
+            "target": {"type": "string"}, "link": {"type": "string"},
+        }, "required": [], "additionalProperties": False},
+        lambda _arguments: _return({"opened": "x"}),
+    ))
+    registry.register(Tool(
+        "open_folder", "Open a folder.",
+        {"type": "object", "properties": {
+            "path": {"type": "string"}, "handle": {"type": "string"},
+            "root": {"type": "string"},
+        }, "required": [], "additionalProperties": False},
+        lambda _arguments: _return({"opened": "x"}),
+    ))
+    return registry
+
+
+def test_a_taint_refusal_is_recorded_with_the_tool_name_only(trace_spy):
+    registry = _taint_registry()
+
+    result = _call(registry, "open", {"target": "https://evil.test/x"}, tainted=True)
+
+    assert result.status == "error"
+    assert trace_spy.refusals == [("open", "taint")]
+
+
+def test_a_handle_tool_refusal_is_recorded_apart_from_a_plain_taint(trace_spy):
+    """Same wall, different row: one of these still had a way through the
+    turn (a handle from an earlier find_file) and the other did not."""
+    registry = _taint_registry()
+
+    result = _call(registry, "open_folder", {"path": "C:/Users/danie/x"}, tainted=True)
+
+    assert result.status == "error"
+    assert trace_spy.refusals == [("open_folder", "handle")]
+
+
+def test_an_exactly_one_target_conflict_is_recorded(trace_spy):
+    registry = _taint_registry()
+
+    result = _call(registry, "open", {"target": "gmail", "link": "u1"})
+
+    assert result.status == "error"
+    assert trace_spy.refusals == [("open", "conflict")]
+
+
+def test_a_pending_collision_is_recorded_for_both_kinds_of_confirm_tier(trace_spy):
+    registry = ToolRegistry()
+    registry.register(_tool("first", policy="confirm"))
+    registry.register(_tool("second", policy="confirm"))
+    registry.register(Tool(
+        "escalating", "Escalates.", {"type": "object", "properties": {}},
+        lambda _arguments: _return("done"), escalate=lambda _arguments: True,
+    ))
+
+    _call(registry, "first", {})
+    assert _call(registry, "second", {}).status == "error"
+    assert _call(registry, "escalating", {}).status == "error"
+
+    assert trace_spy.pendings == [("first", "created")]
+    assert trace_spy.refusals == [("second", "collision"), ("escalating", "collision")]
+
+
+def test_the_pending_lifecycle_is_recorded_end_to_end(trace_spy):
+    registry = ToolRegistry()
+    registry.register(_tool("send", policy="confirm"))
+
+    created = _call(registry, "send", {})
+    asyncio.run(registry.confirm(created.confirm_id))
+
+    assert trace_spy.pendings == [("send", "created"), ("send", "confirmed")]
+
+
+def test_a_cancel_and_a_stale_confirm_are_recorded(trace_spy):
+    registry = ToolRegistry()
+    registry.register(_tool("send", policy="confirm"))
+
+    created = _call(registry, "send", {})
+    registry.cancel_pending()
+    # Nothing pending any more: the confirm that arrives late is unmatched.
+    assert asyncio.run(registry.confirm(created.confirm_id)).status == "error"
+    # And cancelling nothing records nothing -- the reflex lane calls this
+    # speculatively, and a row per empty cancel would be noise.
+    registry.cancel_pending()
+
+    # None, not "": there is genuinely no action to name, and an empty string
+    # would go through the tool-name allowlist -- filing a routine event as
+    # 'other' (the value a real boundary breach writes) and burning the
+    # once-per-process boundary warning so the next real one logs nothing.
+    assert trace_spy.pendings == [
+        ("send", "created"), ("send", "cancelled"), (None, "unmatched"),
+    ]
+
+
+def test_a_wrong_confirm_id_is_recorded_against_the_pending_it_missed(trace_spy):
+    registry = ToolRegistry()
+    registry.register(_tool("send", policy="confirm"))
+
+    _call(registry, "send", {})
+    assert asyncio.run(registry.confirm("not-the-id")).status == "error"
+
+    # Still pending: a wrong id must not consume it.
+    assert registry.pending is not None
+    assert trace_spy.pendings == [("send", "created"), ("send", "unmatched")]
+
+
+def test_a_successful_call_records_no_refusal_or_pending_row(trace_spy):
+    registry = _taint_registry()
+
+    assert _call(registry, "open", {"target": "gmail"}).status == "ok"
+
+    assert trace_spy.refusals == []
+    assert trace_spy.pendings == []
+
+
+# --- DD-3: the closed vocabularies the reflex lane matches against ----------
+
+
+def test_the_registry_publishes_its_open_alias_and_root_vocabularies():
+    """Read-only, and the SAME sets the registry resolves against a moment
+    later -- a second copy in worker/app.py could drift from apps.yaml."""
+    registry = ToolRegistry()
+    registry._configure_open_aliases({"gmail": None, "spotify": None})
+    registry._configure_root_names(["downloads", "kb"])
+
+    assert registry.open_aliases == frozenset({"gmail", "spotify"})
+    assert registry.root_names == frozenset({"downloads", "kb"})
+    assert isinstance(registry.open_aliases, frozenset)
+    assert isinstance(registry.root_names, frozenset)
+
+
+def test_the_published_vocabularies_are_empty_before_anything_configures_them():
+    registry = ToolRegistry()
+
+    assert registry.open_aliases == frozenset()
+    assert registry.root_names == frozenset()
+
+
+# --- DD-3: count_mail cost -------------------------------------------------
+
+
+def test_count_mail_runs_the_inbox_and_primary_walks_concurrently():
+    """Measured: at ~900ms per google page these two walks cost 1841ms one
+    after the other and 920ms side by side -- and the 4-page worst case went
+    from 7.4s, against ToolRegistry's own 8s tool timeout, to 3.7s. Neither
+    walk reads the other's result, so nothing about the answer changes.
+
+    Both queries have to be in flight before either may finish, so a
+    sequential implementation fails this rather than merely being slower.
+    """
+    started = []
+    release = asyncio.Event()
+
+    async def search(arguments):
+        started.append(arguments["query"])
+        if len(started) >= 2:
+            release.set()
+        await asyncio.wait_for(release.wait(), 2.0)
+        if "category:primary" in arguments["query"]:
+            return _gmail_search_page(arguments["query"], [f"p-{i}" for i in range(14)])
+        return _gmail_search_page(arguments["query"], [f"i-{i}" for i in range(61)])
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "in:inbox"})
+
+    assert sorted(started) == ["in:inbox", "in:inbox category:primary"]
+    assert result == ToolResult(
+        "ok", "61 conversations in your inbox, 14 in Primary",
+    )
+
+
+def test_count_mail_without_an_inbox_query_still_runs_exactly_one_walk():
+    calls = []
+
+    async def search(arguments):
+        calls.append(arguments["query"])
+        return _gmail_search_page("label:archive", [f"a-{i}" for i in range(3)])
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    result = _call(registry, "count_mail", {"query": "label:archive"})
+
+    assert calls == ["label:archive"]
+    assert json.loads(result.content)["conversations"] == 3
+
+
+def test_count_mail_still_surfaces_the_inbox_failure_first():
+    """Both walks run now, so both can fail -- and the model must still see
+    the inbox walk's error, not whichever one finished first."""
+    async def search(arguments):
+        if "category:primary" in arguments["query"]:
+            return "totally unparseable"
+        raise RuntimeError("google not connected")
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    assert _call(registry, "count_mail", {"query": "in:inbox"}) == ToolResult(
+        "error", "Google isn't connected yet",
+    )
+
+
+def test_count_mail_re_raises_an_unexpected_failure_rather_than_orphaning_it():
+    async def search(arguments):
+        raise KeyError("boom")
+
+    registry = ToolRegistry()
+    register_count_mail(registry, search)
+
+    assert _call(registry, "count_mail", {"query": "in:inbox"}) == ToolResult(
+        "error", "KeyError",
+    )
+
+
+def test_next_page_token_reads_the_tail_without_ever_missing_one():
+    """The fast path is a fast path, not a narrowing: 91% of the per-page
+    parse cost (17.9 of 19.5 ms on a 500-message page) went on scanning
+    140 KB for a line the server writes at the end, but a token written
+    anywhere else still has to be found."""
+    from worker.tools import _next_page_token
+
+    filler = "\n".join(f"  {i}. Message ID: msg-{i}" for i in range(4000))
+
+    # The real shape: token on the last line, found in the tail.
+    assert _next_page_token(
+        filler + "\n\U0001F4C4 PAGINATION: call search_gmail_messages again "
+        "with page_token='tok-9'"
+    ) == "tok-9"
+    # A legacy line-anchored token far from the end falls back to the full page.
+    assert _next_page_token("page_token: tok-1\n" + filler) == "tok-1"
+    # And a page with no token at all is still no token.
+    assert _next_page_token(filler) is None
+    assert _next_page_token("") is None
+
+
+def test_next_page_token_does_not_invent_one_from_a_half_cut_line():
+    """The tail is trimmed to a whole line before matching, so MULTILINE ^
+    cannot anchor to the middle of a line this slice happened to cut."""
+    from worker.tools import _NEXT_PAGE_TOKEN_TAIL, _next_page_token
+
+    # One enormous line whose tail, cut naively, would read as an anchored
+    # "page_token: ..." that the full page does not contain.
+    assert _next_page_token(
+        "x" * (_NEXT_PAGE_TOKEN_TAIL * 2) + "page_token: fake",
+    ) is None
+
+
+def test_the_real_builtin_wiring_feeds_the_reflex_open_lane():
+    """End to end from config/apps.yaml through builtin() to the grammar: a
+    rename in the config, or a builtin() that stops publishing the alias set,
+    silently turns the whole deterministic lane off, and this is what notices.
+    """
+    from pathlib import Path
+
+    from worker import router
+
+    opened = []
+    registry = ToolRegistry()
+    root = Path(__file__).resolve().parents[1]
+    builtin(
+        registry, load_apps(root / "config" / "apps.yaml"), _FakeWork(),
+        opener=opened.append,
+    )
+
+    assert {"gmail", "spotify", "chrome", "vs code"} <= registry.open_aliases
+    match = router.reflex_open(
+        "open gmail", aliases=registry.open_aliases, roots=registry.root_names,
+    )
+    assert match == router.OpenReflex("alias", "gmail")
+    name, arguments = {"alias": lambda n: ("open", {"target": n})}[match.kind](match.name)
+    assert name in registry.names()
+    assert _call(registry, name, arguments).status == "ok"
+    assert opened == ["https://mail.google.com/"]
+
+
+def test_a_normalize_collision_in_the_open_vocabulary_is_refused_at_load():
+    """MEDIUM-2. router.normalize collapses every non-[a-z0-9] character to a
+    space, while _aliases below only rejects exact casefold duplicates. So two
+    words for DIFFERENT apps that differ only in punctuation both load and
+    then collapse to one spoken word -- "vs-code" and "vs code" is exactly
+    what gets added next. One of them can never be reached, and which one is
+    unknowable from here, so the configuration is refused rather than
+    silently resolved."""
+    registry = ToolRegistry()
+
+    with pytest.raises(ValueError, match="apps.yaml words"):
+        registry._configure_open_aliases({"vs-code": None, "vs code": None})
+    with pytest.raises(ValueError, match="file roots"):
+        registry._configure_root_names(["my-kb", "my kb"])
+
+    # Not configured by a raising call: the registry keeps the vocabulary it
+    # had rather than half of a bad one.
+    assert registry.open_aliases == frozenset()
+    assert registry.root_names == frozenset()
+
+
+def test_the_production_open_vocabulary_has_no_normalize_collision():
+    """The real config, not a fixture -- the load-time check above is only
+    useful if apps.yaml passes it today."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    registry = ToolRegistry()
+    builtin(registry, load_apps(root / "config" / "apps.yaml"), _FakeWork())
+
+    assert len(registry.open_aliases) >= 20
+
+
+def test_the_registry_publishes_a_tools_tier():
+    """The reflex open lane must ask the registry which tier a name is, not
+    keep its own list: rule 4 is decided here."""
+    registry = ToolRegistry()
+    registry.register(_tool("quick"))
+    registry.register(_tool("careful", policy="confirm"))
+
+    assert registry.policy("quick") == "instant"
+    assert registry.policy("careful") == "confirm"
+    assert registry.policy("never-registered") is None
